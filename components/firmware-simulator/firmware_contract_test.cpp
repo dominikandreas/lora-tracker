@@ -57,13 +57,34 @@ void testConfiguration() {
   strlcpy(gateway.trackers[0].device_id, "horse-1", sizeof(gateway.trackers[0].device_id));
   strlcpy(gateway.trackers[0].device_name, "Horse 1", sizeof(gateway.trackers[0].device_name));
   gateway.trackers[0].enabled = 1;
-  gateway.trackers[0].accepts_legacy_lora = 1;
   strlcpy(gateway.trackers[1].device_id, "horse-2", sizeof(gateway.trackers[1].device_id));
   strlcpy(gateway.trackers[1].device_name, "Horse 2", sizeof(gateway.trackers[1].device_name));
   gateway.trackers[1].enabled = 1;
   finalize(gateway, DeviceRole::GATEWAY, 1);
+  assert(validateEnvelope(gateway, DeviceRole::GATEWAY));
+  assert(isValidCanonicalId(gateway.gateway_id, sizeof(gateway.gateway_id)));
+  assert(isValidDisplayName(gateway.gateway_name, sizeof(gateway.gateway_name)));
+  assert(isValidCanonicalId(gateway.mqtt_base_topic, sizeof(gateway.mqtt_base_topic)));
+  assert(validateLoRa(gateway.lora));
+  assert(isNullTerminated(gateway.wifi_ssid, sizeof(gateway.wifi_ssid)));
+  assert(isNullTerminated(gateway.wifi_password, sizeof(gateway.wifi_password)));
+  assert(isNullTerminated(gateway.mqtt_host, sizeof(gateway.mqtt_host)));
+  assert(strnlen(gateway.mqtt_host, sizeof(gateway.mqtt_host)) > 0);
+  assert(isNullTerminated(gateway.mqtt_username, sizeof(gateway.mqtt_username)));
+  assert(isNullTerminated(gateway.mqtt_password, sizeof(gateway.mqtt_password)));
+  assert(gateway.mqtt_port != 0 && gateway.mqtt_tls_enabled <= 1);
+  assert(gateway.mqtt_buffer_size >= 512 && gateway.mqtt_buffer_size <= 4096);
+  assert(gateway.dedup_save_interval > 0 && gateway.dedup_save_interval <= 1000);
+  assert(gateway.wifi_retry_interval_ms >= 1000 && gateway.mqtt_retry_interval_ms >= 1000);
+  assert(gateway.tracker_count <= MAX_GATEWAY_TRACKERS);
+  assert(isValidCanonicalId(gateway.trackers[0].device_id, sizeof(gateway.trackers[0].device_id)));
+  assert(isValidDisplayName(gateway.trackers[0].device_name, sizeof(gateway.trackers[0].device_name)));
+  assert(isValidCanonicalId(gateway.trackers[1].device_id, sizeof(gateway.trackers[1].device_id)));
+  assert(isValidDisplayName(gateway.trackers[1].device_name, sizeof(gateway.trackers[1].device_name)));
+  assert(EquineProtocol::deviceIdHash(gateway.trackers[0].device_id) !=
+         EquineProtocol::deviceIdHash(gateway.trackers[1].device_id));
   assert(validateGatewayConfig(gateway));
-  gateway.trackers[1].accepts_legacy_lora = 1;
+  strlcpy(gateway.trackers[1].device_id, "horse-1", sizeof(gateway.trackers[1].device_id));
   finalize(gateway, DeviceRole::GATEWAY, 1);
   assert(!validateGatewayConfig(gateway));
 }

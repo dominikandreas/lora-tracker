@@ -1,86 +1,57 @@
-# Roadmap and future TODOs
+# Roadmap and larger refactor TODOs
 
-Flutter development is intentionally deferred. The order below focuses first on
-security, recoverability and protocol stability.
+Small hardening changes belong in normal issues. The items below intentionally
+remain TODOs because they alter security boundaries, storage guarantees,
+hardware support or multiple public interfaces.
 
-## P0 — before public or unattended deployment
+## P0 — production release blockers
 
-- [ ] Compile tracker and gateway with a pinned ESP32/Arduino or PlatformIO
-      toolchain and record exact library versions.
-- [ ] Add CI builds for both tracker hardware branches and the gateway.
-- [ ] Run multi-day battery, GNSS, deep-sleep, queue-overflow and reconnect tests
-      on real hardware.
-- [ ] Add authenticated encryption to LoRa history, ACK and command frames.
-- [ ] Replace FNV routing identity with a random public device identifier while
-      preserving migration aliases.
-- [ ] Replace the shared onboarding password with a unique provisioning secret.
-- [ ] Add authenticated BLE/HTTP provisioning sessions and replay protection.
-- [ ] Add signed firmware/version metadata and authenticated OTA updates.
-- [ ] Move gateway MQTT publishing to QoS 1 or add an application-level durable
-      receipt before advancing delivery state.
-- [ ] Define EU duty-cycle accounting and enforce airtime budgets across retries.
-- [ ] Add crash-safe RTC history metadata with magic/version/CRC and migration.
-- [ ] Test factory reset, rollback, power loss during writes and downgrade paths.
+- [ ] Design and implement authenticated encryption for LoRa history, ACK and command frames.
+- [ ] Replace the routing hash with a random public identifier and provision per-device keys.
+- [ ] Add replay-safe, authenticated BLE provisioning with QR bootstrap and key rotation.
+- [ ] Replace password-only ArduinoOTA with signed images, Secure Boot v2, flash/NVS encryption and documented eFuse/key custody.
+- [ ] Replace QoS-0-only gateway publishing with durable local buffering and broker-confirmed delivery.
+- [ ] Port the gateway to a current ESP32-S3/SX1262 board and share its RadioLib driver with the tracker.
+- [ ] Add broker/browser integration tests and hardware-in-the-loop tests for both boards.
+- [ ] Run multi-day battery, GNSS, deep-sleep, RF-loss, queue-overflow and reconnect qualification.
+- [ ] Enforce regional airtime/duty-cycle budgets across retries and document supported regions.
+- [ ] Add crash-safe RTC history metadata with magic, schema, CRC and tested recovery.
+- [ ] Select a software/hardware license and publish a vulnerability-response policy.
 
-## P1 — multi-node product architecture
+## P1 — reliability and operations
 
-- [ ] Define relay message type with immutable message ID, hop limit, previous
-      hop, deduplication cache, randomized forwarding delay and ACK policy.
-- [ ] Prevent ACK collisions when several gateways hear the same tracker.
-- [ ] Add gateway-to-gateway reception metadata and route-quality analytics.
-- [ ] Decide whether relays use the custom protocol, Meshtastic transport, or a
-      bridge. Keep tracker payload encryption independent of the relay network.
-- [ ] Add MQTT broker discovery/profile support for private and public brokers.
-- [ ] Add separate permissions for route consumers, configuration managers and
-      archivers.
-- [ ] Add tracker command/downlink schemas only after authentication exists.
-- [ ] Add key rotation, revocation and lost-device recovery.
+- [ ] Add fleet health metrics, structured logs and alerting for stale devices, low battery and storage failures.
+- [ ] Add database backup/restore, integrity checking and configurable retention tooling.
+- [ ] Add configuration export/import with encrypted secrets and an auditable device inventory.
+- [ ] Add safe firmware rollout groups, rollback metadata and minimum-version enforcement.
+- [ ] Add factory acceptance tests for GNSS, radio, current draw, battery gauge and enclosure seals.
+- [ ] Define queue overflow priorities and explicit data-loss telemetry.
+- [ ] Add multi-gateway ACK collision avoidance and reception-quality analytics.
 
-## P1 — applications and onboarding
+## P1 — application
 
-- [ ] Add BLE and Wi-Fi onboarding/configuration UI to the web app.
-- [ ] Generate/import QR provisioning records with device ID, public routing ID,
-      key version and encrypted secret material.
-- [ ] Add encrypted app-to-app transfer via QR and MQTT mailbox topics.
-- [ ] Add configuration diff/merge UI using `expected_revision` conflict rules.
+- [ ] Build an authenticated onboarding UI for BLE and Wi-Fi.
 - [ ] Add automatic history pagination, background synchronization and export.
-- [ ] Add a geographical map with optional offline/local tiles.
-- [ ] Add alerts for stale tracker, low battery, missing gateway and unusual
-      movement.
-- [ ] Add local biometric/PIN protection for stored tracker secrets.
-- [ ] Build the deferred Flutter app using the same schemas and test vectors.
+- [ ] Add a geographical map with selectable offline/local tiles.
+- [ ] Add encrypted local secret storage protected by platform biometrics or PIN.
+- [ ] Add alerts for stale trackers, low battery, missing gateways and unusual movement.
+- [ ] Build the deferred mobile app from generated shared schemas.
 
-## P1 — storage
+## P2 — maintainability and expansion
 
-- [ ] Define per-tracker storage policy: tracker RTC/NVS, gateway cache, app,
-      archiver, or ciphertext-only cloud.
-- [ ] Add optional gateway/archiver buffering during MQTT outages.
-- [ ] Add an archiver-node protocol for subscribe/store/replay by tracker ID.
-- [ ] Add encrypted-at-rest secrets and optionally encrypted track history.
-- [ ] Add backup, restore, compaction and database-health tooling.
-- [ ] Add retention policies beyond the fixed ten-day default.
+- [ ] Move duplicated embedded headers into a reusable PlatformIO library.
+- [ ] Generate C++, Python, JavaScript and mobile models/test vectors from one schema source.
+- [ ] Split the large tracker and gateway sketches into testable services and hardware adapters.
+- [ ] Rename the remaining historical embedded filenames and C++ namespaces as part of the shared-library refactor.
+- [ ] Fuzz LoRa, MQTT and onboarding parsers and timestamp chains.
+- [ ] Add altitude, speed, heading, HDOP, fix quality and radio metadata.
+- [ ] Define relay routing, hop limits, deduplication and trust boundaries.
+- [ ] Revisit 32-bit Unix timestamps before 2106.
 
-## P2 — protocol and maintainability
+## Hardware backlog
 
-- [ ] Move duplicated shared headers into a reusable Arduino/PlatformIO library.
-- [ ] Add a machine-readable schema source and generated C++, Python, Dart and
-      JavaScript models/test vectors.
-- [ ] Define capability negotiation and minimum-compatible-version fields.
-- [ ] Add explicit firmware/API version reporting to all status endpoints.
-- [ ] Add per-point altitude, speed, heading, HDOP and fix-quality fields with
-      optional delta encoding.
-- [ ] Add RSSI and SNR reception metadata.
-- [ ] Revisit 32-bit Unix timestamps before 2106 and document leap-second rules.
-- [ ] Define queue overflow behavior and priorities for critical points.
-- [ ] Add fuzzing for LoRa/MQTT parsers and malformed timestamp chains.
-- [ ] Add integration tests with a real broker, multiple gateways and packet loss.
-- [ ] Add observability metrics, structured logs and remote diagnostics.
-- [ ] Select a software/hardware license and contribution policy.
-
-## Hardware opportunities
-
-- [ ] Add a low-power accelerometer with wake-on-motion interrupt.
-- [ ] Measure actual current draw in every tracker state.
-- [ ] Evaluate antenna, enclosure and horse-mounted orientation across terrain.
-- [ ] Add secure-element support if key extraction becomes a material threat.
-- [ ] Evaluate gateway SX1262 hardware and diversity/multiple receivers.
+- [ ] Integrate a low-power wake-on-motion accelerometer.
+- [ ] Integrate a real fuel gauge and temperature-aware battery policy.
+- [ ] Evaluate a current-lifecycle secure element after the key architecture is defined.
+- [ ] Validate antenna placement, body attenuation, enclosure impact and mounting safety.
+- [ ] Produce a custom protected power design and IP-rated enclosure after prototype measurements.

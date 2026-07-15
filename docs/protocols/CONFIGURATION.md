@@ -1,8 +1,7 @@
-# LoRa Tracker persistent configuration schema v1
+# Persistent configuration schema
 
-This step adds a versioned, CRC-protected persistent configuration to the
-tracker and gateway. It is the storage foundation for BLE/Wi-Fi onboarding in
-the next implementation step.
+The tracker and gateway use a versioned, CRC-protected persistent
+configuration. The current schema version is 2.
 
 ## Storage envelope
 
@@ -16,7 +15,7 @@ Every blob begins with `ConfigHeaderV1`:
 
 | Field | Purpose |
 |---|---|
-| `magic` | Distinguishes Equine configuration from unrelated NVS data |
+| `magic` | Distinguishes tracker configuration from unrelated NVS data |
 | `schema_version` | Configuration data-model version |
 | `struct_size` | Rejects incompatible layouts before decoding |
 | `revision` | Monotonic revision for synchronization and conflict handling |
@@ -45,19 +44,10 @@ The tracker configuration contains:
 The history buffer size and wire delta unit remain firmware-layout constants;
 changing them requires a state/protocol migration rather than a normal setting.
 
-### Tracker migration
-
-When no valid configuration blob exists, the first boot creates schema v1 from
-factory defaults and imports the old `tracker` namespace values:
-
-- `ssid`
-- `pw`
-- `ble_log`
-
-Existing distance, boot ID, daily age, history-in-RTC and dedup/transmission
-state are not part of the configuration blob and remain handled separately.
-
-Factory reset clears both the old tracker state namespace and `eqcfg`.
+When no valid configuration exists, first boot creates a fresh schema-2 blob
+from the provisioning seeds in `secrets.h`. Older configuration layouts are
+not imported. Runtime distance, boot ID, history and transmission state remain
+separate from the configuration blob.
 
 ## GatewayConfigV1
 
@@ -69,15 +59,14 @@ The gateway configuration contains:
 - LoRa parameters
 - MQTT buffer and reconnect settings
 - deduplication checkpoint interval
-- up to 12 tracker registrations, each with identity, enabled state, legacy
-  LoRa mapping and legacy MQTT alias policy
+- up to 12 tracker registrations, each with identity and enabled state
 
-The first boot seeds the configuration from `secrets.h` and migrates the former
-compile-time Wera registry entry. Per-tracker deduplication namespaces are based
-on the device hash, so existing cursors remain compatible.
+First boot seeds the configuration from `secrets.h`. Per-tracker deduplication
+namespaces are based on the device hash.
 
-`mqtt_tls_enabled` is reserved in schema v1 but validation currently requires it
-to remain false until the TLS transport step is implemented.
+`mqtt_tls_enabled` selects verified TLS. The gateway requires a PEM root CA in
+`secrets.h`; plaintext MQTT is blocked unless its separate test-only build seed
+explicitly allows it.
 
 ## Validation
 
@@ -85,7 +74,6 @@ Configuration is rejected unless, among other constraints:
 
 - canonical IDs contain lowercase letters, digits, `_` or `-`
 - device hashes are unique in the gateway registry
-- no more than one tracker accepts unversioned legacy LoRa
 - LoRa values are within the supported EU-band and modem ranges
 - timeout, sleep and retry sequences are internally consistent
 - strings are terminated and all floating-point thresholds are finite
@@ -97,6 +85,5 @@ Both devices expose `GET /api/v1/config` while their web server is active. The
 response deliberately omits Wi-Fi and MQTT passwords. The gateway's existing
 `GET /api/v1/trackers` runtime endpoint remains available.
 
-Configuration mutation is intentionally not exposed yet. The next step adds the
-onboarding/configuration API, validation responses, transactional updates and
-restart/apply semantics using these storage functions.
+Mutation uses the transactional onboarding API described in
+[`ONBOARDING_API.md`](ONBOARDING_API.md).

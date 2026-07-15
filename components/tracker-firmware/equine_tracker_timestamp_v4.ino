@@ -14,10 +14,6 @@
 #endif
 
 #define USER_BTN_PIN 0
-#ifndef EQUINE_ONBOARDING_AP_PASSWORD
-#define EQUINE_ONBOARDING_AP_PASSWORD "EquineSetup!"
-#endif
-
 #include <Preferences.h>
 #include <WiFi.h>
 #include <ESPmDNS.h>
@@ -38,10 +34,8 @@
 // ==========================================
 // VERSIONED PERSISTENT CONFIGURATION
 // ==========================================
-// These are factory seeds only. The active identity and all tunable values are
-// loaded from the CRC-protected NVS configuration before hardware startup.
-static const char* const FACTORY_TRACKER_ID = "wera";
-static const char* const FACTORY_TRACKER_NAME = "Wera";
+// The active identity and all tunable values are loaded from the CRC-protected
+// NVS configuration before hardware startup.
 
 EquineConfig::TrackerConfigV1 tracker_config{};
 uint64_t tracker_device_hash = 0;
@@ -90,7 +84,10 @@ uint64_t tracker_device_hash = 0;
 #endif
 
 // --- Runtime tuning loaded from tracker_config ---
-const uint16_t HISTORY_SIZE = 500; // RTC layout; changing this needs a firmware migration
+// 448 points use 7,168 bytes and leave headroom in the ESP32's 8 KiB RTC slow
+// memory for counters and future CRC/layout metadata. A 500-point queue does
+// not link on the supported ESP32 target.
+const uint16_t HISTORY_SIZE = 448;
 const int32_t DELTA_UNIT_MICRODEG = 10;
 const uint32_t SECONDS_PER_DAY = 86400;
 const float MIN_BATTERY_VOLTAGE = 3.2f;
@@ -161,6 +158,8 @@ const uint8_t DISPLAY_PAGE_COUNT = 4;
 const uint32_t BLE_CONNECTION_WINDOW_MS = 60000;
 const uint32_t BLE_RECONNECT_WINDOW_MS = 15000;
 const uint32_t WIFI_SETUP_BOOT_HOLD_MS = 1500;
+
+bool isValidSha256Hex(const char* value);
 
 // --- UBX Command to put BN-220 to Sleep ---
 const byte UBX_SLEEP_CMD[] = {
@@ -401,6 +400,16 @@ bool isDebugModeActive() {
   return debug_mode || deviceConnected;
 }
 
+bool isValidSha256Hex(const char* value) {
+  if (!value || strlen(value) != 64) return false;
+  for (size_t i = 0; i < 64; i++) {
+    const char c = value[i];
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+          (c >= 'A' && c <= 'F'))) return false;
+  }
+  return true;
+}
+
 bool isBleConnectionWindowActive() {
   return ble_connection_window_active &&
          (int32_t)(ble_connection_window_deadline_ms - millis()) > 0;
@@ -560,25 +569,21 @@ bool saveTrackerConfig(bool increment_revision = true) {
 }
 
 void makeTrackerFactoryConfig() {
+  const uint32_t chip_suffix =
+    static_cast<uint32_t>(ESP.getEfuseMac() & 0x00FFFFFFULL);
+  char factory_id[EquineConfig::DEVICE_ID_SIZE];
+  char factory_name[EquineConfig::DEVICE_NAME_SIZE];
+  snprintf(factory_id, sizeof(factory_id), "tracker-%06lx",
+           static_cast<unsigned long>(chip_suffix));
+  snprintf(factory_name, sizeof(factory_name), "Tracker %06lX",
+           static_cast<unsigned long>(chip_suffix));
   EquineConfig::makeDefaultTrackerConfig(
     tracker_config,
-    FACTORY_TRACKER_ID,
-    FACTORY_TRACKER_NAME,
+    factory_id,
+    factory_name,
     ssid,
     password);
 
-  // One-time migration from settings used before the versioned config blob.
-  if (prefs.isKey("ssid")) {
-    const String legacy_ssid = prefs.getString("ssid");
-    strlcpy(tracker_config.wifi_ssid, legacy_ssid.c_str(),
-            sizeof(tracker_config.wifi_ssid));
-  }
-  if (prefs.isKey("pw")) {
-    const String legacy_password = prefs.getString("pw");
-    strlcpy(tracker_config.wifi_password, legacy_password.c_str(),
-            sizeof(tracker_config.wifi_password));
-  }
-  tracker_config.ble_debug_enabled = prefs.getBool("ble_log", false) ? 1 : 0;
   EquineConfig::finalize(
     tracker_config, EquineConfig::DeviceRole::TRACKER, 1);
 }
@@ -1644,34 +1649,52 @@ void runWifiSetupMode() {
     logPrintln("Starting fallback AP mode...");
     WiFi.disconnect(false, false);
     WiFi.mode(WIFI_AP);
-    String onboarding_ap = "EquineTracker-" + String(TRACKER_ID);
-    if (WiFi.softAP(onboarding_ap.c_str(), EQUINE_ONBOARDING_AP_PASSWORD)) {
+    String onboarding_ap = "LoRaTracker-" + String(TRACKER_ID);
+    if (strlen(onboarding_ap_password) < 12) {
+      setLastError("Setup password too short");
+      logPrintln("Fallback AP disabled: onboarding password must be at least 12 characters.");
+    } else if (WiFi.softAP(onboarding_ap.c_str(), onboarding_ap_password)) {
       wifi_ap_active = true;
       wifi_station_connected = false;
       responsiveDelay(500);
       last_wifi_ip = WiFi.softAPIP().toString();
       last_wifi_rssi = 0;
       setLastError(savedSsid.length() > 0 ? "STA failed; fallback AP" : "No SSID; fallback AP");
-      logPrintf("AP '%s' started at %s (setup password: %s).\n",
-                onboarding_ap.c_str(), last_wifi_ip.c_str(),
-                EQUINE_ONBOARDING_AP_PASSWORD);
+      logPrintf("AP '%s' started at %s.\n",
+                onboarding_ap.c_str(), last_wifi_ip.c_str());
     } else {
       setLastError("Fallback AP failed");
       logPrintln("Fallback AP failed.");
     }
   }
 
-  String otaHost = "equine-tracker-" + String(TRACKER_ID);
+  String otaHost = "lora-tracker-" + String(TRACKER_ID);
   ArduinoOTA.setHostname(otaHost.c_str());
-  ArduinoOTA.begin();
+  if (isValidSha256Hex(ota_password_hash)) {
+    ArduinoOTA.setPasswordHash(ota_password_hash);
+    ArduinoOTA.begin();
+  } else {
+    logPrintln("OTA disabled: configure a 64-character SHA-256 password hash.");
+  }
 
-  webServer.on("/", HTTP_GET, []() {
+  auto requireWebAuthentication = []() -> bool {
+    if (strlen(onboarding_ap_password) < 12) {
+      webServer.send(503, "application/json", "{\"error\":\"admin_credentials_not_configured\"}");
+      return false;
+    }
+    if (webServer.authenticate("admin", onboarding_ap_password)) return true;
+    webServer.requestAuthentication(BASIC_AUTH, "LoRa Tracker");
+    return false;
+  };
+
+  webServer.on("/", HTTP_GET, [requireWebAuthentication]() {
+    if (!requireWebAuthentication()) return;
     wifi_client_connected = true;
     last_web_activity_ms = millis();
     logPrintln("Web onboarding UI accessed by a client.");
     String html;
     html.reserve(7000);
-    html = "<html><head><title>Equine Tracker</title><meta name='viewport' content='width=device-width,initial-scale=1'>";
+    html = "<html><head><title>LoRa Tracker</title><meta name='viewport' content='width=device-width,initial-scale=1'>";
     html += "<style>body{font-family:sans-serif;margin:20px;max-width:760px}label{display:block;margin-top:12px}input{padding:8px;width:100%;box-sizing:border-box}button{margin-top:18px;padding:10px 16px}code,pre{background:#f4f4f4;padding:4px}small{color:#555}</style></head><body>";
     html += "<h1>" + String(TRACKER_NAME) + " Tracker Onboarding</h1>";
     html += "<p>Schema/revision: " + String(tracker_config.header.schema_version) +
@@ -1716,7 +1739,8 @@ void runWifiSetupMode() {
 
   // Compatibility HTML form. It uses the same transactional candidate/validate
   // path as the REST and BLE transports.
-  webServer.on("/save", HTTP_POST, []() {
+  webServer.on("/save", HTTP_POST, [requireWebAuthentication]() {
+    if (!requireWebAuthentication()) return;
     wifi_client_connected = true;
     last_web_activity_ms = millis();
     EquineConfig::TrackerConfigV1 candidate = tracker_config;
@@ -1757,7 +1781,8 @@ void runWifiSetupMode() {
       "Configuration saved and validated. The tracker will reboot shortly.");
   });
 
-  webServer.on("/api/v1/onboarding", HTTP_GET, []() {
+  webServer.on("/api/v1/onboarding", HTTP_GET, [requireWebAuthentication]() {
+    if (!requireWebAuthentication()) return;
     String out = "{\"api_version\":" + String(EquineConfigApi::API_VERSION) +
       ",\"role\":\"tracker\",\"onboarding_required\":" +
       String(tracker_onboarding_required ? "true" : "false") +
@@ -1766,11 +1791,13 @@ void runWifiSetupMode() {
     webServer.send(200, "application/json", out);
   });
 
-  webServer.on("/api/v1/config", HTTP_GET, []() {
+  webServer.on("/api/v1/config", HTTP_GET, [requireWebAuthentication]() {
+    if (!requireWebAuthentication()) return;
     webServer.send(200, "application/json", trackerConfigJson());
   });
 
-  webServer.on("/api/v1/config", HTTP_POST, []() {
+  webServer.on("/api/v1/config", HTTP_POST, [requireWebAuthentication]() {
+    if (!requireWebAuthentication()) return;
     wifi_client_connected = true;
     last_web_activity_ms = millis();
     EquineConfigApi::PatchStatus status;
@@ -1793,7 +1820,8 @@ void runWifiSetupMode() {
     config_reboot_requested |= needs_reboot;
   });
 
-  webServer.on("/api/v1/config/rollback", HTTP_POST, []() {
+  webServer.on("/api/v1/config/rollback", HTTP_POST, [requireWebAuthentication]() {
+    if (!requireWebAuthentication()) return;
     uint32_t expected = 0;
     if (!EquineConfigApi::parseUnsigned(
           webServer.arg("expected_revision").c_str(), 1, UINT32_MAX, expected) ||
@@ -1815,7 +1843,8 @@ void runWifiSetupMode() {
     config_reboot_requested = true;
   });
 
-  webServer.on("/api/v1/factory-reset", HTTP_POST, []() {
+  webServer.on("/api/v1/factory-reset", HTTP_POST, [requireWebAuthentication]() {
+    if (!requireWebAuthentication()) return;
     if (webServer.arg("confirm") != "FACTORY_RESET") {
       webServer.send(400, "application/json",
         "{\"ok\":false,\"error\":\"confirmation_required\"}");
@@ -1826,19 +1855,22 @@ void runWifiSetupMode() {
     config_factory_reset_requested = true;
   });
 
-  webServer.on("/api/v1/reboot", HTTP_POST, []() {
+  webServer.on("/api/v1/reboot", HTTP_POST, [requireWebAuthentication]() {
+    if (!requireWebAuthentication()) return;
     webServer.send(200, "application/json", "{\"ok\":true,\"rebooting\":true}");
     config_reboot_requested = true;
   });
 
-  webServer.on("/start", HTTP_POST, []() {
+  webServer.on("/start", HTTP_POST, [requireWebAuthentication]() {
+    if (!requireWebAuthentication()) return;
     wifi_client_connected = true;
     last_web_activity_ms = millis();
     force_tracking_mode = true;
     webServer.send(200, "text/html", "Starting tracking mode. You can close this page.<br><br><small>WiFi will now disconnect.</small>");
   });
 
-  webServer.on("/logs", HTTP_GET, []() {
+  webServer.on("/logs", HTTP_GET, [requireWebAuthentication]() {
+    if (!requireWebAuthentication()) return;
     wifi_client_connected = true;
     last_web_activity_ms = millis();
     String out = "";
@@ -2364,7 +2396,7 @@ void renderStatusPage() {
         // Setup/WiFi Mode
         snprintf(lines[0], sizeof(lines[0]), "WiFi: %s", wifi_station_connected ? "STA" : (wifi_ap_active ? "AP" : "TRY"));
         snprintf(lines[1], sizeof(lines[1]), "%.13s", last_wifi_ip.c_str());
-        snprintf(lines[2], sizeof(lines[2]), "%.13s", wifi_ap_active ? "EquineTracker" : "Searching...");
+        snprintf(lines[2], sizeof(lines[2]), "%.13s", wifi_ap_active ? "LoRaTracker" : "Searching...");
         snprintf(lines[3], sizeof(lines[3]), "B:%u%% %.1fV", cached_battery_percentage, cached_battery_voltage);
         snprintf(lines[4], sizeof(lines[4]), "1/4 -> press");
       } else {
@@ -3111,7 +3143,7 @@ void setup() {
   sendUc6580Assistance();
 #endif
 
-  logPrintln("\n--- Equine Tracker Waking Up ---");
+  logPrintln("\n--- LoRa Tracker Waking Up ---");
   logRTCState();
 
   // LoRa is initialized only inside performTrackingCycle() when a batch is due.

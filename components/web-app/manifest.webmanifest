@@ -1,6 +1,6 @@
 {
-  "name": "Equine Tracker Console",
-  "short_name": "Equine",
+  "name": "LoRa Tracker Console",
+  "short_name": "LoRa Tracker",
   "start_url": "./",
   "display": "standalone",
   "background_color": "#0d120e",

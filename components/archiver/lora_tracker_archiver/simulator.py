@@ -1,4 +1,4 @@
-"""Deterministic, brokerless end-to-end simulator for Equine Tracker.
+"""Deterministic, brokerless end-to-end simulator for LoRa Tracker.
 
 The simulator models the messages at the boundaries between tracker, gateway,
 archiver, and web app.  It deliberately uses the archiver's production protocol
@@ -76,7 +76,7 @@ def run_embedded_simulation(*, compiler: str | None = None) -> dict[str, object]
 
     source = harness / "firmware_contract_test.cpp"
     results: dict[str, object] = {"compiler": compiler, "components": []}
-    with tempfile.TemporaryDirectory(prefix="equine-firmware-sim-") as build_dir:
+    with tempfile.TemporaryDirectory(prefix="lora-tracker-firmware-sim-") as build_dir:
         for component in ("tracker-firmware", "gateway-firmware"):
             output = Path(build_dir) / component
             command = [
@@ -149,13 +149,13 @@ def _tracker_points(
 ) -> Iterable[dict[str, object]]:
     """Generate a small, believable route as tracker-originated telemetry."""
     for seq in range(points):
-        # Make every fifth sample legacy/untimed to exercise migration fallback.
+        # Make every fifth sample untimed to exercise receive-time fallback.
         timestamp_valid = seq % 5 != 4
         yield {
             "api_version": 1,
-            "point_schema_version": 2 if timestamp_valid else 1,
+            "point_schema_version": 2,
             "transport_version": 1,
-            "schema_version": 2 if timestamp_valid else 1,
+            "schema_version": 2,
             "device_id": f"horse-{tracker_index + 1}",
             "device_name": f"Simulated Horse {tracker_index + 1}",
             "device_hash": device_hash,
@@ -188,7 +188,7 @@ def run_simulation(
     database: Path | str,
     tracker_count: int = 2,
     points_per_tracker: int = 12,
-    base_topic: str = "equine",
+    base_topic: str = "lora-tracker",
     start_unix_ms: int = 1_784_050_000_000,
 ) -> SimulationSummary:
     """Run tracker -> gateway -> MQTT event -> archiver -> history flow.
@@ -290,7 +290,7 @@ def run_service_simulation(*, database: Path | str) -> dict[str, object]:
         mqtt_password="sim-password",
         mqtt_tls=True,
         mqtt_ca_file=Path("sim-ca.pem"),
-        base_topic="equine",
+        base_topic="lora-tracker",
         archiver_id="simulator",
         database_path=database,
         retention_days=10,
@@ -301,14 +301,14 @@ def run_service_simulation(*, database: Path | str) -> dict[str, object]:
     service = ArchiverService(config, client)
     try:
         service.configure_client()
-        assert client.will == ("equine/v1/archivers/simulator/availability", "offline", 1, True)
+        assert client.will == ("lora-tracker/v1/archivers/simulator/availability", "offline", 1, True)
         assert client.credentials == ("sim-user", "sim-password")
         assert client.tls_ca_file == "sim-ca.pem"
         assert client.on_connect is not None
         client.on_connect(client, None, None, 0)
         assert len(client.subscriptions) == 2
 
-        topic = f"equine/v1/trackers/{allowed_hash}/events/point"
+        topic = f"lora-tracker/v1/trackers/{allowed_hash}/events/point"
         points = list(_tracker_points(device_hash=allowed_hash, tracker_index=0, points=4, start_ms=1_784_050_000_000))
         for point in points:
             client.deliver(topic, _gateway_event(point, 0))
@@ -316,9 +316,9 @@ def run_service_simulation(*, database: Path | str) -> dict[str, object]:
         # A non-allowlisted tracker must not affect counters or storage.
         denied_hash = _device_hash(1)
         denied = _gateway_event(next(_tracker_points(device_hash=denied_hash, tracker_index=1, points=1, start_ms=1)), 0)
-        client.deliver(f"equine/v1/trackers/{denied_hash}/events/point", denied)
+        client.deliver(f"lora-tracker/v1/trackers/{denied_hash}/events/point", denied)
 
-        request_topic = f"equine/v1/trackers/{allowed_hash}/history/request"
+        request_topic = f"lora-tracker/v1/trackers/{allowed_hash}/history/request"
         client.deliver(request_topic, {
             "api_version": 1, "schema_version": 2, "request_id": "page-1",
             "from_unix_ms": 0, "to_unix_ms": 32_503_680_000_000, "limit": 3, "cursor": 0,
@@ -346,15 +346,15 @@ def run_service_simulation(*, database: Path | str) -> dict[str, object]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the Equine Tracker end-to-end simulator")
+    parser = argparse.ArgumentParser(description="Run the LoRa Tracker end-to-end simulator")
     parser.add_argument("--trackers", type=int, default=2, help="number of simulated trackers")
     parser.add_argument("--points", type=int, default=12, help="points emitted per tracker")
     parser.add_argument("--database", type=Path, help="SQLite output file (temporary by default)")
-    parser.add_argument("--base-topic", default="equine", help="MQTT topic root")
+    parser.add_argument("--base-topic", default="lora-tracker", help="MQTT topic root")
     parser.add_argument("--service-suite", action="store_true", help="also run the ArchiverService MQTT simulation")
     parser.add_argument("--embedded-suite", action="store_true", help="also compile/run tracker and gateway C++ contract tests")
     args = parser.parse_args()
-    database = args.database or Path(tempfile.gettempdir()) / "equine-tracker-simulation.sqlite3"
+    database = args.database or Path(tempfile.gettempdir()) / "lora-tracker-simulation.sqlite3"
     summary = run_simulation(
         database=database,
         tracker_count=args.trackers,

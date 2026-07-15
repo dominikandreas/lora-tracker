@@ -1,116 +1,74 @@
-# LoRa Tracker — prototype 1.0
+# LoRa Tracker
 
-A complete first prototype for low-power LoRa tracking with offline route
-buffering, Wi-Fi/MQTT gateways, recent-history archiving, device onboarding, and
-a browser-based monitoring app.
+LoRa Tracker is a low-power GNSS tracking system with battery-powered tracker
+firmware, a Wi-Fi/MQTT gateway, a SQLite history service, a browser PWA and a
+deterministic cross-component simulator.
 
-## Current status
+## Release status
 
-This release is suitable for continued development and controlled field tests.
-It is **not production-secure yet**: LoRa telemetry and MQTT payloads are not
-end-to-end encrypted or authenticated, MQTT publishing is QoS 0, and the
-prototype onboarding access point uses a shared password unless overridden.
-Read [SECURITY.md](SECURITY.md) before exposing any part of the system publicly.
+The repository is suitable for development and controlled field trials, but
+is not approved for unattended production deployment. The remaining release
+blockers are authenticated LoRa telemetry/ACKs, authenticated BLE provisioning,
+signed firmware with ESP32 secure boot, durable gateway delivery and
+hardware-in-the-loop qualification. See [production readiness](docs/PRODUCTION_READINESS.md)
+and [security](SECURITY.md).
 
 ## Components
 
-| Component | Included version | Purpose |
-|---|---:|---|
-| Tracker firmware | timestamp v4 | GNSS tracking, adaptive sleep, compressed offline history, LoRa transport, BLE/Wi-Fi onboarding |
-| Gateway firmware | MQTT v6 | Multi-tracker LoRa reception, ACKs, per-device deduplication, MQTT routing and management |
-| Archiver | v2 | MQTT-to-SQLite storage, ten-day retention by default, deduplication and paginated history responses |
-| Web app | v1 | Static PWA with MQTT-over-WebSocket, IndexedDB cache, tracker selection and route display |
+| Component | Purpose |
+|---|---|
+| `components/tracker-firmware` | GNSS acquisition, motion-aware sleep, offline history and LoRa transport |
+| `components/gateway-firmware` | Multi-tracker LoRa reception, ACKs, deduplication and MQTT routing |
+| `components/archiver` | Validated MQTT ingestion, SQLite retention and paginated history |
+| `components/web-app` | Installable MQTT-over-WebSocket monitoring PWA |
+| `components/firmware-simulator` | Native contract tests for shared embedded headers |
 
-## Major capabilities
+Only the current protocol and JSON schemas are accepted. Older packet, history,
+point and request schemas are deliberately rejected.
 
-- Adaptive GNSS acquisition and no-fix backoff
-- Stationary/moving sleep policies and low-power LoRa initialization
-- Offline history queue with spatial compression
-- One absolute GNSS timestamp plus ULEB128 per-point time deltas
-- Exponential LoRa retry backoff and ACK-based queue clearing
-- Versioned LoRa envelope, configuration blobs, onboarding API and MQTT schemas
-- Multiple trackers and gateways with stable point IDs
-- Transactional configuration with CRC, revisions, backup and rollback
-- BLE and Wi-Fi onboarding after factory reset
-- MQTT event/state split and a standalone SQLite archiver
-- Browser PWA with local history caching
-- Compatibility with legacy and history-schema-v1 packets during migration
+## Quick start
 
-## Repository layout
+Run the brokerless system and embedded contract simulation:
 
-```text
-components/
-  tracker-firmware/   Current tracker sketch and shared headers
-  gateway-firmware/   Current multi-device gateway sketch and shared headers
-  firmware-simulator/ Native C++ contract harness for shared firmware headers
-  archiver/           Python/SQLite MQTT archiver and tests
-  web-app/            Static progressive web application and tests
-docs/
-  protocols/          Wire, configuration, onboarding and MQTT specifications
-  ARCHITECTURE.md
-  BUILD_AND_DEPLOY.md
-  COMPATIBILITY.md
-  OPERATIONS.md
-history/
-  original-prototypes/  Input prototypes retained for traceability
-  patches/              Milestone patches from power optimization through Step 6
-ROADMAP.md             Prioritized future work and deferred Flutter application
-SECURITY.md            Current threat model, limitations and crypto direction
-CHANGELOG.md           Prototype development history
-SHA256SUMS             Integrity hashes for all files in this bundle
+```bash
+cd components/archiver
+python -m lora_tracker_archiver.simulator \
+  --trackers 2 --points 12 --service-suite --embedded-suite
 ```
 
-## Recommended deployment order
+Build every firmware target with the pinned PlatformIO toolchain:
 
-1. Deploy or upgrade the archiver to v2.
-2. Flash the gateway MQTT-v6 firmware.
-3. Verify the gateway still accepts the old tracker format and returns ACKs.
-4. Flash the tracker timestamp-v4 firmware.
-5. Deploy the web application.
-6. Confirm point events, latest state and history retrieval before relying on it
-   for unattended tracking.
+```bash
+pio run -d components/tracker-firmware -e heltec_wifi_lora_32_v2
+pio run -d components/tracker-firmware -e heltec_wireless_tracker
+pio run -d components/gateway-firmware -e heltec_wifi_lora_32_v2
+```
 
-See [BUILD_AND_DEPLOY.md](docs/BUILD_AND_DEPLOY.md) for concrete setup steps.
+Copy each firmware component's `secrets.example.h` to the git-ignored
+`secrets.h` first. Use a unique onboarding password per device, a separate OTA
+password hash, and a PEM root CA for gateway MQTT. Plain MQTT is disabled by
+default.
 
-## Versioning snapshot
-
-- LoRa transport envelope: v1
-- History message schemas: v1 and v2 accepted; tracker emits v2
-- ACK schema: v1
-- Persistent configuration: v1
-- Onboarding/configuration API: v1
-- MQTT topic API: v1
-- MQTT point/history JSON schema: v2
-
-## Documentation entry points
+## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md)
+- [Onboarding and configuration](docs/ONBOARDING.md)
+- [Configuration reference](docs/CONFIGURATION_REFERENCE.md)
 - [Build and deployment](docs/BUILD_AND_DEPLOY.md)
-- [Compatibility and migrations](docs/COMPATIBILITY.md)
-- [Operations and troubleshooting](docs/OPERATIONS.md)
-- [Security status](SECURITY.md)
-- [Future roadmap](ROADMAP.md)
-- [Protocol specifications](docs/protocols/)
+- [Hardware recommendations](docs/HARDWARE.md)
+- [Operations](docs/OPERATIONS.md)
+- [Simulation coverage](docs/SIMULATION_COVERAGE.md)
+- [Production readiness](docs/PRODUCTION_READINESS.md)
+- [Protocol specifications](docs/protocols/README.md)
+- [Roadmap and larger refactors](ROADMAP.md)
 
-## Validation boundary
+The simulator validates cross-component contracts, both copies of the embedded
+headers, storage, MQTT callbacks and browser payload normalization. It does not
+simulate RF, GNSS, power, flash failure, real brokers or browsers. Those limits
+are listed in [simulation coverage](docs/SIMULATION_COVERAGE.md).
 
-The included Python and JavaScript tests can be run locally. The firmware was
-previously checked with compile-oriented mocks, but this bundle does not pin the
-exact Arduino core and library versions and has not been compiled against your
-local hardware toolchain as part of packaging. Perform real board builds and
-hardware field tests before deployment.
+## Default namespace
 
-For a repeatable, brokerless integration check across the tracker, gateway,
-archiver and PWA-facing MQTT/history boundary, run:
-
-```text
-cd components/archiver
-python -m equine_archiver.simulator --trackers 2 --points 12 --service-suite --embedded-suite
-```
-
-See [simulation coverage](docs/SIMULATION_COVERAGE.md) for the interface cases
-covered in software and the physical checks that require target hardware. The
-embedded suite needs a host C++17 compiler and executes the shared C++ headers
-from both firmware components; it is not a substitute for an ESP32 board build.
-Pinned ESP32 PlatformIO environments are included with each firmware component;
-open `equine-tracker-v2.code-workspace` to work with both projects together.
+New installations publish below `lora-tracker/v1`. Device IDs are canonical
+lowercase identifiers; routing uses the derived 64-bit public device hash. The
+hash is not a secret or an authentication credential.

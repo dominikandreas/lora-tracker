@@ -1,10 +1,9 @@
 // Pure point contract shared by the browser application and its simulator tests.
 export function normalizePoint(raw, fallbackNow = Date.now()) {
-  if (!raw || raw.api_version !== 1 || ![1, 2].includes(raw.point_schema_version)) {
+  if (!raw || raw.api_version !== 1 || raw.point_schema_version !== 2) {
     throw new Error('Unsupported point schema');
   }
-  const validTime = raw.point_schema_version >= 2
-    && raw.timestamp_valid === true
+  const validTime = raw.timestamp_valid === true
     && Number.isSafeInteger(raw.fix_time_unix_ms)
     && raw.fix_time_unix_ms > 0;
   const effective = validTime ? raw.fix_time_unix_ms : (raw.received_at_ms || fallbackNow);

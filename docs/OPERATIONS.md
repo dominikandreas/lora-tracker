@@ -12,14 +12,14 @@ queued sequence remains available for later delivery.
 ## Useful MQTT topics
 
 ```text
-equine/v1/trackers/<device_hash>/events/point
-equine/v1/trackers/<device_hash>/state
-equine/v1/trackers/<device_hash>/history/request
-equine/v1/trackers/<device_hash>/history/response/<request_id>
-equine/v1/gateways/<gateway_hash>/availability
-equine/v1/gateways/<gateway_hash>/status
-equine/v1/gateways/<gateway_hash>/commands/request
-equine/v1/gateways/<gateway_hash>/commands/response/<request_id>
+lora-tracker/v1/trackers/<device_hash>/events/point
+lora-tracker/v1/trackers/<device_hash>/state
+lora-tracker/v1/trackers/<device_hash>/history/request
+lora-tracker/v1/trackers/<device_hash>/history/response/<request_id>
+lora-tracker/v1/gateways/<gateway_hash>/availability
+lora-tracker/v1/gateways/<gateway_hash>/status
+lora-tracker/v1/gateways/<gateway_hash>/commands/request
+lora-tracker/v1/gateways/<gateway_hash>/commands/response/<request_id>
 ```
 
 ## Health checks

@@ -5,12 +5,12 @@ paginated history requests over MQTT.
 
 ## Features
 
-- Accepts point JSON schema v1 and v2 during rolling upgrades.
-- Stores GNSS fix time from schema v2 and falls back to server receive time for
-  legacy untimed points.
+- Accepts only point JSON schema 2.
+- Stores GNSS fix time and uses server receive time for current-schema points
+  that explicitly report no valid fix timestamp.
 - Deduplicates using stable `point_id`.
 - Records receptions from multiple gateways independently.
-- Migrates an existing v1 SQLite database in place.
+- Upgrades an existing SQLite database in place.
 - Keeps ten days by default using effective observation time.
 - Optional allowlist of tracker hashes.
 - Chunked MQTT history-schema v2 responses.
@@ -25,7 +25,7 @@ python -m venv .venv
 pip install .
 cp .env.example .env
 set -a; . ./.env; set +a
-python -m equine_archiver
+python -m lora_tracker_archiver
 ```
 
 ## Run the end-to-end simulator
@@ -36,7 +36,7 @@ and paginated history responses. It uses the production protocol and SQLite
 store, so it can be run before hardware or a broker are available.
 
 ```bash
-python -m equine_archiver.simulator --trackers 2 --points 12 --service-suite --embedded-suite
+python -m lora_tracker_archiver.simulator --trackers 2 --points 12 --service-suite --embedded-suite
 ```
 
 It prints a JSON summary and writes a temporary SQLite database by default. Use
@@ -57,12 +57,12 @@ docker compose -f docker-compose.example.yml up --build -d
 ## Request history
 
 ```bash
-mosquitto_sub -t 'equine/v1/trackers/3db3edf61a18fac0/history/response/demo-1'
+mosquitto_sub -t 'lora-tracker/v1/trackers/3db3edf61a18fac0/history/response/demo-1'
 ```
 
 ```bash
 mosquitto_pub \
-  -t 'equine/v1/trackers/3db3edf61a18fac0/history/request' \
+  -t 'lora-tracker/v1/trackers/3db3edf61a18fac0/history/request' \
   -m '{"api_version":1,"schema_version":2,"request_id":"demo-1","limit":100}'
 ```
 

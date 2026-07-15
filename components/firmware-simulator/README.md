@@ -11,7 +11,7 @@ Wi-Fi.  Those require target builds and hardware-in-the-loop tests.
 Run it as part of the full simulator from `components/archiver`:
 
 ```text
-python -m equine_archiver.simulator --embedded-suite
+python -m lora_tracker_archiver.simulator --embedded-suite
 ```
 
 The command requires a C++17 compiler (`g++`, `clang++`, or `CXX`).  It compiles

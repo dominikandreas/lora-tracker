@@ -1,4 +1,4 @@
-# LoRa Tracker MQTT API v1 — point/history schema v2
+# MQTT API
 
 The topic API remains `v1`. Point JSON and history response schemas are now
 version 2 to carry tracker fix time. MQTT remains an untrusted transport until
@@ -7,8 +7,8 @@ end-to-end authenticated encryption is added.
 ## Point events and latest state
 
 ```text
-equine/v1/trackers/<device_hash>/events/point   non-retained
-equine/v1/trackers/<device_hash>/state          retained
+lora-tracker/v1/trackers/<device_hash>/events/point   non-retained
+lora-tracker/v1/trackers/<device_hash>/state          retained
 ```
 
 ```json
@@ -37,8 +37,8 @@ equine/v1/trackers/<device_hash>/state          retained
 }
 ```
 
-When decoding an old history-v1 or legacy LoRa packet, the gateway still emits
-point schema v2 but uses:
+When a current history packet explicitly has no valid GNSS timestamp, the
+gateway emits:
 
 ```json
 {
@@ -53,7 +53,7 @@ Consumers must prefer `fix_time_unix_ms` only when `timestamp_valid` is true.
 ## History request
 
 ```text
-equine/v1/trackers/<device_hash>/history/request
+lora-tracker/v1/trackers/<device_hash>/history/request
 ```
 
 ```json
@@ -68,14 +68,13 @@ equine/v1/trackers/<device_hash>/history/request
 }
 ```
 
-The archiver accepts history request schemas 1 and 2 during migration. Time
-filtering in schema 2 uses GNSS fix time when available and server receive time
-for old untimed points.
+The archiver accepts only history request schema 2. Time filtering uses GNSS
+fix time when available and server receive time for explicitly untimed points.
 
 ## History response
 
 ```text
-equine/v1/trackers/<device_hash>/history/response/<request_id>
+lora-tracker/v1/trackers/<device_hash>/history/response/<request_id>
 ```
 
 Every returned point includes:
@@ -88,8 +87,8 @@ Every returned point includes:
 - `reception_gateway_count`
 - `best_rssi`
 
-`effective_time_unix_ms` is GNSS fix time when valid, otherwise receive time. It
-is the recommended display and filtering field for mixed-version history.
+`effective_time_unix_ms` is GNSS fix time when valid, otherwise receive time.
+It is the recommended display and filtering field.
 
 Responses remain chunked and use `final`, `has_more`, and `next_cursor`.
 

@@ -1,6 +1,7 @@
-# Equine onboarding and configuration API v1
+# Onboarding and configuration API
 
-This document defines the provisioning transport implemented in Step 4. It operates on the versioned, CRC-protected configuration blobs from `EQUINE_CONFIG_V1.md`.
+This document defines the provisioning transport over the versioned,
+CRC-protected configuration blobs in [`CONFIGURATION.md`](CONFIGURATION.md).
 
 ## Transaction model
 
@@ -26,7 +27,10 @@ For secret fields:
 
 ## Wi-Fi HTTP API
 
-All mutation bodies use `application/x-www-form-urlencoded`.
+All mutation bodies use `application/x-www-form-urlencoded`. Every HTTP route
+requires Basic authentication with username `admin` and the device's unique
+onboarding password. The password is also the WPA2 credential of the fallback
+access point and must be at least 12 characters.
 
 ### Discovery
 
@@ -88,10 +92,12 @@ The next boot enters onboarding automatically.
 
 After factory reset, or after an explicit post-boot Wi-Fi setup gesture, the tracker provides both transports concurrently:
 
-- Wi-Fi AP: `EquineTracker-<device_id>`
+- Wi-Fi AP: `LoRaTracker-<device_id>`
 - BLE name: `EqTrk-<device_id>`
 
-The prototype fallback AP password is `EquineSetup!`. It can later be replaced by a per-device provisioning credential without changing the API.
+Set a different `onboarding_ap_password` in each device's `secrets.h`. The
+firmware refuses to start the AP or authorize HTTP if it is shorter than 12
+characters, and never prints it to logs.
 
 The tracker also tries station mode during an explicit setup session when it is already provisioned. Timer wake-ups never expose configuration services.
 
@@ -125,13 +131,13 @@ The PATCH body uses the same URL-encoded fields and secret semantics as HTTP.
 An unprovisioned gateway automatically starts:
 
 ```text
-SSID: EquineGateway-<gateway_id>
-Password: EquineSetup!
+SSID: LoRaGateway-<gateway_id>
+Password: the gateway's unique onboarding password
 ```
 
 For a provisioned gateway, configuration reads remain available on the local network, but writes are locked. Holding the gateway USER button for five seconds unlocks writes for ten minutes. If Wi-Fi is unavailable, the gateway exposes its fallback AP; it remains read-only until that physical hold unless it is unprovisioned.
 
-Define `EQUINE_ONBOARDING_AP_PASSWORD` at build time in either firmware to override the prototype AP password.
+Provision `onboarding_ap_password` in `secrets.h` before the first flash.
 
 ## Tracker patch fields
 
@@ -193,8 +199,6 @@ tracker_count
 tracker.0.id
 tracker.0.name
 tracker.0.enabled
-tracker.0.accepts_legacy_lora
-tracker.0.publish_legacy_mqtt_aliases
 ...
 tracker.11.*
 ```
@@ -203,9 +207,12 @@ The complete candidate is validated after all fields are applied, so `tracker_co
 
 ## Security scope
 
-This step provides physical-gated configuration and transactional integrity, but not end-to-end cryptographic provisioning yet. The later encryption step should add:
+HTTP has per-device password authentication and gateway mutations additionally
+require a physical unlock. BLE commands are still unauthenticated beyond radio
+proximity and are therefore a release blocker. A future protocol revision must
+add:
 
-- a random per-device secret instead of a shared AP password;
+- a random per-device cryptographic provisioning secret distinct from the AP password;
 - authenticated app/device sessions;
 - QR transfer of public identity and provisioning material;
 - encrypted export/import bundles;

@@ -1,49 +1,22 @@
 # Changelog
 
-## 1.0.0-prototype — 2026-07-15
+## Unreleased — production-hardening pass
 
-First consolidated prototype release.
+- Removed support for all superseded LoRa, point and history-request schemas.
+- Changed the product, package, workspace and default MQTT namespace to LoRa Tracker.
+- Added certificate-verified gateway MQTT TLS and explicit plaintext opt-in.
+- Required unique onboarding credentials for AP and HTTP administration.
+- Disabled OTA without a password hash and disabled telnet logging by default.
+- Strengthened archiver validation and SQLite durability settings.
+- Fixed browser defaults, strict schema validation and offline asset caching.
+- Added pinned tracker/gateway PlatformIO builds and embedded contract simulation.
+- Fixed an ESP32 RTC slow-memory link overflow by sizing the history queue to 448 points.
+- Added onboarding, configuration, hardware, operations, security and production-readiness guidance.
 
-### Prototype stabilization
+## Initial implementation
 
-- Reduced normal power consumption through adaptive GNSS acquisition, deep
-  sleep, lazy display/radio initialization and cached battery reads.
-- Added stationary and no-fix backoff policies.
-- Added LoRa batching, ACK handling and exponential retry backoff.
-- Corrected BLE toggle lifecycle deadlocks and display-button state handling.
-- Separated GNSS movement classification from stale speed values and added
-  displacement-derived speed.
-
-### Protocol and multi-node foundation
-
-- Added versioned LoRa transport envelope and public device routing hash.
-- Added multi-tracker gateway registry and per-device deduplication.
-- Added stable point IDs suitable for several gateways.
-- Added legacy rolling-upgrade support.
-
-### Configuration and onboarding
-
-- Added CRC-protected active/backup NVS configuration blobs.
-- Added validation, revision conflicts, rollback and migration.
-- Added tracker BLE/Wi-Fi onboarding and gateway Wi-Fi onboarding.
-- Added physical gateway write-unlock window.
-
-### MQTT and storage
-
-- Split point event stream from retained latest state.
-- Added gateway management topics and status.
-- Added Python/SQLite archiver with deduplication, multi-gateway reception
-  metadata, retention and paginated MQTT history requests.
-
-### Timestamp and web application
-
-- Added history schema v2 with root Unix time and ULEB128 delta timestamps.
-- Added point/history JSON schema v2 with GNSS/receive-time fallback.
-- Added a static PWA with MQTT-over-WebSocket, IndexedDB and SVG route view.
-
-### Deferred
-
-- Flutter application
-- End-to-end encryption and authenticated ACKs
-- LoRa relay/mesh support
-- QR/app-to-app provisioning transfer
+- Added adaptive GNSS acquisition, movement filtering and deep-sleep policies.
+- Added compressed offline history, ACK-based LoRa delivery and retry backoff.
+- Added multi-tracker gateway routing, MQTT publishing and deduplication.
+- Added transactional configuration, Wi-Fi/BLE onboarding and rollback.
+- Added the SQLite archiver, browser PWA and deterministic system simulator.

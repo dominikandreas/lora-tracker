@@ -43,17 +43,17 @@ model.
 
 ## Gateway
 
-The gateway accepts legacy, history-v1 and history-v2 LoRa packets. Versioned
-frames are routed by a public 64-bit device hash. It maintains independent
+The gateway accepts only the current versioned LoRa history packet. Frames are
+routed by a public 64-bit device hash. It maintains independent
 per-tracker deduplication state, publishes point events and retained latest
 state, and ACKs only after successful packet processing.
 
-The gateway can register up to 12 trackers in configuration v1. One tracker may
-be designated as the recipient of identity-less legacy packets.
+The gateway can register up to 12 trackers. Unknown identities and unsupported
+schemas are rejected.
 
 ## MQTT and archiver
 
-Canonical topics are rooted at `equine/v1`. Point events are non-retained;
+Canonical topics are rooted at `lora-tracker/v1`. Point events are non-retained;
 latest state and availability are retained. The stable point identifier is:
 
 ```text
@@ -92,5 +92,5 @@ The routing hash must never be treated as a password or encryption key.
 ## Versioning
 
 Transport, message schema, configuration, onboarding API and MQTT JSON schema
-are versioned independently. This lets consumers support rolling upgrades
-without changing all layers simultaneously.
+are versioned independently. This release intentionally supports only its
+current schema set; incompatible devices must be upgraded before deployment.

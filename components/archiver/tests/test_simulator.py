@@ -5,12 +5,12 @@ import shutil
 
 import pytest
 
-from equine_archiver.simulator import (
+from lora_tracker_archiver.simulator import (
     run_embedded_simulation,
     run_service_simulation,
     run_simulation,
 )
-from equine_archiver.store import HistoryStore
+from lora_tracker_archiver.store import HistoryStore
 
 
 def _host_cpp_compiler_available() -> bool:

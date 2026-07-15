@@ -1,3 +1,5 @@
+"""SQLite history storage."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -23,8 +25,10 @@ class HistoryStore:
         self._db = sqlite3.connect(self.path, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         with self._db:
+            self._db.execute("PRAGMA foreign_keys=ON")
+            self._db.execute("PRAGMA busy_timeout=5000")
             self._db.execute("PRAGMA journal_mode=WAL")
-            self._db.execute("PRAGMA synchronous=NORMAL")
+            self._db.execute("PRAGMA synchronous=FULL")
             self._db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS points (
@@ -168,8 +172,8 @@ class HistoryStore:
         limit: int,
         cursor: int = 0,
     ) -> QueryResult:
-        # GNSS fix time is authoritative when available. Legacy points fall back
-        # to server receive time, preserving useful history during migration.
+        # GNSS fix time is authoritative when available. Untimed points fall
+        # back to authenticated gateway receive time.
         effective_time = (
             "CASE WHEN p.timestamp_valid = 1 AND p.fix_time_unix_ms > 0 "
             "THEN p.fix_time_unix_ms ELSE p.received_at_ms END"
@@ -215,7 +219,7 @@ class HistoryStore:
 
     def purge_before(self, cutoff_unix_ms: int) -> int:
         # Retention is based on effective observation time, not delayed MQTT
-        # delivery time. Legacy points use receive time.
+        # delivery time. Untimed points use receive time.
         with self._lock, self._db:
             point_ids = [
                 row[0]

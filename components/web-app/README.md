@@ -7,7 +7,7 @@ files and uses MQTT 3.1.1 over WebSocket directly in the browser.
 
 - MQTT WebSocket connection with username/password
 - Automatic discovery of tracker point/state messages
-- Point-schema v1 and v2 compatibility
+- Strict point-schema 2 validation
 - GNSS timestamp display with receive-time fallback
 - MQTT history-schema v2 requests and chunk collection
 - IndexedDB local point cache

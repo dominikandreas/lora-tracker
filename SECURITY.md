@@ -1,71 +1,56 @@
-# Security status
+# Security
 
-## Prototype warning
+## Deployment status
 
-This release protects configuration integrity against accidental corruption,
-but it does **not** provide end-to-end confidentiality or authenticity for
-location data. Do not treat it as suitable for publishing real tracker data on
-an anonymous public broker.
+Do not expose real location data to an anonymous or public broker. This release
+has materially safer defaults, but unauthenticated LoRa and BLE paths remain
+production release blockers.
 
-## Present protections
+## Implemented controls
 
-- CRC-protected, revisioned configuration with backup and rollback
-- Gateway configuration write window gated by a physical button
-- Broker username/password support
-- MQTT TLS support in the Python archiver when configured
-- Web app does not persist the MQTT password
-- Version/magic/device checks on LoRa frames
-- Stable deduplication IDs
+- Unique per-device onboarding password required for WPA2 and HTTP Basic auth
+- Gateway configuration mutations additionally gated by a physical button
+- OTA disabled unless a separate 64-character SHA-256 password hash is supplied
+- Gateway MQTT uses certificate-verified TLS by default
+- Plain MQTT requires an explicit `allow_insecure_mqtt=true` test override
+- Unauthenticated telnet logging disabled by default
+- Archiver refuses plaintext MQTT unless explicitly opted in
+- Revisioned configuration, CRC validation, backup and rollback
+- Strict current-schema parsing, registered-device routing and stable dedup IDs
+- Secrets omitted from configuration reads and MQTT passwords not persisted by the PWA
 
-These are useful operational controls, not a complete security model.
+## Open release blockers
 
-## Known gaps
+1. LoRa history and ACK frames are plaintext and unauthenticated. A forged ACK
+   can clear the tracker queue.
+2. BLE provisioning commands do not authenticate the client or protect against replay.
+3. Gateway MQTT publishing uses QoS 0 and has no durable outage queue.
+4. ArduinoOTA password authentication does not provide a signed firmware trust chain.
+5. The public FNV-1a device hash is predictable and provides routing only.
+6. Broker and archiver can see plaintext locations; authorization relies on broker ACLs.
+7. ESP32 secure boot, flash/NVS encryption and production eFuse policy are not configured.
 
-1. LoRa telemetry is plaintext and unauthenticated.
-2. ACK frames are unauthenticated and could be forged to clear a queue.
-3. The current FNV-1a device hash is predictable and is only a routing ID.
-4. The default onboarding AP password is shared: `EquineSetup!`.
-5. BLE onboarding does not yet require cryptographic pairing or an authenticated
-   application session.
-6. HTTP onboarding is plaintext on the local AP/LAN.
-7. MQTT data is visible to the broker and archiver.
-8. Gateway firmware uses PubSubClient QoS-0 publishing.
-9. OTA authentication/signing is not fully specified or enforced.
-10. Gateway command and history-response authorization depend on broker ACLs.
+## Minimum field-trial rules
 
-## Minimum deployment rules
+- Use a private broker with trusted TLS certificates, named accounts and least-privilege ACLs.
+- Give every physical device a different onboarding and OTA password.
+- Keep provisioning and device HTTP endpoints on an isolated management network.
+- Leave BLE debug disabled except during attended setup.
+- Do not enable the test-only plaintext MQTT or telnet build switches.
+- Treat location history, backups and logs as sensitive personal data.
+- Rotate credentials after a lost device or an exposed provisioning record.
 
-- Use a private broker or a dedicated account on a managed broker.
-- Enable TLS and verify certificates.
-- Disable anonymous access.
-- Restrict ACLs by tracker, gateway, archiver and application role.
-- Replace the onboarding AP password at build time.
-- Keep OTA access on a trusted network.
-- Do not expose the device HTTP interfaces to the internet.
-- Treat location history as sensitive personal data.
+## Required production design
 
-## Planned cryptographic design
+The planned protocol must use a random per-device secret, purpose-separated
+keys, AEAD for history/ACK/command frames, non-repeating counters, replay
+windows, authenticated ACK ranges, key rotation and revocation. Gateways should
+route ciphertext without needing tracker keys. Production firmware should use
+ESP32-S3 Secure Boot v2 together with flash and NVS encryption, signed OTA and
+per-device key material. These changes are tracked in [ROADMAP.md](ROADMAP.md).
 
-A future protocol revision should introduce:
+## Reporting
 
-- random per-device 128- or 256-bit provisioning secret;
-- random public device identifier/routing hash, distinct from the secret;
-- AEAD for history, ACK and command frames;
-- nonces derived from a non-repeating boot/session counter, message type and
-  sequence number;
-- replay windows and authenticated ACK ranges;
-- HKDF-based purpose-specific keys;
-- key version and rotation support;
-- QR provisioning payload containing public identity and protected key material;
-- encrypted app-to-app export/import bundles;
-- optional archiver decryption authorization separate from gateway routing.
-
-Gateways and relays should be able to route ciphertext without tracker keys.
-Whether the archiver stores ciphertext or plaintext should be a per-tracker
-policy.
-
-## Reporting issues
-
-This is a private prototype bundle with no selected public license or formal
-security reporting channel. Record discovered issues in the project tracker and
-do not publish exploitable details before deployed devices are updated.
+Report suspected vulnerabilities privately through the repository's GitHub
+security advisory interface. Do not publish working exploits before deployed
+devices can be updated.

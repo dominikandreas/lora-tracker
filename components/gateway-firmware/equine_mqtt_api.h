@@ -23,7 +23,7 @@ inline void formatTrackerTopic(char* output, size_t output_size,
                                const char* suffix) {
   if (!output || output_size == 0) return;
   snprintf(output, output_size, "%s/v%u/trackers/%s/%s",
-           base_topic ? base_topic : "equine", API_VERSION,
+           base_topic ? base_topic : "lora-tracker", API_VERSION,
            device_hash ? device_hash : "unknown",
            suffix ? suffix : "");
 }
@@ -33,7 +33,7 @@ inline void formatGatewayTopic(char* output, size_t output_size,
                                const char* suffix) {
   if (!output || output_size == 0) return;
   snprintf(output, output_size, "%s/v%u/gateways/%s/%s",
-           base_topic ? base_topic : "equine", API_VERSION,
+           base_topic ? base_topic : "lora-tracker", API_VERSION,
            gateway_hash ? gateway_hash : "unknown",
            suffix ? suffix : "");
 }

@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <SPI.h>
 #include <LoRa.h>
@@ -22,10 +23,6 @@ EquineConfig::GatewayConfigV1 gateway_config{};
 Preferences configPrefs;
 
 #define USER_BTN_PIN 0
-#ifndef EQUINE_ONBOARDING_AP_PASSWORD
-#define EQUINE_ONBOARDING_AP_PASSWORD "EquineSetup!"
-#endif
-
 bool gateway_onboarding_required = false;
 bool gateway_config_mode = false;
 bool gateway_ap_active = false;
@@ -60,8 +57,6 @@ struct TrackerRuntime {
   char state_topic[96];
   char point_event_topic[112];
   char availability_topic[96];
-  char legacy_state_topic[64];
-  char legacy_availability_topic[64];
   char dedup_namespace[16];
 
   bool has_processed_point;
@@ -100,26 +95,10 @@ const size_t LOG_HISTORY_LINE_LENGTH = 160;
 // VERSIONED PAYLOAD FORMAT
 // ==========================================
 using AckPayload = EquineProtocol::AckPayloadV1;
-using LoRaHeaderV1 = EquineProtocol::HistoryHeaderV1;
 using LoRaHeaderV2 = EquineProtocol::HistoryHeaderV2;
 using AnchorPoint = EquineProtocol::AnchorPointV1;
 
-// The gateway accepts legacy packets during the rolling upgrade. Update the
-// gateway first, then the tracker. New trackers always require versioned ACKs.
-struct LegacyAckPayload {
-  uint32_t boot_id;
-  uint32_t acked_seq;
-} __attribute__((packed));
-
-struct LegacyLoRaHeader {
-  uint32_t boot_id;
-  uint32_t first_seq;
-  uint16_t total_dist_dam;
-  uint8_t batt_pct;
-} __attribute__((packed));
-
 struct DecodedHistoryHeader {
-  bool legacy;
   uint8_t transport_version;
   uint8_t schema_version;
   uint64_t device_id_hash;
@@ -131,8 +110,14 @@ struct DecodedHistoryHeader {
   uint8_t batt_pct;
 };
 
-WiFiClient espClient;
-PubSubClient client(espClient);
+WiFiClient plainMqttClient;
+WiFiClientSecure secureMqttClient;
+PubSubClient client;
+#ifdef LORA_TRACKER_ENABLE_INSECURE_TELNET
+constexpr bool REMOTE_LOGGING_ENABLED = true;
+#else
+constexpr bool REMOTE_LOGGING_ENABLED = false;
+#endif
 WiFiServer telnetServer(23);
 WiFiClient telnetClient;
 WebServer webServer(80);
@@ -148,6 +133,16 @@ wl_status_t lastWiFiStatus = WL_IDLE_STATUS;
 
 constexpr uint32_t GATEWAY_STATUS_INTERVAL_MS = 60000;
 constexpr size_t MQTT_COMMAND_PAYLOAD_SIZE = 512;
+
+bool isValidSha256Hex(const char* value) {
+  if (!value || strlen(value) != 64) return false;
+  for (size_t i = 0; i < 64; i++) {
+    const char c = value[i];
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+          (c >= 'A' && c <= 'F'))) return false;
+  }
+  return true;
+}
 
 // ==========================================
 // HELPERS
@@ -297,10 +292,18 @@ bool writeGatewayConfigBlob(const char* key,
 }
 
 void makeGatewayFactoryConfig() {
+  const uint32_t chip_suffix =
+    static_cast<uint32_t>(ESP.getEfuseMac() & 0x00FFFFFFULL);
+  char factory_id[EquineConfig::DEVICE_ID_SIZE];
+  char factory_name[EquineConfig::DEVICE_NAME_SIZE];
+  snprintf(factory_id, sizeof(factory_id), "gateway-%06lx",
+           static_cast<unsigned long>(chip_suffix));
+  snprintf(factory_name, sizeof(factory_name), "Gateway %06lX",
+           static_cast<unsigned long>(chip_suffix));
   EquineConfig::makeDefaultGatewayConfig(
     gateway_config,
-    "home",
-    "Home Equine Gateway",
+    factory_id,
+    factory_name,
     ssid,
     password,
     mqtt_server,
@@ -308,15 +311,8 @@ void makeGatewayFactoryConfig() {
     mqtt_user,
     mqtt_pass);
 
-  // Migration seed matching the former compile-time registry. Future
-  // onboarding writes the same versioned structure without recompilation.
-  gateway_config.tracker_count = 1;
-  EquineConfig::GatewayTrackerConfigV1& tracker = gateway_config.trackers[0];
-  strlcpy(tracker.device_id, "wera", sizeof(tracker.device_id));
-  strlcpy(tracker.device_name, "Wera", sizeof(tracker.device_name));
-  tracker.enabled = 1;
-  tracker.accepts_legacy_lora = 1;
-  tracker.publish_legacy_mqtt_aliases = 1;
+  // Start with an empty allowlist; onboarding must register every tracker.
+  gateway_config.tracker_count = 0;
   EquineConfig::finalize(
     gateway_config, EquineConfig::DeviceRole::GATEWAY, 1);
 }
@@ -378,7 +374,7 @@ bool loadGatewayConfig() {
     source = "backup";
     if (!readGatewayConfigBlob(
           EquineConfig::BACKUP_CONFIG_KEY, gateway_config)) {
-      source = "factory/migrated";
+      source = "factory";
       created_factory = true;
       makeGatewayFactoryConfig();
       if (!saveGatewayConfig(false)) return false;
@@ -504,11 +500,7 @@ String gatewayConfigJson() {
     out += "\",\"name\":\"";
     appendJsonEscaped(out, tracker.device_name);
     out += "\",\"device_hash\":\"" + String(hash) +
-           "\",\"enabled\":" + String(tracker.enabled ? "true" : "false") +
-           ",\"accepts_legacy_lora\":" +
-           String(tracker.accepts_legacy_lora ? "true" : "false") +
-           ",\"publish_legacy_mqtt_aliases\":" +
-           String(tracker.publish_legacy_mqtt_aliases ? "true" : "false") + "}";
+           "\",\"enabled\":" + String(tracker.enabled ? "true" : "false") + "}";
   }
   out += "]}";
   return out;
@@ -598,19 +590,6 @@ TrackerRuntime* findTrackerByHash(uint64_t hash) {
   return nullptr;
 }
 
-TrackerRuntime* findLegacyTracker() {
-  TrackerRuntime* result = nullptr;
-  for (size_t i = 0; i < GATEWAY_TRACKER_COUNT; i++) {
-    if (!tracker_runtime[i].config->accepts_legacy_lora) continue;
-    if (result != nullptr) {
-      logPrintln("Registry error: multiple trackers accept legacy LoRa.");
-      return nullptr;
-    }
-    result = &tracker_runtime[i];
-  }
-  return result;
-}
-
 bool initializeTrackerRegistry() {
   tracker_runtime_count = 0;
   memset(tracker_runtime, 0, sizeof(tracker_runtime));
@@ -631,9 +610,8 @@ bool initializeTrackerRegistry() {
   EquineMqttApi::formatGatewayTopic(
     gateway_response_prefix, sizeof(gateway_response_prefix),
     gateway_config.mqtt_base_topic, gateway_hash_text, "commands/response");
-  snprintf(ota_hostname, sizeof(ota_hostname), "equine-gateway-%s", GATEWAY_ID);
+  snprintf(ota_hostname, sizeof(ota_hostname), "lora-gateway-%s", GATEWAY_ID);
 
-  uint8_t legacy_count = 0;
   for (uint8_t config_index = 0;
        config_index < gateway_config.tracker_count;
        config_index++) {
@@ -669,17 +647,6 @@ bool initializeTrackerRegistry() {
     EquineMqttApi::formatTrackerTopic(
       tracker.availability_topic, sizeof(tracker.availability_topic),
       gateway_config.mqtt_base_topic, tracker.hash_text, "availability");
-    snprintf(
-      tracker.legacy_state_topic, sizeof(tracker.legacy_state_topic),
-      "horse/%s/state", tracker.config->device_id
-    );
-    snprintf(
-      tracker.legacy_availability_topic,
-      sizeof(tracker.legacy_availability_topic),
-      "horse/%s/availability", tracker.config->device_id
-    );
-
-    if (tracker.config->accepts_legacy_lora) legacy_count++;
 
     for (size_t previous = 0; previous < tracker_runtime_count; previous++) {
       if (tracker_runtime[previous].device_id_hash == tracker.device_id_hash) {
@@ -699,11 +666,6 @@ bool initializeTrackerRegistry() {
     tracker_runtime_count++;
   }
 
-  if (legacy_count > 1) {
-    logPrintln("Configuration error: only one tracker may accept legacy LoRa.");
-    return false;
-  }
-
   return true;
 }
 
@@ -716,9 +678,6 @@ void publishGatewayAvailability(const char* payload) {
   for (size_t i = 0; i < GATEWAY_TRACKER_COUNT; i++) {
     TrackerRuntime& tracker = tracker_runtime[i];
     client.publish(tracker.availability_topic, payload, true);
-    if (tracker.config->publish_legacy_mqtt_aliases) {
-      client.publish(tracker.legacy_availability_topic, payload, true);
-    }
   }
 }
 
@@ -740,9 +699,6 @@ bool publishTrackerPoint(TrackerRuntime& tracker, const char* payload) {
               tracker.state_topic);
   }
 
-  if (tracker.config->publish_legacy_mqtt_aliases) {
-    client.publish(tracker.legacy_state_topic, payload, false);
-  }
   return true;
 }
 
@@ -986,41 +942,11 @@ void loadDedupState(TrackerRuntime& tracker) {
     return;
   }
 
-  const bool has_new_namespace_state = dedupPrefs.isKey("has");
   tracker.has_processed_point = dedupPrefs.getBool("has", false);
   tracker.last_processed_boot_id = dedupPrefs.getULong("boot", 0);
   tracker.last_processed_seq = dedupPrefs.getULong("seq", 0);
   tracker.unsaved_dedup_updates = 0;
   dedupPrefs.end();
-
-  // One-time migration from the protocol-v1 single-tracker gateway. Legacy
-  // firmware stored Wera's cursor in namespace "gateway" with longer keys.
-  if (!has_new_namespace_state && tracker.config->accepts_legacy_lora) {
-    Preferences legacyPrefs;
-    if (legacyPrefs.begin("gateway", true)) {
-      const bool legacy_state_exists = legacyPrefs.isKey("has_point");
-      const bool legacy_has_point = legacyPrefs.getBool("has_point", false);
-      const uint32_t legacy_boot = legacyPrefs.getULong("boot_id", 0);
-      const uint32_t legacy_seq = legacyPrefs.getULong("seq", 0);
-      legacyPrefs.end();
-
-      if (legacy_state_exists && legacy_has_point) {
-        tracker.has_processed_point = true;
-        tracker.last_processed_boot_id = legacy_boot;
-        tracker.last_processed_seq = legacy_seq;
-
-        Preferences migrationTarget;
-        if (migrationTarget.begin(tracker.dedup_namespace, false)) {
-          migrationTarget.putBool("has", true);
-          migrationTarget.putULong("boot", legacy_boot);
-          migrationTarget.putULong("seq", legacy_seq);
-          migrationTarget.end();
-          logPrintf("Migrated legacy dedup cursor to %s for %s.\n",
-                    tracker.dedup_namespace, tracker.config->device_id);
-        }
-      }
-    }
-  }
 
   logPrintf("Loaded dedup [%s/%s] -> has=%s boot_id=%lu seq=%lu\n",
             tracker.config->device_id,
@@ -1080,6 +1006,11 @@ void updateDedupState(TrackerRuntime& tracker, uint32_t boot_id, uint32_t seq) {
 
 void setupOTA() {
   ArduinoOTA.setHostname(ota_hostname);
+  if (!isValidSha256Hex(ota_password_hash)) {
+    logPrintln("OTA disabled: configure a 64-character SHA-256 password hash.");
+    return;
+  }
+  ArduinoOTA.setPasswordHash(ota_password_hash);
 
   ArduinoOTA
     .onStart([]() {
@@ -1114,14 +1045,29 @@ void setupOTA() {
 }
 
 void setupRemoteLogging() {
+  if (!REMOTE_LOGGING_ENABLED) {
+    logPrintln("Unauthenticated telnet logging is disabled.");
+    return;
+  }
   telnetServer.begin();
   telnetServer.setNoDelay(true);
 
   logPrintf("Remote logs ready on telnet://%s:23\n", ota_hostname);
 }
 
+bool requireWebAuthentication() {
+  if (strlen(onboarding_ap_password) < 12) {
+    webServer.send(503, "application/json", "{\"error\":\"admin_credentials_not_configured\"}");
+    return false;
+  }
+  if (webServer.authenticate("admin", onboarding_ap_password)) return true;
+  webServer.requestAuthentication(BASIC_AUTH, "LoRa Tracker gateway");
+  return false;
+}
+
 void setupWebInterface() {
   webServer.on("/", HTTP_GET, []() {
+    if (!requireWebAuthentication()) return;
     logPrintln("Web UI accessed by a client.");
     String html;
     html.reserve(6000);
@@ -1135,17 +1081,14 @@ void setupWebInterface() {
             String(gateway_config.header.schema_version) + "/" +
             String(gateway_config.header.revision) +
             "<br>Registered trackers: " + String(GATEWAY_TRACKER_COUNT) + "</p>";
-    html += "<h2>Tracker registry</h2><table><tr><th>Name</th><th>ID</th><th>Hash</th><th>Legacy</th><th>Last seen</th><th>RSSI</th><th>Dedup cursor</th></tr>";
+    html += "<h2>Tracker registry</h2><table><tr><th>Name</th><th>ID</th><th>Hash</th><th>Last seen</th><th>RSSI</th><th>Dedup cursor</th></tr>";
 
     const uint32_t now = millis();
     for (size_t i = 0; i < GATEWAY_TRACKER_COUNT; i++) {
       const TrackerRuntime& tracker = tracker_runtime[i];
       html += "<tr><td>" + String(tracker.config->device_name) + "</td><td><code>" +
               String(tracker.config->device_id) + "</code></td><td><code>" +
-              String(tracker.hash_text) + "</code></td><td>" +
-              String(tracker.config->accepts_legacy_lora ? "LoRa " : "") +
-              String(tracker.config->publish_legacy_mqtt_aliases ? "MQTT" : "") +
-              "</td><td>";
+              String(tracker.hash_text) + "</code></td><td>";
       if (tracker.has_been_seen) {
         html += String((now - tracker.last_seen_ms) / 1000UL) + " s ago";
       } else {
@@ -1187,6 +1130,7 @@ void setupWebInterface() {
   });
 
   webServer.on("/api/v1/onboarding", HTTP_GET, []() {
+    if (!requireWebAuthentication()) return;
     String out = "{\"api_version\":" + String(EquineConfigApi::API_VERSION) +
       ",\"role\":\"gateway\",\"onboarding_required\":" +
       String(gateway_onboarding_required ? "true" : "false") +
@@ -1197,10 +1141,12 @@ void setupWebInterface() {
   });
 
   webServer.on("/api/v1/config", HTTP_GET, []() {
+    if (!requireWebAuthentication()) return;
     webServer.send(200, "application/json", gatewayConfigJson());
   });
 
   webServer.on("/api/v1/config", HTTP_POST, []() {
+    if (!requireWebAuthentication()) return;
     if (!gatewayConfigWritesAllowed()) {
       webServer.send(403, "application/json",
         "{\"ok\":false,\"error\":\"physical_config_mode_required\"}");
@@ -1227,6 +1173,7 @@ void setupWebInterface() {
   });
 
   webServer.on("/api/v1/config/rollback", HTTP_POST, []() {
+    if (!requireWebAuthentication()) return;
     if (!gatewayConfigWritesAllowed()) {
       webServer.send(403, "application/json",
         "{\"ok\":false,\"error\":\"physical_config_mode_required\"}");
@@ -1254,6 +1201,7 @@ void setupWebInterface() {
   });
 
   webServer.on("/api/v1/factory-reset", HTTP_POST, []() {
+    if (!requireWebAuthentication()) return;
     if (!gatewayConfigWritesAllowed()) {
       webServer.send(403, "application/json",
         "{\"ok\":false,\"error\":\"physical_config_mode_required\"}");
@@ -1270,6 +1218,7 @@ void setupWebInterface() {
   });
 
   webServer.on("/api/v1/reboot", HTTP_POST, []() {
+    if (!requireWebAuthentication()) return;
     if (!gatewayConfigWritesAllowed()) {
       webServer.send(403, "application/json",
         "{\"ok\":false,\"error\":\"physical_config_mode_required\"}");
@@ -1280,6 +1229,7 @@ void setupWebInterface() {
   });
 
   webServer.on("/api/v1/trackers", HTTP_GET, []() {
+    if (!requireWebAuthentication()) return;
     String out;
     out.reserve(2500);
     out = "{\"api_version\":1,\"gateway_id\":\"" + String(GATEWAY_ID) +
@@ -1307,6 +1257,7 @@ void setupWebInterface() {
   });
 
   webServer.on("/logs", HTTP_GET, []() {
+    if (!requireWebAuthentication()) return;
     String out = "";
     if (logHistoryCount == 0) {
       out = "No logs yet.";
@@ -1327,6 +1278,7 @@ void setupWebInterface() {
 }
 
 void handleRemoteLogging() {
+  if (!REMOTE_LOGGING_ENABLED) return;
   if (telnetServer.hasClient()) {
     WiFiClient newClient = telnetServer.available();
 
@@ -1408,7 +1360,7 @@ void publishAutoDiscoveryForTracker(const TrackerRuntime& tracker) {
   char payload[768];
   char device_registry_id[48];
   snprintf(device_registry_id, sizeof(device_registry_id),
-           "equine_tracker_%s", tracker.hash_text);
+           "lora_tracker_%s", tracker.hash_text);
 
   // Keep the discovery path human-readable while using the hash in unique IDs.
   snprintf(topic, sizeof(topic),
@@ -1419,7 +1371,7 @@ void publishAutoDiscoveryForTracker(const TrackerRuntime& tracker) {
     "\"json_attr_t\":\"%s\",\"source_type\":\"gps\","
     "\"uniq_id\":\"%s_loc\",\"avty_t\":\"%s\","
     "\"dev\":{\"ids\":[\"%s\"],\"name\":\"%s Tracker\","
-    "\"mdl\":\"Equine Telemetry v1\"}}",
+    "\"mdl\":\"LoRa Tracker\"}}",
     tracker.config->device_name,
     tracker.state_topic,
     tracker.state_topic,
@@ -1539,13 +1491,14 @@ bool postBootButtonRequestsGatewayConfig() {
 void startGatewayFallbackAp() {
   WiFi.disconnect(false, false);
   WiFi.mode(WIFI_AP);
-  String ap_name = "EquineGateway-" + String(GATEWAY_ID);
-  if (WiFi.softAP(ap_name.c_str(), EQUINE_ONBOARDING_AP_PASSWORD)) {
+  String ap_name = "LoRaGateway-" + String(GATEWAY_ID);
+  if (strlen(onboarding_ap_password) < 12) {
+    logPrintln("Fallback AP disabled: onboarding password must be at least 12 characters.");
+  } else if (WiFi.softAP(ap_name.c_str(), onboarding_ap_password)) {
     gateway_ap_active = true;
     gateway_network_ip = WiFi.softAPIP().toString();
-    logPrintf("Gateway setup AP '%s' active at %s (password: %s).\n",
-              ap_name.c_str(), gateway_network_ip.c_str(),
-              EQUINE_ONBOARDING_AP_PASSWORD);
+    logPrintf("Gateway setup AP '%s' active at %s.\n",
+              ap_name.c_str(), gateway_network_ip.c_str());
   } else {
     logPrintln("Failed to start gateway fallback AP.");
   }
@@ -1628,10 +1581,19 @@ void reconnectMqttIfNeeded() {
   }
 
   lastMqttReconnectAttemptMs = now;
+
+  if (gateway_config.mqtt_tls_enabled && mqtt_ca_certificate[0] == '\0') {
+    logPrintln("MQTT disabled: TLS is enabled but no CA certificate is configured.");
+    return;
+  }
+  if (!gateway_config.mqtt_tls_enabled && !allow_insecure_mqtt) {
+    logPrintln("MQTT disabled: plaintext transport requires allow_insecure_mqtt=true.");
+    return;
+  }
   logPrint("Attempting MQTT connection...");
 
   char clientId[48];
-  snprintf(clientId, sizeof(clientId), "EqGw-%s", gateway_hash_text);
+  snprintf(clientId, sizeof(clientId), "ltg-%s", gateway_hash_text);
 
   if (client.connect(
         clientId,
@@ -1677,13 +1639,11 @@ void setup() {
             (unsigned)GATEWAY_TRACKER_COUNT);
   for (size_t i = 0; i < GATEWAY_TRACKER_COUNT; i++) {
     const TrackerRuntime& tracker = tracker_runtime[i];
-    logPrintf("  registry[%u] id=%s name=%s hash=%s legacy_lora=%s legacy_mqtt=%s\n",
+    logPrintf("  registry[%u] id=%s name=%s hash=%s\n",
               (unsigned)i,
               tracker.config->device_id,
               tracker.config->device_name,
-              tracker.hash_text,
-              tracker.config->accepts_legacy_lora ? "yes" : "no",
-              tracker.config->publish_legacy_mqtt_aliases ? "yes" : "no");
+              tracker.hash_text);
   }
 
   loadAllDedupStates();
@@ -1696,6 +1656,12 @@ void setup() {
   setupRemoteLogging();
   setupWebInterface();
 
+  if (gateway_config.mqtt_tls_enabled) {
+    secureMqttClient.setCACert(mqtt_ca_certificate);
+    client.setClient(secureMqttClient);
+  } else {
+    client.setClient(plainMqttClient);
+  }
   client.setServer(gateway_config.mqtt_host, gateway_config.mqtt_port);
   client.setBufferSize(MQTT_BUFFER_SIZE);
   client.setCallback(mqttMessageCallback);
@@ -1758,8 +1724,8 @@ void loop() {
   if (!packetSize) return;
 
   do {
-    // Legacy history header + root coordinates + anchor count + batch count.
-    if (packetSize < (int)(sizeof(LegacyLoRaHeader) + 8 + 2) ||
+    // Versioned history header + root coordinates + anchor and batch counts.
+    if (packetSize < (int)(sizeof(LoRaHeaderV2) + 8 + 2) ||
         packetSize > 255) {
       logPrintf("Ignored invalid packet size: %d bytes.\n", packetSize);
       break;
@@ -1780,106 +1746,47 @@ void loop() {
     DecodedHistoryHeader header{};
     TrackerRuntime* tracker = nullptr;
 
-    bool has_v1_magic = false;
-    if (packetSize >= (int)sizeof(EquineProtocol::FrameHeaderV1)) {
-      EquineProtocol::FrameHeaderV1 frame{};
-      memcpy(&frame, payload_buffer, sizeof(frame));
-      has_v1_magic = EquineProtocol::hasValidMagic(frame);
+    LoRaHeaderV2 wire_header{};
+    memcpy(&wire_header, payload_buffer, sizeof(wire_header));
+    const EquineProtocol::FrameHeaderV1& frame = wire_header.frame;
+    if (!EquineProtocol::isSupportedHistoryFrame(frame)) {
+      logPrintf("Unsupported frame: transport=%u type=%u schema=%u flags=0x%02X.\n",
+                frame.transport_version, frame.message_type,
+                frame.schema_version, frame.flags);
+      break;
     }
 
-    if (has_v1_magic) {
-      EquineProtocol::FrameHeaderV1 frame{};
-      memcpy(&frame, payload_buffer, sizeof(frame));
-      if (!EquineProtocol::isSupportedHistoryFrame(frame)) {
-        logPrintf(
-          "Unsupported frame: transport=%u type=%u schema=%u flags=0x%02X.\n",
-          frame.transport_version,
-          frame.message_type,
-          frame.schema_version,
-          frame.flags);
-        break;
-      }
+    tracker = findTrackerByHash(frame.device_id_hash);
+    if (!tracker) {
+      char unknown_hash[17];
+      EquineProtocol::formatDeviceHash(frame.device_id_hash, unknown_hash,
+                                      sizeof(unknown_hash));
+      logPrintf("Ignored unregistered device hash %s.\n", unknown_hash);
+      break;
+    }
 
-      tracker = findTrackerByHash(frame.device_id_hash);
-      if (!tracker) {
-        char unknown_hash[17];
-        EquineProtocol::formatDeviceHash(
-          frame.device_id_hash,
-          unknown_hash,
-          sizeof(unknown_hash));
-        logPrintf("Ignored unregistered device hash %s.\n", unknown_hash);
-        break;
-      }
+    header.transport_version = frame.transport_version;
+    header.schema_version = frame.schema_version;
+    header.device_id_hash = frame.device_id_hash;
+    header.boot_id = wire_header.boot_id;
+    header.first_seq = wire_header.first_seq;
+    header.root_unix_time_s = wire_header.root_unix_time_s;
+    header.timestamps_present =
+      (frame.flags & EquineProtocol::FLAG_HAS_TIMESTAMPS) != 0;
+    header.total_dist_dam = wire_header.total_dist_dam;
+    header.batt_pct = wire_header.batt_pct;
+    offset = sizeof(wire_header);
 
-      header.legacy = false;
-      header.transport_version = frame.transport_version;
-      header.schema_version = frame.schema_version;
-      header.device_id_hash = frame.device_id_hash;
-      header.root_unix_time_s = 0;
-      header.timestamps_present = false;
-
-      if (frame.schema_version == EquineProtocol::HISTORY_SCHEMA_VERSION_V1) {
-        if (packetSize < (int)(sizeof(LoRaHeaderV1) + 8 + 2)) {
-          logPrintf("Protocol history-v1 packet is too short: %d bytes.\n", packetSize);
-          break;
-        }
-        LoRaHeaderV1 wire_header{};
-        memcpy(&wire_header, payload_buffer, sizeof(wire_header));
-        header.boot_id = wire_header.boot_id;
-        header.first_seq = wire_header.first_seq;
-        header.total_dist_dam = wire_header.total_dist_dam;
-        header.batt_pct = wire_header.batt_pct;
-        offset = sizeof(wire_header);
-      } else {
-        if (packetSize < (int)(sizeof(LoRaHeaderV2) + 8 + 2)) {
-          logPrintf("Protocol history-v2 packet is too short: %d bytes.\n", packetSize);
-          break;
-        }
-        LoRaHeaderV2 wire_header{};
-        memcpy(&wire_header, payload_buffer, sizeof(wire_header));
-        header.boot_id = wire_header.boot_id;
-        header.first_seq = wire_header.first_seq;
-        header.root_unix_time_s = wire_header.root_unix_time_s;
-        header.timestamps_present =
-          (wire_header.frame.flags & EquineProtocol::FLAG_HAS_TIMESTAMPS) != 0;
-        header.total_dist_dam = wire_header.total_dist_dam;
-        header.batt_pct = wire_header.batt_pct;
-        offset = sizeof(wire_header);
-
-        if (header.timestamps_present &&
-            (header.root_unix_time_s < 946684800UL ||
-             header.root_unix_time_s > 4102444800UL)) {
-          logPrintf("Rejected implausible root GNSS timestamp: %lu.\n",
-                    (unsigned long)header.root_unix_time_s);
-          break;
-        }
-        if (!header.timestamps_present && header.root_unix_time_s != 0) {
-          logPrintln("Timestamp value present without timestamp frame flag.");
-          break;
-        }
-      }
-    } else {
-      tracker = findLegacyTracker();
-      if (!tracker) {
-        logPrintln("Ignored legacy packet: no unique legacy tracker registered.");
-        break;
-      }
-
-      LegacyLoRaHeader legacy_header{};
-      memcpy(&legacy_header, payload_buffer, sizeof(legacy_header));
-      header.legacy = true;
-      header.transport_version = 0;
-      header.schema_version = 0;
-      header.device_id_hash = tracker->device_id_hash;
-      header.boot_id = legacy_header.boot_id;
-      header.first_seq = legacy_header.first_seq;
-      header.root_unix_time_s = 0;
-      header.timestamps_present = false;
-      header.total_dist_dam = legacy_header.total_dist_dam;
-      header.batt_pct = legacy_header.batt_pct;
-      offset = sizeof(legacy_header);
-      logPrintf("Mapped legacy packet to registered tracker %s.\n",
-                tracker->config->device_id);
+    if (header.timestamps_present &&
+        (header.root_unix_time_s < 946684800UL ||
+         header.root_unix_time_s > 4102444800UL)) {
+      logPrintf("Rejected implausible root GNSS timestamp: %lu.\n",
+                (unsigned long)header.root_unix_time_s);
+      break;
+    }
+    if (!header.timestamps_present && header.root_unix_time_s != 0) {
+      logPrintln("Timestamp value present without timestamp frame flag.");
+      break;
     }
 
     tracker->has_been_seen = true;
@@ -1919,10 +1826,9 @@ void loop() {
     const uint8_t num_batches = payload_buffer[offset++];
 
     logPrintf(
-      "Received %s packet [%s/%s]: transport=%u schema=%u boot=%lu "
+      "Received packet [%s/%s]: transport=%u schema=%u boot=%lu "
       "first_seq=%lu root=%.6f,%.6f root_utc=%lu timestamps=%s "
       "anchors=%u batches=%u RSSI=%d\n",
-      header.legacy ? "legacy" : "versioned",
       tracker->config->device_id,
       tracker->hash_text,
       header.transport_version,
@@ -2087,26 +1993,24 @@ void loop() {
           anchor_lon_micro + (int32_t)rel_dlon * DELTA_UNIT_MICRODEG;
 
         uint32_t delta_time_s = 0;
-        if (header.schema_version == EquineProtocol::HISTORY_SCHEMA_VERSION) {
-          size_t timestamp_bytes = 0;
-          if (!EquineProtocol::decodeUleb128U32(
-                payload_buffer + offset,
-                (size_t)packetSize - offset,
-                delta_time_s,
-                timestamp_bytes)) {
-            logPrintln("Invalid or truncated ULEB128 timestamp delta.");
+        size_t timestamp_bytes = 0;
+        if (!EquineProtocol::decodeUleb128U32(
+              payload_buffer + offset,
+              (size_t)packetSize - offset,
+              delta_time_s,
+              timestamp_bytes)) {
+          logPrintln("Invalid or truncated ULEB128 timestamp delta.");
+          packet_valid = false;
+          break;
+        }
+        offset += timestamp_bytes;
+        if (header.timestamps_present) {
+          if (delta_time_s > UINT32_MAX - current_point_time_s) {
+            logPrintln("Timestamp delta overflow.");
             packet_valid = false;
             break;
           }
-          offset += timestamp_bytes;
-          if (header.timestamps_present) {
-            if (delta_time_s > UINT32_MAX - current_point_time_s) {
-              logPrintln("Timestamp delta overflow.");
-              packet_valid = false;
-              break;
-            }
-            current_point_time_s += delta_time_s;
-          }
+          current_point_time_s += delta_time_s;
         }
 
         processPoint(
@@ -2138,26 +2042,18 @@ void loop() {
     saveDedupState(*tracker, false);
 
     LoRa.beginPacket();
-    if (header.legacy) {
-      LegacyAckPayload ack{};
-      ack.boot_id = header.boot_id;
-      ack.acked_seq = highest_ackable_seq;
-      LoRa.write((uint8_t*)&ack, sizeof(ack));
-    } else {
-      AckPayload ack{};
-      ack.frame = EquineProtocol::makeFrameHeader(
-        EquineProtocol::MessageType::ACK,
-        EquineProtocol::ACK_SCHEMA_VERSION,
-        tracker->device_id_hash);
-      ack.boot_id = header.boot_id;
-      ack.acked_seq = highest_ackable_seq;
-      LoRa.write((uint8_t*)&ack, sizeof(ack));
-    }
+    AckPayload ack{};
+    ack.frame = EquineProtocol::makeFrameHeader(
+      EquineProtocol::MessageType::ACK,
+      EquineProtocol::ACK_SCHEMA_VERSION,
+      tracker->device_id_hash);
+    ack.boot_id = header.boot_id;
+    ack.acked_seq = highest_ackable_seq;
+    LoRa.write((uint8_t*)&ack, sizeof(ack));
 
     const int txResult = LoRa.endPacket();
     if (txResult) {
-      logPrintf("Sent %s ACK [%s] boot=%lu seq=%lu\n",
-                header.legacy ? "legacy" : "versioned",
+      logPrintf("Sent ACK [%s] boot=%lu seq=%lu\n",
                 tracker->config->device_id,
                 (unsigned long)header.boot_id,
                 (unsigned long)highest_ackable_seq);
@@ -2169,4 +2065,3 @@ void loop() {
 
   LoRa.receive();
 }
-

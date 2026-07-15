@@ -1,0 +1,84 @@
+# Onboarding and configuration
+
+## Prepare a device
+
+1. Copy `secrets.example.h` to `secrets.h` in the relevant firmware directory.
+2. Set a unique `onboarding_ap_password` of at least 12 characters. Record it in
+   the device inventory or place it in a protected per-device QR record.
+3. Set `ota_password_hash` to the 64-character lowercase or uppercase SHA-256
+   hash of a separate password. Leave it empty to keep OTA disabled.
+4. For a gateway, set a TLS broker port (normally 8883), paste the broker root CA
+   into `mqtt_ca_certificate`, and leave `allow_insecure_mqtt=false`.
+5. Build, flash and label the device ID, hardware revision, firmware commit,
+   region/frequency and provisioning-record identifier.
+
+Never commit `secrets.h`, `.env`, broker CA private keys or provisioning exports.
+The CA certificate is public; client and signing keys are not.
+
+## Tracker first boot
+
+An unprovisioned tracker derives a collision-resistant setup ID from the low
+24 bits of its eFuse MAC, then exposes `LoRaTracker-<device_id>` and BLE name
+`EqTrk-<device_id>`. Connect to the AP with the unique onboarding password,
+then open the AP address shown on serial output. HTTP authentication uses user
+`admin` and the same password.
+
+Read `GET /api/v1/config`, retain its `revision`, and submit a transactional
+`POST /api/v1/config` with `expected_revision`. Configure identity, Wi-Fi, the
+regional LoRa parameters, GNSS thresholds, transmission policy and sleep
+intervals. Reboot, then verify normal GNSS fixes, LoRa ACKs and increasing point
+sequences before mounting the device.
+
+### Tracker button controls
+
+- After a hard boot, release GPIO 0, then hold it for 1.5 seconds during the
+  five-second on-screen setup window to start Wi-Fi onboarding.
+- A short press wakes the display and advances through status, GNSS, radio and debug pages.
+- Hold 4–8 seconds, release, then short-press within ten seconds to reset distance and queued history.
+- Hold 8–12 seconds, release, then confirm to toggle the bounded BLE debug session.
+- Hold at least 12 seconds, release, then confirm to factory-reset configuration and runtime state.
+
+The confirmation step prevents a single accidental long press from erasing
+state. Never hold GPIO 0 while powering or resetting an ESP32-S3 because it can
+enter the ROM downloader instead of the application.
+
+BLE exposes the same patch model, but is not authenticated in this release.
+Use it only during attended field trials and disable BLE debug afterwards.
+
+## Gateway first boot
+
+An unprovisioned gateway derives its setup ID from its eFuse MAC and exposes
+`LoRaGateway-<gateway_id>` with an empty tracker allowlist. Authenticate as
+`admin`, configure Wi-Fi, TLS MQTT settings, the same regional LoRa settings as
+the trackers, and a registry entry for every allowed tracker. IDs must be unique
+canonical lowercase strings.
+
+On a provisioned gateway, hold the USER button for five seconds to open the
+ten-minute write window. Authentication is still required. Read-only HTTP routes
+also require authentication so status, logs and device inventory are not
+available anonymously on the LAN.
+
+## Transaction rules
+
+- Always read immediately before writing and send `expected_revision`.
+- On HTTP 409, reload, merge and retry; never blindly increment a guessed revision.
+- Omit a secret, send an empty value, or send `__KEEP__` to retain it.
+- Send `__CLEAR__` only when intentionally erasing a secret.
+- A valid update backs up the previous configuration and increments the revision.
+- Rollback restores the backup as a new revision; it never moves the counter backwards.
+- Factory reset requires `confirm=FACTORY_RESET` and returns the device to onboarding.
+
+The complete endpoint and field reference is in
+[`protocols/ONBOARDING_API.md`](protocols/ONBOARDING_API.md).
+
+## Post-onboarding acceptance checklist
+
+- Device starts without exposing a shared or logged password.
+- Gateway reports verified TLS and rejects plaintext when the test override is false.
+- Tracker and gateway have identical frequency, bandwidth, spreading factor,
+  coding rate, preamble and sync word.
+- Only registered tracker hashes are accepted.
+- `timestamp_valid`, location, battery and sequence values are plausible.
+- Archiver availability is online and a history request ends with `final=true`.
+- Factory-reset and rollback procedure has been tested on a spare unit.
+- Provisioning record, recovery credentials and firmware commit are stored securely.

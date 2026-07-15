@@ -8,8 +8,8 @@ point uses a 32-bit Unix epoch and every later point uses an unsigned LEB128
 seconds delta from the previous point. Normal tracking intervals add one byte
 per point.
 
-The tracker still expects ACK schema v1. Flash a v6 gateway before flashing this
-tracker so both history schemas remain accepted during the upgrade.
+The tracker and gateway must use the same current protocol schema. Unsupported
+packet and history schemas are deliberately not accepted.
 
 ## PlatformIO
 

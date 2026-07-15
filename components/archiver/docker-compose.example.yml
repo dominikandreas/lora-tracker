@@ -1,10 +1,10 @@
 services:
-  equine-archiver:
+  lora-tracker-archiver:
     build: .
     restart: unless-stopped
     env_file: .env
     volumes:
-      - equine-history:/data
+      - lora-tracker-history:/data
 
 volumes:
-  equine-history:
+  lora-tracker-history:

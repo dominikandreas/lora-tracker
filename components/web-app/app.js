@@ -9,15 +9,15 @@ let selectedHash = null;
 let connected = false;
 let pendingHistoryRequest = null;
 
-const saved = JSON.parse(localStorage.getItem('equine.web.settings') || '{}');
+const saved = JSON.parse(localStorage.getItem('lora-tracker.web.settings') || '{}');
 els.brokerUrl.value = saved.brokerUrl || '';
-els.baseTopic.value = saved.baseTopic || 'equine';
+els.baseTopic.value = saved.baseTopic || 'lora-tracker';
 els.username.value = saved.username || '';
 
 function saveSettings() {
-  localStorage.setItem('equine.web.settings', JSON.stringify({
+  localStorage.setItem('lora-tracker.web.settings', JSON.stringify({
     brokerUrl: els.brokerUrl.value.trim(),
-    baseTopic: els.baseTopic.value.trim() || 'equine',
+    baseTopic: els.baseTopic.value.trim() || 'lora-tracker',
     username: els.username.value.trim(),
   }));
 }
@@ -155,7 +155,7 @@ async function renderSelectedTracker() {
 }
 
 function parseTopic(topic) {
-  const base = (els.baseTopic.value.trim() || 'equine').split('/').filter(Boolean);
+  const base = (els.baseTopic.value.trim() || 'lora-tracker').split('/').filter(Boolean);
   const parts = topic.split('/');
   const start = parts.findIndex((_, i) => base.every((part, j) => parts[i + j] === part));
   if (start < 0) return null;
@@ -168,7 +168,7 @@ mqtt.addEventListener('status', event => {
   connected = state === 'online';
   setConnectionState(state, state === 'reconnecting' ? `Reconnecting in ${Math.round(event.detail.delay / 1000)} seconds…` : state === 'online' ? 'Subscribed to tracker telemetry and history responses.' : state === 'connecting' ? 'Opening secure MQTT WebSocket…' : 'Not connected.');
   if (state === 'online') {
-    const base = els.baseTopic.value.trim() || 'equine';
+    const base = els.baseTopic.value.trim() || 'lora-tracker';
     mqtt.subscribe(
       `${base}/v1/trackers/+/events/point`,
       `${base}/v1/trackers/+/state`,
@@ -216,7 +216,7 @@ els.connectButton.addEventListener('click', () => {
     url,
     username: els.username.value.trim(),
     password: els.password.value,
-    clientId: `equine-web-${crypto.randomUUID().replaceAll('-', '').slice(0, 18)}`,
+    clientId: `ltw-${crypto.randomUUID().replaceAll('-', '').slice(0, 18)}`,
   });
 });
 
@@ -225,7 +225,7 @@ els.historyButton.addEventListener('click', () => {
     els.connectionMessage.textContent = 'Connect to MQTT and select a tracker first.';
     return;
   }
-  const base = els.baseTopic.value.trim() || 'equine';
+  const base = els.baseTopic.value.trim() || 'lora-tracker';
   const hours = Number(els.historyRange.value || 24);
   const requestId = `web-${Date.now().toString(36)}`;
   pendingHistoryRequest = requestId;

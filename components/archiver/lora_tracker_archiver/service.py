@@ -1,6 +1,9 @@
+"""MQTT archiver service."""
+
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import signal
 import threading
@@ -27,7 +30,7 @@ from .protocol import (
 )
 from .store import HistoryStore
 
-LOG = logging.getLogger("equine_archiver")
+LOG = logging.getLogger("lora_tracker.archiver")
 
 
 class ArchiverService:
@@ -192,8 +195,10 @@ def make_mqtt_client(config: ArchiverConfig) -> Any:
     except ImportError as exc:
         raise RuntimeError("paho-mqtt is required; install the project dependencies") from exc
 
+    identity_hash = hashlib.sha256(config.archiver_id.encode()).hexdigest()[:8]
+    client_id = f"lta-{config.archiver_id[:8]}-{identity_hash}"
     return mqtt.Client(
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-        client_id=f"equine-archiver-{config.archiver_id}",
+        client_id=client_id,
         protocol=mqtt.MQTTv311,
     )

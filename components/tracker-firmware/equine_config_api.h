@@ -421,8 +421,6 @@ inline FieldResult applyGatewayField(EquineConfig::GatewayConfigV1& config,
     if(strcmp(subfield,"id")==0) return assignText(tracker.device_id,value,status,key,false,true)?FieldResult::APPLIED:FieldResult::INVALID;
     if(strcmp(subfield,"name")==0) return assignText(tracker.device_name,value,status,key,false,true)?FieldResult::APPLIED:FieldResult::INVALID;
     if(strcmp(subfield,"enabled")==0) return assignBool(tracker.enabled,value,status,key,true)?FieldResult::APPLIED:FieldResult::INVALID;
-    if(strcmp(subfield,"accepts_legacy_lora")==0) return assignBool(tracker.accepts_legacy_lora,value,status,key,true)?FieldResult::APPLIED:FieldResult::INVALID;
-    if(strcmp(subfield,"publish_legacy_mqtt_aliases")==0) return assignBool(tracker.publish_legacy_mqtt_aliases,value,status,key,true)?FieldResult::APPLIED:FieldResult::INVALID;
   }
   return FieldResult::UNKNOWN;
 }

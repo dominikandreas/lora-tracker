@@ -1,3 +1,5 @@
+"""Strict MQTT topic and payload validation."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,11 +9,10 @@ from typing import Any, Iterable
 
 API_VERSION = 1
 POINT_SCHEMA_VERSION = 2
-SUPPORTED_POINT_SCHEMA_VERSIONS = frozenset({1, 2})
 HISTORY_SCHEMA_VERSION = 2
-SUPPORTED_HISTORY_SCHEMA_VERSIONS = frozenset({1, 2})
 
 _DEVICE_HASH_RE = re.compile(r"^[0-9a-f]{16}$")
+_CANONICAL_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,23})$")
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,48}$")
 _MAX_UNIX_MS = 32_503_680_000_000  # year 3000
 
@@ -127,10 +128,14 @@ def validate_point(data: dict[str, Any], topic_device_hash: str) -> dict[str, An
     schema_version = data.get("point_schema_version")
     if (
         data.get("api_version") != API_VERSION
-        or schema_version not in SUPPORTED_POINT_SCHEMA_VERSIONS
+        or schema_version != POINT_SCHEMA_VERSION
     ):
         raise ProtocolError(
             "unsupported_version", "unsupported point API or schema version"
+        )
+    if data.get("transport_version") != 1 or data.get("schema_version") != 2:
+        raise ProtocolError(
+            "unsupported_version", "unsupported LoRa transport or history schema"
         )
     device_hash = validate_device_hash(str(data.get("device_hash", "")))
     if device_hash != topic_device_hash:
@@ -139,11 +144,7 @@ def validate_point(data: dict[str, Any], topic_device_hash: str) -> dict[str, An
         )
 
     point_id = data.get("point_id")
-    if (
-        not isinstance(point_id, str)
-        or len(point_id) > 96
-        or not point_id.startswith(f"{device_hash}:")
-    ):
+    if not isinstance(point_id, str) or len(point_id) > 96:
         raise ProtocolError("invalid_point", "point_id is missing or inconsistent")
 
     normalized = dict(data)
@@ -156,35 +157,42 @@ def validate_point(data: dict[str, Any], topic_device_hash: str) -> dict[str, An
     normalized["rssi"] = _require_int(data, "rssi", -200, 50)
     normalized["boot_id"] = _require_int(data, "boot_id", 0, 4_294_967_295)
     normalized["seq"] = _require_int(data, "seq", 0, 4_294_967_295)
+    if point_id != f'{device_hash}:{normalized["boot_id"]}:{normalized["seq"]}':
+        raise ProtocolError("invalid_point", "point_id does not match identity and sequence")
 
-    for key in ("device_id", "device_name", "gateway_id", "gateway_hash"):
-        value = normalized.get(key, "")
-        if not isinstance(value, str) or len(value) > 96:
-            raise ProtocolError("invalid_point", f"{key} must be a short string")
+    for key in ("device_id", "gateway_id"):
+        value = normalized.get(key)
+        if not isinstance(value, str) or not _CANONICAL_ID_RE.fullmatch(value):
+            raise ProtocolError("invalid_point", f"{key} is not a canonical identifier")
+    for key in ("device_name",):
+        value = normalized.get(key)
+        if (
+            not isinstance(value, str)
+            or not 1 <= len(value) <= 32
+            or any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
+        ):
+            raise ProtocolError("invalid_point", f"{key} is not a valid display name")
+    normalized["gateway_hash"] = validate_device_hash(
+        str(normalized.get("gateway_hash", ""))
+    )
+    normalized["gateway_uptime_ms"] = _require_int(
+        data, "gateway_uptime_ms", 0, 4_294_967_295
+    )
 
-    if schema_version == 1:
-        normalized["timestamp_valid"] = False
-        normalized["fix_time_unix_ms"] = 0
-        normalized["time_source"] = "unavailable"
-    else:
-        timestamp_valid = data.get("timestamp_valid")
-        if not isinstance(timestamp_valid, bool):
-            raise ProtocolError("invalid_point", "timestamp_valid must be boolean")
-        fix_time = _require_int(data, "fix_time_unix_ms", 0, _MAX_UNIX_MS)
-        source = data.get("time_source")
-        if source not in {"gnss", "unavailable"}:
-            raise ProtocolError("invalid_point", "unsupported time_source")
-        if timestamp_valid and (fix_time == 0 or source != "gnss"):
-            raise ProtocolError(
-                "invalid_point", "valid timestamps require GNSS time"
-            )
-        if not timestamp_valid and fix_time != 0:
-            raise ProtocolError(
-                "invalid_point", "invalid timestamps must use zero epoch"
-            )
-        normalized["timestamp_valid"] = timestamp_valid
-        normalized["fix_time_unix_ms"] = fix_time
-        normalized["time_source"] = source
+    timestamp_valid = data.get("timestamp_valid")
+    if not isinstance(timestamp_valid, bool):
+        raise ProtocolError("invalid_point", "timestamp_valid must be boolean")
+    fix_time = _require_int(data, "fix_time_unix_ms", 0, _MAX_UNIX_MS)
+    source = data.get("time_source")
+    if source not in {"gnss", "unavailable"}:
+        raise ProtocolError("invalid_point", "unsupported time_source")
+    if timestamp_valid and (fix_time == 0 or source != "gnss"):
+        raise ProtocolError("invalid_point", "valid timestamps require GNSS time")
+    if not timestamp_valid and fix_time != 0:
+        raise ProtocolError("invalid_point", "invalid timestamps must use zero epoch")
+    normalized["timestamp_valid"] = timestamp_valid
+    normalized["fix_time_unix_ms"] = fix_time
+    normalized["time_source"] = source
 
     return normalized
 
@@ -205,7 +213,7 @@ def parse_history_request(
     schema_version = data.get("schema_version")
     if (
         data.get("api_version") != API_VERSION
-        or schema_version not in SUPPORTED_HISTORY_SCHEMA_VERSIONS
+        or schema_version != HISTORY_SCHEMA_VERSION
     ):
         raise ProtocolError(
             "unsupported_version", "unsupported history API or schema version"

@@ -1,87 +1,53 @@
-# LoRa Tracker build and deployment
+# Build and deployment
 
-## 1. Tracker firmware
+## Prerequisites
 
-Project: `components/tracker-firmware/`
+- PlatformIO Core for embedded builds
+- Python 3.11+ for the archiver and system simulator
+- Node.js 20+ for browser unit tests
+- A private MQTT broker with TLS TCP and WebSocket listeners
 
-### Supported source branches
+## Secrets
 
-- `BOARD_WIRELESS_TRACKER`: Heltec Wireless Tracker / ESP32-S3, UC6580 GNSS,
-  SX1262 through RadioLib, TFT through TFT_eSPI.
-- Default branch: older Heltec WiFi LoRa 32 V2 style hardware, BN-220 GNSS,
-  SX1276 through the LoRa library, OLED through U8g2.
+Copy `secrets.example.h` to `secrets.h` in each firmware directory. These files
+are git-ignored. Assign every device a unique 12+ character onboarding password
+and a separate OTA password hash. For the gateway, configure a TLS port and PEM
+root CA. Leave `allow_insecure_mqtt=false` outside an isolated test network.
 
-### Required Arduino libraries
+The archiver uses environment variables documented in `.env.example`. TLS is
+enabled by default; provide `MQTT_CA_FILE`. Set `ALLOW_INSECURE_MQTT=true` only
+for an explicit local test.
 
-- TinyGPS++
-- Preferences, WiFi, WebServer, ArduinoOTA and ESP32 BLE from the ESP32 core
-- RadioLib and TFT_eSPI for `BOARD_WIRELESS_TRACKER`
-- LoRa and U8g2 for the legacy branch
-
-Copy `secrets.example.h` to `secrets.h`. Values are only migration/factory
-seeds; onboarding writes the active configuration to NVS.
-
-The included `platformio.ini` pins PlatformIO's Espressif32 6.7.0 platform and
-the library versions inherited from the v1 projects. Install PlatformIO Core,
-then build one of the explicit targets:
+## Tracker firmware
 
 ```bash
 pio run -d components/tracker-firmware -e heltec_wifi_lora_32_v2
 pio run -d components/tracker-firmware -e heltec_wireless_tracker
 ```
 
-The Wireless Tracker target defines `BOARD_WIRELESS_TRACKER` and its TFT_eSPI
-display settings. Append `-t upload` only after selecting the correct physical
-board/port.
+The first target supports the older Heltec V2/SX1276 plus BN-220/OLED branch.
+The second supports the Heltec Wireless Tracker ESP32-S3/SX1262/UC6580/TFT
+branch. Never upload until the exact board, region, antenna and serial port have
+been checked.
 
-### First boot and onboarding
+An unprovisioned tracker starts `LoRaTracker-<device_id>` and requires HTTP user
+`admin` plus its unique onboarding password. See [onboarding](ONBOARDING.md).
 
-An unprovisioned tracker starts:
-
-```text
-Wi-Fi AP: EquineTracker-<device_id>
-BLE name: EqTrk-<device_id>
-Prototype AP password: EquineSetup!
-```
-
-The password can be overridden at build time with
-`EQUINE_ONBOARDING_AP_PASSWORD`. Configuration can be changed transactionally
-through the HTTP or BLE API described in `docs/protocols/EQUINE_ONBOARDING_API_V1.md`.
-
-## 2. Gateway firmware
-
-Project: `components/gateway-firmware/`
-
-The current pin mapping targets the original Heltec V2/SX1276 receiver:
-
-```text
-SCK=5, MISO=19, MOSI=27, SS=18, RST=14, DIO0=26
-```
-
-Required libraries:
-
-- PubSubClient
-- LoRa
-- Preferences, WiFi, WebServer and ArduinoOTA from the ESP32 core
-
-Copy `secrets.example.h` to `secrets.h`, set migration defaults, and build the
-pinned target:
+## Gateway firmware
 
 ```bash
 pio run -d components/gateway-firmware -e heltec_wifi_lora_32_v2
 ```
 
-Append `-t upload` only after selecting the correct physical board/port.
+The checked-in gateway pin map is only for the Heltec V2/SX1276:
+`SCK=5`, `MISO=19`, `MOSI=27`, `SS=18`, `RST=14`, `DIO0=26`. Porting to a
+current ESP32-S3/SX1262 board is a production TODO.
 
-An unprovisioned gateway starts `EquineGateway-<gateway_id>`. On provisioned
-gateways, writes require holding the USER button for five seconds, opening a
-ten-minute administration window.
+An unprovisioned gateway starts `LoRaGateway-<gateway_id>`. Once provisioned,
+hold USER for five seconds to unlock writes for ten minutes; HTTP authentication
+is still required.
 
-## 3. Archiver
-
-Project: `components/archiver/`
-
-### Local Python
+## Archiver
 
 ```bash
 cd components/archiver
@@ -90,10 +56,10 @@ python -m venv .venv
 pip install .
 cp .env.example .env
 set -a; . ./.env; set +a
-python -m equine_archiver
+python -m lora_tracker_archiver
 ```
 
-### Docker
+Or run the example container deployment:
 
 ```bash
 cd components/archiver
@@ -101,72 +67,48 @@ cp .env.example .env
 docker compose -f docker-compose.example.yml up --build -d
 ```
 
-Persist `/data/equine-history.sqlite3` and back it up like any other SQLite
-database. The default retention window is ten days.
+Persist and back up `/data/lora-tracker-history.sqlite3` using SQLite's online
+backup mechanism or a stopped, consistent copy.
 
-## 4. Web app
+## Web app
 
-Project: `components/web-app/`
+Serve `components/web-app` from HTTPS and connect it to a trusted `wss://` MQTT
+listener. A local development server is sufficient for a smoke test:
 
 ```bash
 cd components/web-app
 python3 -m http.server 8080
 ```
 
-Open `http://localhost:8080`. The MQTT broker must expose a WebSocket listener,
-preferably `wss://` with a trusted certificate.
+The app persists broker URL, namespace and username but not the password.
 
-The app remembers the broker URL, base topic and username but not the password.
-
-## 5. Broker
-
-Use a broker with:
-
-- TLS for TCP and WebSocket listeners;
-- authentication;
-- topic ACLs;
-- retained-message limits and sensible session limits;
-- persistence if latest-state continuity matters.
-
-Do not use an anonymous public broker for real location data. MQTT payloads are
-currently plaintext to the broker.
-
-## 6. Safe deployment order
-
-1. Back up the gateway configuration and archiver database.
-2. Deploy archiver v2; it accepts old and new point schemas.
-3. Flash gateway v6; it accepts legacy, history-v1 and history-v2 frames.
-4. Confirm old trackers still receive ACKs and points reach MQTT.
-5. Flash tracker timestamp v4.
-6. Confirm `timestamp_valid=true` and plausible `fix_time_unix_ms` values.
-7. Deploy the web app and request history.
-
-## 7. Tests
-
-Archiver:
+## Validation
 
 ```bash
 cd components/archiver
 python -m pytest
-```
+python -m lora_tracker_archiver.simulator \
+  --trackers 2 --points 12 --service-suite --embedded-suite
 
-Web app MQTT codec:
-
-```bash
-cd components/web-app
+cd ../web-app
 npm test
 ```
 
-Firmware targets are pinned in the two `platformio.ini` files. Open
-`equine-tracker-v2.code-workspace` in VS Code to work with both PlatformIO
-projects together. Board builds still require the physical-board validation
-described in the simulation coverage document.
+Run all three PlatformIO builds above. Before any field trial, also exercise a
+real TLS broker, supported browsers and physical devices as described in
+[simulation coverage](SIMULATION_COVERAGE.md).
 
-The brokerless simulator can also compile and run the shared firmware protocol
-and configuration contracts on a WSL host with a C++17 compiler:
+## Deployment sequence
 
-```bash
-python -m equine_archiver.simulator --embedded-suite
-```
+There is no rolling compatibility mode. Upgrade the complete installation in a
+maintenance window:
 
-This is not an ESP32 board build; it does not cover peripherals or RF behavior.
+1. Back up gateway configuration and the archiver database.
+2. Stop consumers and deploy the archiver and web app.
+3. Flash and provision the gateway, then verify TLS and broker ACLs.
+4. Flash each tracker with the matching release and verify its registry entry.
+5. Confirm current timestamps, increasing sequences, ACK-driven queue progress
+   and a complete history response.
+6. Record the firmware commit and configuration revision for every unit.
+
+Use `lora-tracker.code-workspace` to open both PlatformIO projects in VS Code.

@@ -3,7 +3,7 @@
 Run the deterministic suite from `components/archiver`:
 
 ```text
-python -m equine_archiver.simulator --trackers 2 --points 12 --service-suite --embedded-suite
+python -m lora_tracker_archiver.simulator --trackers 2 --points 12 --service-suite --embedded-suite
 ```
 
 It is intentionally brokerless: the in-memory MQTT client exercises the real
@@ -18,14 +18,14 @@ Use the pinned PlatformIO environments in `components/tracker-firmware` and
 
 | Boundary / behaviour | Covered by simulator |
 |---|---|
-| Tracker telemetry contract | Multi-tracker routes, stable IDs, sequence/boot IDs, battery, RSSI, valid GNSS time and legacy receive-time fallback |
+| Tracker telemetry contract | Multi-tracker routes, stable IDs, sequence/boot IDs, battery, RSSI, valid GNSS time and explicit current-schema untimed points |
 | Embedded tracker and gateway shared code | Native C++17 compilation and execution of each firmware copy of the protocol/configuration headers: frame layout, device hashes, ULEB128 boundaries/malformed data, CRC validation and tracker registry rules |
 | Gateway to MQTT contract | Two independent gateway receptions, gateway metadata, duplicate delivery and archiver deduplication |
 | Topic and payload validation | Canonical point topics, device-hash consistency, production JSON/protocol validation |
 | Archiver storage | SQLite insertion, per-gateway reception aggregation, timestamp fallback, history filtering and chunking |
 | Archiver MQTT service | Last will, credentials/TLS setup, subscriptions, retained availability/status, allowlist rejection, successful and invalid history requests |
 | History API | Chunked responses, `final`, `has_more`, cursor output and structured error response |
-| Browser point contract | Schema v1/v2 normalization, GNSS time preference, receive-time fallback and incompatible-schema rejection |
+| Browser point contract | Strict schema-2 normalization, GNSS time preference, receive-time fallback and incompatible-schema rejection |
 | MQTT Web codec | Packet encoding/decoding tests in `components/web-app/tests` |
 
 ## Required physical/infrastructure validation

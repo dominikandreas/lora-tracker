@@ -1,4 +1,4 @@
-const DB_NAME = 'equine-web-v1';
+const DB_NAME = 'lora-tracker-web';
 const DB_VERSION = 1;
 const STORE = 'points';
 

@@ -1,8 +1,7 @@
-# LoRa Tracker LoRa protocol — history schema v2
+# LoRa protocol
 
-The transport envelope remains version 1. Only the `HISTORY` message schema is
-incremented from 1 to 2. Gateways should accept both history schemas during a
-rolling upgrade; trackers emit schema 2 after this update.
+The transport envelope is version 1 and the only supported `HISTORY` message
+schema is 2. A gateway rejects every other transport or history schema.
 
 All integers are packed little-endian.
 
@@ -65,17 +64,11 @@ supporting multi-day gaps.
 - Points in one timed packet must be monotonic.
 - The tracker stops packing before a missing or backwards timestamp.
 - Gateways reject malformed, overflowing, truncated or implausible timestamps.
-- Schema-v1 and legacy points remain accepted but have no GNSS timestamp.
+- A current-schema packet may explicitly omit timestamps by clearing the flag.
 - The gateway publishes milliseconds in MQTT as `fix_time_unix_ms`.
 
-## Compatibility
+## Supported schema set
 
-Safe update order:
-
-1. Flash the schema-v2 gateway, which accepts legacy, history-v1 and history-v2.
-2. Verify existing trackers still receive ACKs.
-3. Flash trackers with schema-v2 firmware.
-4. Update archivers/apps to point schema v2; the supplied archiver also accepts
-   point schema v1 during migration.
-
-ACK schema remains version 1 and is unchanged.
+Tracker and gateway firmware must be deployed as a matched release. The ACK
+message schema is 1, the history schema is 2, and no older packet layout is
+decoded.

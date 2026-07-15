@@ -14,7 +14,6 @@ namespace EquineProtocol {
 
 constexpr uint16_t FRAME_MAGIC = 0x5145;  // bytes "EQ" on little-endian targets
 constexpr uint8_t TRANSPORT_VERSION = 1;
-constexpr uint8_t HISTORY_SCHEMA_VERSION_V1 = 1;
 constexpr uint8_t HISTORY_SCHEMA_VERSION = 2;
 constexpr uint8_t ACK_SCHEMA_VERSION = 1;
 constexpr uint8_t MQTT_API_VERSION = 1;
@@ -43,15 +42,6 @@ struct FrameHeaderV1 {
   uint8_t schema_version;
   uint8_t flags;
   uint64_t device_id_hash;
-} __attribute__((packed));
-
-// Kept for rolling upgrades. Schema v1 has no point timestamps.
-struct HistoryHeaderV1 {
-  FrameHeaderV1 frame;
-  uint32_t boot_id;
-  uint32_t first_seq;
-  uint16_t total_dist_dam;
-  uint8_t batt_pct;
 } __attribute__((packed));
 
 // Schema v2 adds one absolute UTC timestamp for the root point. Every later
@@ -83,7 +73,6 @@ struct DeltaPointV1 {
 } __attribute__((packed));
 
 static_assert(sizeof(FrameHeaderV1) == 14, "Unexpected protocol frame size");
-static_assert(sizeof(HistoryHeaderV1) == 25, "Unexpected v1 history header size");
 static_assert(sizeof(HistoryHeaderV2) == 29, "Unexpected v2 history header size");
 static_assert(sizeof(AckPayloadV1) == 22, "Unexpected ACK size");
 static_assert(sizeof(AnchorPointV1) == 4, "Unexpected anchor size");
@@ -139,8 +128,7 @@ inline bool isSupportedHistoryFrame(const FrameHeaderV1& header) {
   return header.magic == FRAME_MAGIC &&
          header.transport_version == TRANSPORT_VERSION &&
          header.message_type == static_cast<uint8_t>(MessageType::HISTORY) &&
-         (header.schema_version == HISTORY_SCHEMA_VERSION_V1 ||
-          header.schema_version == HISTORY_SCHEMA_VERSION);
+         header.schema_version == HISTORY_SCHEMA_VERSION;
 }
 
 inline size_t uleb128SizeU32(uint32_t value) {

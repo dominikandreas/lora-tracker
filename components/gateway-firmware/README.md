@@ -1,22 +1,22 @@
 # LoRa Tracker gateway firmware
 
-This gateway accepts legacy, history-schema-v1 and history-schema-v2 LoRa
-frames. Schema v2 reconstructs GNSS timestamps from one absolute root epoch and
-ULEB128 per-point deltas.
+The gateway accepts only the current versioned LoRa history frame. It
+reconstructs GNSS timestamps from one absolute root epoch and ULEB128
+per-point deltas; unsupported schemas are rejected.
 
 ## New behavior
 
 - Publishes point JSON schema v2 with `fix_time_unix_ms`, `timestamp_valid` and
   `time_source`.
-- Retains rolling compatibility with old trackers.
+- Rejects packets from unregistered trackers and unsupported schemas.
 - Rejects malformed, truncated, overflowing or implausible timestamp chains.
 - Publishes each decoded point to the non-retained event topic and retained
   latest-state topic.
 - Keeps stable `point_id` values for cross-gateway deduplication.
 - Retains the Step-5 gateway status and command API.
 
-Compile `equine_gateway_mqtt_v6.ino` with the same ESP32, LoRa, Preferences,
-PubSubClient and WebServer libraries used by the previous gateway.
+PlatformIO compiles the gateway sketch with the pinned ESP32, LoRa,
+Preferences, PubSubClient and WebServer dependencies.
 
 ## PlatformIO
 
@@ -32,3 +32,7 @@ Append `-t upload` only after choosing the correct connected board. The host
 simulator validates shared binary/configuration contracts, not gateway Wi-Fi,
 MQTT, NVS, or radio hardware; see
 [`docs/SIMULATION_COVERAGE.md`](../../docs/SIMULATION_COVERAGE.md).
+
+The default MQTT transport verifies the broker with the PEM root CA in
+`secrets.h`. Plain MQTT requires the explicit `allow_insecure_mqtt` test-only
+override. Unauthenticated telnet logging is disabled by default.

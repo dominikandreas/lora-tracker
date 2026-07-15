@@ -1,4 +1,4 @@
-from equine_archiver.protocol import (
+from lora_tracker_archiver.protocol import (
     ProtocolError,
     iter_history_responses,
     parse_history_request,
@@ -13,6 +13,8 @@ def point(seq: int = 1, schema: int = 2):
     data = {
         "api_version": 1,
         "point_schema_version": schema,
+        "transport_version": 1,
+        "schema_version": 2,
         "device_hash": HASH,
         "point_id": f"{HASH}:5:{seq}",
         "latitude": 50.1,
@@ -26,6 +28,7 @@ def point(seq: int = 1, schema: int = 2):
         "device_name": "Wera",
         "gateway_id": "home",
         "gateway_hash": "1111111111111111",
+        "gateway_uptime_ms": 1000,
     }
     if schema == 2:
         data.update(
@@ -37,17 +40,20 @@ def point(seq: int = 1, schema: int = 2):
 
 
 def test_point_and_topic_validation():
-    topic = f"equine/v1/trackers/{HASH}/events/point"
+    topic = f"lora-tracker/v1/trackers/{HASH}/events/point"
     assert tracker_hash_from_topic(topic, "events/point") == HASH
     normalized = validate_point(point(), HASH)
     assert normalized["seq"] == 1
     assert normalized["timestamp_valid"] is True
 
 
-def test_legacy_point_gets_timestamp_fallback_fields():
-    normalized = validate_point(point(schema=1), HASH)
-    assert normalized["timestamp_valid"] is False
-    assert normalized["fix_time_unix_ms"] == 0
+def test_old_point_schema_is_rejected():
+    try:
+        validate_point(point(schema=1), HASH)
+    except ProtocolError as exc:
+        assert exc.code == "unsupported_version"
+    else:
+        raise AssertionError("old point schema accepted")
 
 
 def test_invalid_timestamp_rejected():
@@ -68,6 +74,17 @@ def test_topic_payload_hash_mismatch_rejected():
         assert exc.code == "topic_payload_mismatch"
     else:
         raise AssertionError("mismatch accepted")
+
+
+def test_inconsistent_point_id_is_rejected():
+    invalid = point()
+    invalid["point_id"] = f"{HASH}:5:99"
+    try:
+        validate_point(invalid, HASH)
+    except ProtocolError as exc:
+        assert exc.code == "invalid_point"
+    else:
+        raise AssertionError("inconsistent point identity accepted")
 
 
 def test_history_request_and_chunks():
@@ -97,3 +114,14 @@ def test_history_request_and_chunks():
     assert responses[1]["has_more"] is True
     assert responses[1]["next_cursor"] == 9
     assert responses[1]["schema_version"] == 2
+
+
+def test_old_history_schema_is_rejected():
+    try:
+        parse_history_request(
+            {"api_version": 1, "schema_version": 1, "request_id": "old"}, 500
+        )
+    except ProtocolError as exc:
+        assert exc.code == "unsupported_version"
+    else:
+        raise AssertionError("old history schema accepted")

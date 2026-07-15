@@ -10,7 +10,7 @@
 namespace EquineConfig {
 
 constexpr uint32_t CONFIG_MAGIC = 0x45434647UL;  // "ECFG"
-constexpr uint16_t CONFIG_SCHEMA_VERSION = 1;
+constexpr uint16_t CONFIG_SCHEMA_VERSION = 2;
 constexpr uint8_t MAX_GATEWAY_TRACKERS = 12;
 constexpr size_t DEVICE_ID_SIZE = 25;       // 24 chars + NUL
 constexpr size_t DEVICE_NAME_SIZE = 33;     // 32 chars + NUL
@@ -108,9 +108,7 @@ struct GatewayTrackerConfigV1 {
   char device_id[DEVICE_ID_SIZE];
   char device_name[DEVICE_NAME_SIZE];
   uint8_t enabled;
-  uint8_t accepts_legacy_lora;
-  uint8_t publish_legacy_mqtt_aliases;
-  uint8_t reserved;
+  uint8_t reserved[3];
 } __attribute__((packed));
 
 struct GatewayConfigV1 {
@@ -318,7 +316,7 @@ inline bool validateGatewayConfig(const GatewayConfigV1& config) {
       !isValidCanonicalId(config.mqtt_base_topic, sizeof(config.mqtt_base_topic)) ||
       !validateLoRa(config.lora) ||
       config.mqtt_port == 0 ||
-      config.mqtt_tls_enabled != 0 ||
+      config.mqtt_tls_enabled > 1 ||
       config.mqtt_buffer_size < 512 || config.mqtt_buffer_size > 4096 ||
       config.dedup_save_interval == 0 || config.dedup_save_interval > 1000 ||
       config.wifi_retry_interval_ms < 1000 ||
@@ -327,7 +325,6 @@ inline bool validateGatewayConfig(const GatewayConfigV1& config) {
     return false;
   }
 
-  uint8_t legacy_count = 0;
   for (uint8_t i = 0; i < config.tracker_count; i++) {
     const GatewayTrackerConfigV1& tracker = config.trackers[i];
     if (!tracker.enabled) continue;
@@ -335,7 +332,6 @@ inline bool validateGatewayConfig(const GatewayConfigV1& config) {
         !isValidDisplayName(tracker.device_name, sizeof(tracker.device_name))) {
       return false;
     }
-    if (tracker.accepts_legacy_lora) legacy_count++;
     const uint64_t hash = EquineProtocol::deviceIdHash(tracker.device_id);
     for (uint8_t previous = 0; previous < i; previous++) {
       if (!config.trackers[previous].enabled) continue;
@@ -345,7 +341,7 @@ inline bool validateGatewayConfig(const GatewayConfigV1& config) {
       }
     }
   }
-  return legacy_count <= 1;
+  return true;
 }
 
 inline void setDefaultLoRa(LoRaConfigV1& config) {
@@ -438,15 +434,15 @@ inline void makeDefaultGatewayConfig(
           sizeof(config.wifi_password));
   strlcpy(config.mqtt_host, default_mqtt_host ? default_mqtt_host : "",
           sizeof(config.mqtt_host));
-  config.mqtt_port = default_mqtt_port ? default_mqtt_port : 1883;
-  config.mqtt_tls_enabled = 0;
+  config.mqtt_port = default_mqtt_port ? default_mqtt_port : 8883;
+  config.mqtt_tls_enabled = 1;
   strlcpy(config.mqtt_username,
           default_mqtt_username ? default_mqtt_username : "",
           sizeof(config.mqtt_username));
   strlcpy(config.mqtt_password,
           default_mqtt_password ? default_mqtt_password : "",
           sizeof(config.mqtt_password));
-  strlcpy(config.mqtt_base_topic, "equine", sizeof(config.mqtt_base_topic));
+  strlcpy(config.mqtt_base_topic, "lora-tracker", sizeof(config.mqtt_base_topic));
   setDefaultLoRa(config.lora);
   config.mqtt_buffer_size = 1024;
   config.dedup_save_interval = 10;

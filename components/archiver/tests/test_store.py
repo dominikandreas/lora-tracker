@@ -1,7 +1,7 @@
 from pathlib import Path
 import sqlite3
 
-from equine_archiver.store import HistoryStore
+from lora_tracker_archiver.store import HistoryStore
 
 HASH = "3db3edf61a18fac0"
 
@@ -11,12 +11,15 @@ def make_point(seq: int, *, fix_time_ms: int | None = None):
     return {
         "api_version": 1,
         "point_schema_version": 2,
+        "transport_version": 1,
+        "schema_version": 2,
         "device_hash": HASH,
         "point_id": f"{HASH}:7:{seq}",
         "device_id": "wera",
         "device_name": "Wera",
         "gateway_hash": "1111111111111111",
         "gateway_id": "home",
+        "gateway_uptime_ms": 1000,
         "latitude": 50.0 + seq / 1000,
         "longitude": 8.0,
         "dist_m": seq * 10,
@@ -53,7 +56,7 @@ def test_insert_deduplicate_query_and_purge(tmp_path: Path):
         store.close()
 
 
-def test_receive_time_fallback_for_legacy_timestamp(tmp_path: Path):
+def test_receive_time_fallback_for_untimed_point(tmp_path: Path):
     store = HistoryStore(tmp_path / "history.sqlite3")
     try:
         assert store.insert_point(make_point(1), 50_000)
@@ -69,7 +72,7 @@ def test_receive_time_fallback_for_legacy_timestamp(tmp_path: Path):
         store.close()
 
 
-def test_existing_v1_database_is_migrated(tmp_path: Path):
+def test_existing_database_is_migrated(tmp_path: Path):
     path = tmp_path / "history.sqlite3"
     db = sqlite3.connect(path)
     db.execute(

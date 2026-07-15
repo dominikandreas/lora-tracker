@@ -19,10 +19,10 @@ test('connect packet uses MQTT 3.1.1', () => {
 });
 
 test('publish packet round trip', () => {
-  const encoded = encodePublish('equine/v1/test', '{"ok":true}');
+  const encoded = encodePublish('lora-tracker/v1/test', '{"ok":true}');
   const parsed = parsePackets(encoded);
   assert.equal(parsed.packets.length, 1);
   const publish = decodePublish(parsed.packets[0]);
-  assert.equal(publish.topic, 'equine/v1/test');
+  assert.equal(publish.topic, 'lora-tracker/v1/test');
   assert.equal(publish.payload, '{"ok":true}');
 });
