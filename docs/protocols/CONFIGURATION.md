@@ -55,17 +55,19 @@ The gateway configuration contains:
 
 - gateway ID and display name
 - Wi-Fi credentials
-- MQTT host, port, username, password and base topic
+- MQTT host, port, username, password, PEM root CA and base topic
 - LoRa parameters
 - MQTT buffer and reconnect settings
 - deduplication checkpoint interval
-- up to 12 tracker registrations, each with identity and enabled state
+- up to 12 tracker registrations, each with identity, 256-bit radio key and
+  enabled state
 
 First boot seeds the configuration from `secrets.h`. Per-tracker deduplication
 namespaces are based on the device hash.
 
-`mqtt_tls_enabled` selects verified TLS. The gateway requires a PEM root CA in
-`secrets.h`; plaintext MQTT is blocked unless its separate test-only build seed
+`mqtt_tls_enabled` selects verified TLS. The gateway requires a PEM root CA from
+the runtime `mqtt_ca_certificate` field; `secrets.h` is an optional factory
+seed. Plaintext MQTT is blocked unless its separate test-only build seed
 explicitly allows it.
 
 ## Validation

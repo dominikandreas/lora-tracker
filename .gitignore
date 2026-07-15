@@ -10,6 +10,7 @@ components/.pio-build/
 *.egg-info/
 .pytest_cache/
 node_modules/
+dist/
 
 # Editor files
 .vscode/

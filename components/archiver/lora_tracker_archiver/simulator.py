@@ -154,7 +154,7 @@ def _tracker_points(
         yield {
             "api_version": 1,
             "point_schema_version": 2,
-            "transport_version": 1,
+            "transport_version": 2,
             "schema_version": 2,
             "device_id": f"horse-{tracker_index + 1}",
             "device_name": f"Simulated Horse {tracker_index + 1}",

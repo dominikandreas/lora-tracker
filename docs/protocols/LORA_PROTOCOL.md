@@ -1,74 +1,107 @@
 # LoRa protocol
 
-The transport envelope is version 1 and the only supported `HISTORY` message
-schema is 2. A gateway rejects every other transport or history schema.
-
+The transport envelope is version 2. The only supported `HISTORY` schema is 2
+and the only supported `ACK` schema is 1. Tracker and gateway reject every
+other transport/schema combination and every frame without the encrypted flag.
 All integers are packed little-endian.
 
-## Frame and history header
+## Authenticated envelope
 
 ```text
 FrameHeaderV1
   uint16 magic                0x5145 (wire bytes "EQ")
-  uint8  transport_version    1
-  uint8  message_type         1 = HISTORY
-  uint8  schema_version       2
-  uint8  flags                bit 2 = timestamps present
-  uint64 device_id_hash
+  uint8  transport_version    2
+  uint8  message_type         1 = HISTORY, 2 = ACK
+  uint8  schema_version       2 for HISTORY, 1 for ACK
+  uint8  flags                bit 0 encrypted, bit 2 timestamps present
+  uint64 device_id_hash       public routing identifier
 
-HistoryHeaderV2
+SecureFrameHeaderV2
   FrameHeaderV1 frame
-  uint32 boot_id
+  uint64 nonce_prefix         random for every sender boot
+  uint32 boot_id              monotonic tracker boot generation
+  uint32 counter              unique transmit counter, or acked_seq for ACK
+```
+
+`SecureFrameHeaderV2` is visible for routing but supplied to AES-256-GCM as
+additional authenticated data. The 96-bit GCM nonce is the little-endian
+concatenation of `nonce_prefix` and `counter`. Every frame ends with the
+16-byte GCM tag. A tracker has a randomly generated 32-byte key; its gateway
+registry entry must contain the same key.
+
+A sender creates a fresh 64-bit nonce prefix at every boot and advances a
+separate transmit counter for every history encryption, including retries.
+Changing battery, distance or batch contents therefore cannot reuse a GCM
+nonce while an older point remains at the queue head. The transmit counter is
+covered by RTC integrity metadata; corruption advances the boot epoch and
+rotates the nonce prefix before the queue is reset. ACK senders use their own
+independently generated prefix and can safely repeat the same authenticated
+ACK content for the same acknowledged sequence. Gateways reject boot IDs older
+than the stored point cursor and sequences at or below the cursor as duplicates.
+If the tracker loses or wraps
+its monotonic boot counter, it rotates the LoRa key and returns to onboarding
+instead of risking nonce/cursor reuse.
+
+## Encrypted history plaintext
+
+```text
+HistoryPayloadV2
   uint32 first_seq
   uint32 root_unix_time_s
   uint16 total_dist_dam
   uint8  batt_pct
+
+int32 root_latitude_microdegrees
+int32 root_longitude_microdegrees
+uint8 anchor_count
+AnchorPointV1 anchors[anchor_count]
+uint8 batch_count
+... batches ...
 ```
 
-`root_unix_time_s` is UTC from GNSS and is valid only when
+`root_unix_time_s` is GNSS UTC and is valid only when
 `FLAG_HAS_TIMESTAMPS` is set. A zero value with the flag clear represents an
-untimed packet.
+untimed packet. `first_seq` is inside the authenticated ciphertext and is
+independent from the envelope's per-encryption counter.
 
-## Spatial and temporal body
-
-The existing spatial compression is retained:
+The spatial compression is:
 
 1. Absolute root latitude and longitude as signed microdegrees.
-2. A list of signed 16-bit anchors relative to the root in 10-microdegree units.
+2. Signed 16-bit anchors relative to the root in 10-microdegree units.
 3. Batches grouped by anchor.
-4. Signed 8-bit latitude and longitude deltas relative to that anchor.
+4. Signed 8-bit latitude/longitude deltas relative to that anchor.
 
-History schema v2 appends one unsigned LEB128 value after every non-root point:
+Every non-root point appends an unsigned LEB128 time delta:
 
 ```text
-int8   relative_latitude
-int8   relative_longitude
-ULEB128 seconds_since_previous_point
+uint8  anchor_index
+uint8  point_count
+repeat point_count:
+  int8   relative_latitude
+  int8   relative_longitude
+  ULEB128 seconds_since_previous_point
 ```
 
-The time delta is relative to the previous point in sequence order, including
-across batch boundaries. It is not relative to the batch anchor.
+The delta is relative to the previous point in sequence order, including across
+batch boundaries. The tracker stops before a missing/backwards timestamp;
+gateways reject malformed, overflowing, truncated or implausible values.
 
-Typical cost:
+## Encrypted ACK plaintext
 
-- 0–127 seconds: 1 byte
-- 128–16,383 seconds: 2 bytes
-- 16,384–2,097,151 seconds: 3 bytes
-- Maximum uint32 delta: 5 bytes
+```text
+AckPayloadV1
+  uint32 acked_seq
+```
 
-This is more efficient than storing a 32-bit timestamp per point while still
-supporting multi-day gaps.
+The payload must equal the authenticated envelope counter, the device hash and
+boot ID must match the outstanding tracker batch, and the sequence must clear
+at least one queued point. A missing, stale, inconsistent or invalid-tag ACK
+never clears tracker history.
 
-## Timestamp rules
+## Key handling limits
 
-- Points in one timed packet must be monotonic.
-- The tracker stops packing before a missing or backwards timestamp.
-- Gateways reject malformed, overflowing, truncated or implausible timestamps.
-- A current-schema packet may explicitly omit timestamps by clearing the flag.
-- The gateway publishes milliseconds in MQTT as `fix_time_unix_ms`.
-
-## Supported schema set
-
-Tracker and gateway firmware must be deployed as a matched release. The ACK
-message schema is 1, the history schema is 2, and no older packet layout is
-decoded.
+The implementation protects LoRa confidentiality and integrity against passive
+observation, forgery and simple replay. It does not yet provide automated key
+rotation/revocation, a secure-element boundary, a random public routing ID or a
+gateway design that routes ciphertext without holding tracker keys. Those
+lifecycle and blast-radius improvements remain production work.

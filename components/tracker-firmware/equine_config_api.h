@@ -92,6 +92,44 @@ inline bool parseBool(const char* value, uint8_t& output) {
   return false;
 }
 
+inline int hexNibble(char value) {
+  if (value >= '0' && value <= '9') return value - '0';
+  if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+  if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+  return -1;
+}
+
+inline bool assignAeadKey(
+    uint8_t (&destination)[EquineProtocol::AEAD_KEY_SIZE],
+    const char* value,
+    PatchStatus& status,
+    const char* name) {
+  if (!value || strlen(value) != EquineProtocol::AEAD_KEY_SIZE * 2) {
+    setError(status, name, "expected exactly 64 hexadecimal characters");
+    return false;
+  }
+  uint8_t decoded[EquineProtocol::AEAD_KEY_SIZE]{};
+  for (size_t i = 0; i < sizeof(decoded); i++) {
+    const int high = hexNibble(value[i * 2]);
+    const int low = hexNibble(value[i * 2 + 1]);
+    if (high < 0 || low < 0) {
+      setError(status, name, "expected exactly 64 hexadecimal characters");
+      return false;
+    }
+    decoded[i] = static_cast<uint8_t>((high << 4) | low);
+  }
+  if (!EquineConfig::hasProvisionedKey(decoded)) {
+    setError(status, name, "all-zero keys are forbidden");
+    return false;
+  }
+  if (memcmp(destination, decoded, sizeof(decoded)) != 0) {
+    memcpy(destination, decoded, sizeof(decoded));
+    status.changed = true;
+    status.reboot_required = true;
+  }
+  return true;
+}
+
 template <size_t N>
 inline bool copyText(char (&destination)[N], const char* value,
                      bool allow_empty = true) {
@@ -336,6 +374,8 @@ inline FieldResult applyTrackerField(EquineConfig::TrackerConfigV1& config,
     return assignBool(config.ble_debug_enabled, value, status, key) ? FieldResult::APPLIED : FieldResult::INVALID;
   if (strcmp(key, "battery_sense_enabled") == 0)
     return assignBool(config.battery_sense_enabled, value, status, key, true) ? FieldResult::APPLIED : FieldResult::INVALID;
+  if (strcmp(key, "lora_aead_key") == 0)
+    return assignAeadKey(config.lora_aead_key, value, status, key) ? FieldResult::APPLIED : FieldResult::INVALID;
 
   EQ_SET_U32("lora_tx_interval_s", lora_tx_interval_s, 10, 86400);
   EQ_SET_U16("lora_tx_min_points", lora_tx_min_points, 1, 100);
@@ -420,6 +460,7 @@ inline FieldResult applyGatewayField(EquineConfig::GatewayConfigV1& config,
     EquineConfig::GatewayTrackerConfigV1& tracker=config.trackers[index];
     if(strcmp(subfield,"id")==0) return assignText(tracker.device_id,value,status,key,false,true)?FieldResult::APPLIED:FieldResult::INVALID;
     if(strcmp(subfield,"name")==0) return assignText(tracker.device_name,value,status,key,false,true)?FieldResult::APPLIED:FieldResult::INVALID;
+    if(strcmp(subfield,"lora_aead_key")==0) return assignAeadKey(tracker.lora_aead_key,value,status,key)?FieldResult::APPLIED:FieldResult::INVALID;
     if(strcmp(subfield,"enabled")==0) return assignBool(tracker.enabled,value,status,key,true)?FieldResult::APPLIED:FieldResult::INVALID;
   }
   return FieldResult::UNKNOWN;

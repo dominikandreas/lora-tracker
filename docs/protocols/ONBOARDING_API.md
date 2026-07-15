@@ -17,7 +17,19 @@ Configuration changes never mutate the live blob field-by-field. The device:
 
 Invalid or stale requests leave the active configuration unchanged. A successful rollback is stored as a new revision rather than moving the revision backwards.
 
-Secrets are never returned by the read API. `wifi_password_set` and `mqtt.password_set` expose only whether a value exists.
+The gateway's broker root CA is stored in a dedicated active/backup NVS pair
+because a PEM bundle does not fit the compact configuration blob. It is
+validated and committed with the same revisioned transaction; rollback restores
+the matching previous CA value.
+
+Wi-Fi and MQTT passwords are never returned by the read API;
+`wifi_password_set` and `mqtt.password_set` expose only whether a value exists.
+The gateway similarly reports `mqtt.ca_certificate_set` without returning the
+PEM contents. The certificate is public trust material, but omitting it from
+routine reads keeps configuration responses compact.
+The tracker returns its `lora_aead_key` through this authenticated local
+interface because an operator must transfer it to the gateway. Treat the full
+response as a provisioning secret and do not save it in logs.
 
 For secret fields:
 
@@ -25,11 +37,15 @@ For secret fields:
 - `__CLEAR__`: erase it;
 - any other value: replace it.
 
+`mqtt_ca_certificate` uses `__KEEP__` to retain, an empty value to clear, or a
+PEM certificate bundle up to 4096 bytes to replace. Clearing it while TLS is
+enabled fails validation.
+
 ## Wi-Fi HTTP API
 
 All mutation bodies use `application/x-www-form-urlencoded`. Every HTTP route
 requires Basic authentication with username `admin` and the device's unique
-onboarding password. The password is also the WPA2 credential of the fallback
+admin credential. The credential is also the WPA2 password of the fallback
 access point and must be at least 12 characters.
 
 ### Discovery
@@ -95,9 +111,10 @@ After factory reset, or after an explicit post-boot Wi-Fi setup gesture, the tra
 - Wi-Fi AP: `LoRaTracker-<device_id>`
 - BLE name: `EqTrk-<device_id>`
 
-Set a different `onboarding_ap_password` in each device's `secrets.h`. The
-firmware refuses to start the AP or authorize HTTP if it is shorter than 12
-characters, and never prints it to logs.
+An erased generic release generates a unique 20-character admin credential and
+prints it during the attended onboarding serial session. A factory may instead
+set a unique `factory_admin_password` in each device's `secrets.h`. The firmware
+refuses to start the AP or authorize HTTP with fewer than 12 characters.
 
 The tracker also tries station mode during an explicit setup session when it is already provisioned. Timer wake-ups never expose configuration services.
 
@@ -116,6 +133,7 @@ Commands are UTF-8 text terminated by `\n`. Responses are JSON terminated by `\n
 Commands:
 
 ```text
+AUTH <admin-password>
 HELLO
 GET CONFIG
 PATCH expected_revision=4&device_name=Wera&moving_sleep_s=45
@@ -124,7 +142,11 @@ FACTORY_RESET FACTORY_RESET
 REBOOT
 ```
 
-The PATCH body uses the same URL-encoded fields and secret semantics as HTTP.
+The RX characteristic requires LE Secure Connections with MITM protection. The
+pairing PIN is printed in the attended serial session when the bounded BLE
+window opens. `AUTH` is mandatory for every connection before responses or
+debug logs are exposed. The PATCH body uses the same URL-encoded fields and
+secret semantics as HTTP.
 
 ## Gateway onboarding and write protection
 
@@ -137,14 +159,15 @@ Password: the gateway's unique onboarding password
 
 For a provisioned gateway, configuration reads remain available on the local network, but writes are locked. Holding the gateway USER button for five seconds unlocks writes for ten minutes. If Wi-Fi is unavailable, the gateway exposes its fallback AP; it remains read-only until that physical hold unless it is unprovisioned.
 
-Provision `onboarding_ap_password` in `secrets.h` before the first flash.
+The erased gateway generates its unique admin credential; a factory may inject
+`factory_admin_password` per device before first flash.
 
 ## Tracker patch fields
 
 Identity and local setup:
 
 ```text
-device_id, device_name, wifi_ssid, wifi_password,
+device_id, device_name, wifi_ssid, wifi_password, lora_aead_key,
 ble_debug_enabled, battery_sense_enabled
 ```
 
@@ -186,7 +209,7 @@ Gateway and network:
 ```text
 gateway_id, gateway_name, wifi_ssid, wifi_password,
 mqtt_host, mqtt_port, mqtt_tls_enabled, mqtt_username,
-mqtt_password, mqtt_base_topic, mqtt_buffer_size,
+mqtt_password, mqtt_ca_certificate, mqtt_base_topic, mqtt_buffer_size,
 dedup_save_interval, wifi_retry_interval_ms, mqtt_retry_interval_ms
 ```
 
@@ -198,6 +221,7 @@ Registry:
 tracker_count
 tracker.0.id
 tracker.0.name
+tracker.0.lora_aead_key
 tracker.0.enabled
 ...
 tracker.11.*
@@ -208,12 +232,11 @@ The complete candidate is validated after all fields are applied, so `tracker_co
 ## Security scope
 
 HTTP has per-device password authentication and gateway mutations additionally
-require a physical unlock. BLE commands are still unauthenticated beyond radio
-proximity and are therefore a release blocker. A future protocol revision must
-add:
+require a physical unlock. BLE uses Secure Connections/MITM and an authenticated
+application session. Remaining provisioning work includes:
 
 - a random per-device cryptographic provisioning secret distinct from the AP password;
-- authenticated app/device sessions;
+- purpose-separated provisioning/session keys rather than deriving pairing from the admin credential;
 - QR transfer of public identity and provisioning material;
 - encrypted export/import bundles;
-- authenticated telemetry and ACK frames.
+- automated LoRa key rotation, revocation and recovery.

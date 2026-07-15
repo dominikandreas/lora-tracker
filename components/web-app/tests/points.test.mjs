@@ -2,7 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { normalizePoint } from '../points.js';
 
-const base = { api_version: 1, point_schema_version: 2, point_id: 'abc:1:1' };
+const base = {
+  api_version: 1,
+  point_schema_version: 2,
+  transport_version: 2,
+  schema_version: 2,
+  point_id: 'abc:1:1'
+};
 
 test('uses a valid GNSS timestamp as the browser display time', () => {
   const point = normalizePoint({ ...base, timestamp_valid: true, fix_time_unix_ms: 1_784_050_000_000 });
@@ -22,4 +28,5 @@ test('uses received time for untimed and malformed timestamp fields', () => {
 test('rejects incompatible point schemas', () => {
   assert.throws(() => normalizePoint({ api_version: 2, point_schema_version: 2 }), /Unsupported/);
   assert.throws(() => normalizePoint({ api_version: 1, point_schema_version: 1 }), /Unsupported/);
+  assert.throws(() => normalizePoint({ ...base, transport_version: 1 }), /Unsupported/);
 });

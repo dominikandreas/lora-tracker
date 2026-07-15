@@ -25,9 +25,11 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <BLESecurity.h>
 #include <string>
 #include "secrets.h"
 #include "equine_protocol.h"
+#include "equine_crypto.h"
 #include "equine_config.h"
 #include "equine_config_api.h"
 
@@ -171,7 +173,8 @@ const byte UBX_SLEEP_CMD[] = {
 // VERSIONED PAYLOAD FORMAT
 // =====================================================
 using AckPayload = EquineProtocol::AckPayloadV1;
-using LoRaHeader = EquineProtocol::HistoryHeaderV2;
+using SecureFrameHeader = EquineProtocol::SecureFrameHeaderV2;
+using HistoryPayload = EquineProtocol::HistoryPayloadV2;
 using AnchorPoint = EquineProtocol::AnchorPointV1;
 using DeltaPoint = EquineProtocol::DeltaPointV1;
 
@@ -191,6 +194,7 @@ struct StoredHistoryPoint {
 TinyGPSPlus gps;
 Preferences prefs;
 Preferences configPrefs;
+char admin_password[25]{};
 
 RTC_DATA_ATTR double total_distance_meters = 0.0;
 RTC_DATA_ATTR double last_lat = 0.0;
@@ -201,12 +205,33 @@ RTC_DATA_ATTR StoredHistoryPoint history_points[HISTORY_SIZE];
 RTC_DATA_ATTR uint16_t history_head = 0;   // next write index
 RTC_DATA_ATTR uint16_t history_count = 0;  // valid points in ring
 
+struct RtcHistoryMetadata {
+  uint32_t magic;
+  uint16_t schema;
+  uint16_t point_size;
+  uint16_t capacity;
+  uint16_t head;
+  uint16_t count;
+  uint16_t reserved;
+  uint32_t next_seq;
+  uint32_t next_tx_counter;
+  uint32_t boot_id;
+  uint64_t nonce_prefix;
+  uint32_t crc32;
+} __attribute__((packed));
+
+constexpr uint32_t RTC_HISTORY_MAGIC = 0x4c545248UL;  // "LTRH"
+constexpr uint16_t RTC_HISTORY_SCHEMA = 2;
+RTC_DATA_ATTR RtcHistoryMetadata rtc_history_metadata{};
+
 RTC_DATA_ATTR uint32_t seconds_since_last_fix = 0;
 RTC_DATA_ATTR uint8_t teleport_strikes = 0;
 RTC_DATA_ATTR uint32_t wakeup_counter = 0;
 RTC_DATA_ATTR double last_saved_dist = -1.0;
 RTC_DATA_ATTR uint32_t seconds_since_daily_reset = 0;
 RTC_DATA_ATTR uint32_t next_point_seq = 0; // survives deep sleep
+RTC_DATA_ATTR uint32_t next_tx_counter = 0; // unique per encryption epoch
+RTC_DATA_ATTR uint64_t tx_nonce_prefix = 0;
 RTC_DATA_ATTR uint64_t target_wakeup_time_us = 0;
 RTC_DATA_ATTR uint64_t session_start_time_us = 0; // wall-clock uptime across deep sleep
 RTC_DATA_ATTR uint16_t stationary_fix_streak = 0;
@@ -233,6 +258,58 @@ RTC_DATA_ATTR double last_gnss_altitude_m = 0.0;
 RTC_DATA_ATTR bool has_gnss_utc_time = false;
 
 uint32_t boot_id = 0; // loaded/incremented from NVS on hard boot
+
+uint32_t updateCrc32(uint32_t crc, const uint8_t* data, size_t length) {
+  for (size_t i = 0; i < length; i++) {
+    crc ^= data[i];
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      const uint32_t mask = -(crc & 1UL);
+      crc = (crc >> 1) ^ (0xEDB88320UL & mask);
+    }
+  }
+  return crc;
+}
+
+uint32_t calculateRtcHistoryCrc(RtcHistoryMetadata metadata) {
+  metadata.crc32 = 0;
+  uint32_t crc = updateCrc32(
+    0xFFFFFFFFUL,
+    reinterpret_cast<const uint8_t*>(&metadata), sizeof(metadata));
+  crc = updateCrc32(
+    crc,
+    reinterpret_cast<const uint8_t*>(history_points), sizeof(history_points));
+  return ~crc;
+}
+
+void sealRtcHistory() {
+  rtc_history_metadata.magic = RTC_HISTORY_MAGIC;
+  rtc_history_metadata.schema = RTC_HISTORY_SCHEMA;
+  rtc_history_metadata.point_size = sizeof(StoredHistoryPoint);
+  rtc_history_metadata.capacity = HISTORY_SIZE;
+  rtc_history_metadata.head = history_head;
+  rtc_history_metadata.count = history_count;
+  rtc_history_metadata.reserved = 0;
+  rtc_history_metadata.next_seq = next_point_seq;
+  rtc_history_metadata.next_tx_counter = next_tx_counter;
+  rtc_history_metadata.boot_id = boot_id;
+  rtc_history_metadata.nonce_prefix = tx_nonce_prefix;
+  rtc_history_metadata.crc32 = calculateRtcHistoryCrc(rtc_history_metadata);
+}
+
+bool validateRtcHistory() {
+  return rtc_history_metadata.magic == RTC_HISTORY_MAGIC &&
+    rtc_history_metadata.schema == RTC_HISTORY_SCHEMA &&
+    rtc_history_metadata.point_size == sizeof(StoredHistoryPoint) &&
+    rtc_history_metadata.capacity == HISTORY_SIZE &&
+    rtc_history_metadata.head == history_head &&
+    rtc_history_metadata.count == history_count &&
+    history_head < HISTORY_SIZE && history_count <= HISTORY_SIZE &&
+    rtc_history_metadata.next_seq == next_point_seq &&
+    rtc_history_metadata.next_tx_counter == next_tx_counter &&
+    rtc_history_metadata.boot_id == boot_id &&
+    rtc_history_metadata.nonce_prefix == tx_nonce_prefix &&
+    rtc_history_metadata.crc32 == calculateRtcHistoryCrc(rtc_history_metadata);
+}
 
 // =====================================================
 // LOGGING & DEBUG STATE
@@ -323,6 +400,7 @@ bool isBleConnectionWindowActive();
 BLEServer *pServer = NULL;
 BLECharacteristic *pTxCharacteristic = NULL;
 bool deviceConnected = false;
+bool ble_session_authenticated = false;
 bool ble_initialized = false;
 bool ble_connection_window_active = false;
 uint32_t ble_connection_window_deadline_ms = 0;
@@ -378,6 +456,7 @@ class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* server) override {
         (void)server;
         deviceConnected = true;
+        ble_session_authenticated = false;
         ble_advertising = false;
         ble_connection_window_active = false;
         debug_mode = true; // A connected client deliberately keeps the tracker awake.
@@ -385,6 +464,7 @@ class MyServerCallbacks: public BLEServerCallbacks {
 
     void onDisconnect(BLEServer* server) override {
         deviceConnected = false;
+        ble_session_authenticated = false;
         debug_mode = false;
         ble_connection_window_active = true;
         ble_connection_window_deadline_ms = millis() + BLE_RECONNECT_WINDOW_MS;
@@ -460,7 +540,7 @@ void logPrint(const T& message) {
   String s = String(message);
   Serial.print(s);
   rememberLogLine(s.c_str());
-  if (deviceConnected && pTxCharacteristic) {
+  if (deviceConnected && ble_session_authenticated && pTxCharacteristic) {
     pTxCharacteristic->setValue(s.c_str());
     pTxCharacteristic->notify();
     delay(5);
@@ -472,7 +552,7 @@ void logPrintln(const T& message) {
   String s = String(message) + "\n";
   Serial.print(s);
   rememberLogLine(s.c_str());
-  if (deviceConnected && pTxCharacteristic) {
+  if (deviceConnected && ble_session_authenticated && pTxCharacteristic) {
     String cleanS = s;
     cleanS.replace("\r\n", "\n");
     cleanS.replace("\n", "\r\n");
@@ -495,7 +575,7 @@ void logPrintf(const char* format, ...) {
   if (written <= 0) return;
   Serial.print(buffer);
   rememberLogLine(buffer);
-  if (deviceConnected && pTxCharacteristic) {
+  if (deviceConnected && ble_session_authenticated && pTxCharacteristic) {
     String cleanS = String(buffer);
     cleanS.replace("\r\n", "\n");
     cleanS.replace("\n", "\r\n");
@@ -509,6 +589,38 @@ void logPrintf(const char* format, ...) {
 // =====================================================
 // CONFIGURATION STORAGE
 // =====================================================
+void initializeAdminCredential() {
+  Preferences credentials;
+  if (!credentials.begin("ltcred", false)) return;
+  const bool factory_valid = factory_admin_password &&
+    strlen(factory_admin_password) >= 12 &&
+    strlen(factory_admin_password) < sizeof(admin_password);
+  String stored = credentials.getString("admin", "");
+  if (stored.length() >= 12 && stored.length() < sizeof(admin_password)) {
+    strlcpy(admin_password, stored.c_str(), sizeof(admin_password));
+  } else if (factory_valid) {
+    strlcpy(admin_password, factory_admin_password, sizeof(admin_password));
+    credentials.putString("admin", admin_password);
+  } else {
+    static const char alphabet[] = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    for (size_t i = 0; i < 20; i++) {
+      admin_password[i] = alphabet[esp_random() % (sizeof(alphabet) - 1)];
+    }
+    admin_password[20] = '\0';
+    credentials.putString("admin", admin_password);
+  }
+  credentials.end();
+}
+
+void clearAdminCredential() {
+  Preferences credentials;
+  if (credentials.begin("ltcred", false)) {
+    credentials.clear();
+    credentials.end();
+  }
+  memset(admin_password, 0, sizeof(admin_password));
+}
+
 void applyTrackerConfigRuntimeState() {
   tracker_device_hash = EquineProtocol::deviceIdHash(tracker_config.device_id);
   ble_debug_enabled = tracker_config.ble_debug_enabled != 0;
@@ -577,12 +689,15 @@ void makeTrackerFactoryConfig() {
            static_cast<unsigned long>(chip_suffix));
   snprintf(factory_name, sizeof(factory_name), "Tracker %06lX",
            static_cast<unsigned long>(chip_suffix));
+  uint8_t generated_lora_key[EquineProtocol::AEAD_KEY_SIZE];
+  esp_fill_random(generated_lora_key, sizeof(generated_lora_key));
   EquineConfig::makeDefaultTrackerConfig(
     tracker_config,
     factory_id,
     factory_name,
     ssid,
-    password);
+    password,
+    generated_lora_key);
 
   EquineConfig::finalize(
     tracker_config, EquineConfig::DeviceRole::TRACKER, 1);
@@ -641,6 +756,7 @@ void clearTrackerConfigStorage() {
     configPrefs.clear();
     configPrefs.end();
   }
+  clearAdminCredential();
 }
 
 
@@ -688,8 +804,12 @@ bool rollbackTrackerConfig(char* error, size_t error_size) {
 String trackerConfigJson() {
   using EquineConfigApi::appendJsonEscaped;
   char hash_text[17];
+  char key_text[EquineProtocol::AEAD_KEY_SIZE * 2 + 1];
   EquineProtocol::formatDeviceHash(
     TRACKER_DEVICE_HASH, hash_text, sizeof(hash_text));
+  for (size_t i = 0; i < EquineProtocol::AEAD_KEY_SIZE; i++) {
+    snprintf(key_text + i * 2, 3, "%02x", tracker_config.lora_aead_key[i]);
+  }
 
   String out;
   out.reserve(3600);
@@ -706,7 +826,8 @@ String trackerConfigJson() {
   out += "\",\"device_hash\":\"" + String(hash_text) +
          "\",\"wifi_ssid\":\"";
   appendJsonEscaped(out, tracker_config.wifi_ssid);
-  out += "\",\"wifi_password_set\":" +
+  out += "\",\"lora_aead_key\":\"" + String(key_text) +
+         "\",\"wifi_password_set\":" +
          String(tracker_config.wifi_password[0] ? "true" : "false") +
          ",\"ble_debug_enabled\":" +
          String(tracker_config.ble_debug_enabled ? "true" : "false") +
@@ -925,6 +1046,31 @@ void processBleConfigCommand(const char* command) {
     sendBleConfigError("command_too_large", "maximum is 1535 bytes");
     return;
   }
+  if (strncmp(command, "AUTH ", 5) == 0) {
+    const char* supplied = command + 5;
+    const size_t supplied_length = strlen(supplied);
+    const size_t expected_length = strlen(admin_password);
+    uint8_t difference = static_cast<uint8_t>(supplied_length ^ expected_length);
+    const size_t compared = supplied_length > expected_length
+      ? supplied_length : expected_length;
+    for (size_t i = 0; i < compared; i++) {
+      const uint8_t left = i < supplied_length ? supplied[i] : 0;
+      const uint8_t right = i < expected_length ? admin_password[i] : 0;
+      difference |= left ^ right;
+    }
+    if (difference == 0 && expected_length >= 12) {
+      ble_session_authenticated = true;
+      sendBleConfigText("{\"ok\":true,\"authenticated\":true}");
+    } else {
+      ble_session_authenticated = false;
+      sendBleConfigError("authentication_failed", "disconnect and try again");
+    }
+    return;
+  }
+  if (!ble_session_authenticated) {
+    sendBleConfigError("authentication_required", "send AUTH <admin-password> first");
+    return;
+  }
   if (strcmp(command, "HELLO") == 0) {
     String out = "{\"ok\":true,\"api_version\":" +
       String(EquineConfigApi::API_VERSION) +
@@ -1030,6 +1176,7 @@ void stopBleDebug() {
   pTxCharacteristic = NULL;
   pRxCharacteristic = NULL;
   deviceConnected = false;
+  ble_session_authenticated = false;
   debug_mode = false;
   ble_initialized = false;
   ble_advertising = false;
@@ -1046,6 +1193,16 @@ void startBleDebugWindow(uint32_t duration_ms, bool force_provisioning) {
     logPrintln("Starting bounded BLE/configuration window...");
     String ble_name = "EqTrk-" + String(TRACKER_ID);
     BLEDevice::init(ble_name.c_str());
+    const uint32_t pairing_pin =
+      100000UL + static_cast<uint32_t>(
+        EquineProtocol::deviceIdHash(admin_password) % 900000ULL);
+    BLESecurity* security = new BLESecurity();
+    security->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND);
+    security->setCapability(ESP_IO_CAP_OUT);
+    security->setKeySize(16);
+    security->setStaticPIN(pairing_pin);
+    logPrintf("BLE Secure Connections pairing PIN: %06lu\n",
+              static_cast<unsigned long>(pairing_pin));
     pServer = BLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
 
@@ -1060,6 +1217,7 @@ void startBleDebugWindow(uint32_t duration_ms, bool force_provisioning) {
       CHARACTERISTIC_UUID_RX,
       BLECharacteristic::PROPERTY_WRITE
     );
+    pRxCharacteristic->setAccessPermissions(ESP_GATT_PERM_WRITE_ENC_MITM);
     pRxCharacteristic->setCallbacks(new BleConfigCallbacks());
 
     pService->start();
@@ -1118,6 +1276,7 @@ void waitForBleConnectionWindow() {
   const uint64_t now_us = (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;
   target_wakeup_time_us = now_us + restart_delay_us;
 
+  sealRtcHistory();
   esp_sleep_enable_ext0_wakeup((gpio_num_t)USER_BTN_PIN, 0);
   esp_sleep_enable_timer_wakeup(restart_delay_us);
   esp_deep_sleep_start();
@@ -1650,10 +1809,10 @@ void runWifiSetupMode() {
     WiFi.disconnect(false, false);
     WiFi.mode(WIFI_AP);
     String onboarding_ap = "LoRaTracker-" + String(TRACKER_ID);
-    if (strlen(onboarding_ap_password) < 12) {
+    if (strlen(admin_password) < 12) {
       setLastError("Setup password too short");
       logPrintln("Fallback AP disabled: onboarding password must be at least 12 characters.");
-    } else if (WiFi.softAP(onboarding_ap.c_str(), onboarding_ap_password)) {
+    } else if (WiFi.softAP(onboarding_ap.c_str(), admin_password)) {
       wifi_ap_active = true;
       wifi_station_connected = false;
       responsiveDelay(500);
@@ -1662,6 +1821,10 @@ void runWifiSetupMode() {
       setLastError(savedSsid.length() > 0 ? "STA failed; fallback AP" : "No SSID; fallback AP");
       logPrintf("AP '%s' started at %s.\n",
                 onboarding_ap.c_str(), last_wifi_ip.c_str());
+      if (tracker_onboarding_required) {
+        logPrintf("FIRST-BOOT ADMIN CREDENTIAL (record securely): admin / %s\n",
+                  admin_password);
+      }
     } else {
       setLastError("Fallback AP failed");
       logPrintln("Fallback AP failed.");
@@ -1678,11 +1841,11 @@ void runWifiSetupMode() {
   }
 
   auto requireWebAuthentication = []() -> bool {
-    if (strlen(onboarding_ap_password) < 12) {
+    if (strlen(admin_password) < 12) {
       webServer.send(503, "application/json", "{\"error\":\"admin_credentials_not_configured\"}");
       return false;
     }
-    if (webServer.authenticate("admin", onboarding_ap_password)) return true;
+    if (webServer.authenticate("admin", admin_password)) return true;
     webServer.requestAuthentication(BASIC_AUTH, "LoRa Tracker");
     return false;
   };
@@ -2043,15 +2206,7 @@ uint16_t buildDynamicPayload(uint8_t* buffer, size_t max_len, uint16_t& points_p
   points_packed = 0;
   const StoredHistoryPoint& root = history_points[historyIndexToRing(0)];
 
-  LoRaHeader header{};
-  header.frame = EquineProtocol::makeFrameHeader(
-    EquineProtocol::MessageType::HISTORY,
-    EquineProtocol::HISTORY_SCHEMA_VERSION,
-    TRACKER_DEVICE_HASH,
-    root.unix_time_s > 0 ? EquineProtocol::FLAG_HAS_TIMESTAMPS
-                         : EquineProtocol::FLAG_NONE
-  );
-  header.boot_id = boot_id;
+  HistoryPayload header{};
   header.first_seq = root.seq;
   header.root_unix_time_s = root.unix_time_s;
   header.total_dist_dam = (uint16_t)(total_distance_meters / 10.0);
@@ -2117,7 +2272,7 @@ uint16_t buildDynamicPayload(uint8_t* buffer, size_t max_len, uint16_t& points_p
       current_anchor_idx != target_anchor_idx ||
       num_batches == 0 || batches_buf[current_batch_count_ptr] == 255;
 
-    const size_t base_len = sizeof(LoRaHeader) + 8 + 1 + 1;
+    const size_t base_len = sizeof(HistoryPayload) + 8 + 1 + 1;
     const size_t projected_anchor_count =
       num_anchors + (needs_new_anchor ? 1 : 0);
     const size_t projected_batches_len =
@@ -2971,7 +3126,13 @@ void setup() {
   if (hard_boot) delay(250);
 #endif
 
+  if (!EquineCrypto::selfTest()) {
+    Serial.println("Fatal: AES-GCM self-test failed.");
+    while (true) delay(1000);
+  }
+
   prefs.begin("tracker", false);
+  initializeAdminCredential();
   if (!loadTrackerConfig()) {
     // The factory configuration is validated in code, so reaching this branch
     // indicates an NVS write failure. Continue with the in-memory defaults.
@@ -3009,8 +3170,25 @@ void setup() {
     total_distance_meters = prefs.getDouble("dist", 0.0);
     last_saved_dist = total_distance_meters;
 
-    boot_id = prefs.getUInt("boot_id", 0) + 1;
+    const bool had_boot_counter = prefs.isKey("boot_id");
+    const uint32_t previous_boot_id = prefs.getUInt("boot_id", 0);
+    if ((!had_boot_counter && !tracker_onboarding_required) ||
+        previous_boot_id == UINT32_MAX) {
+      esp_fill_random(
+        tracker_config.lora_aead_key,
+        sizeof(tracker_config.lora_aead_key));
+      saveTrackerConfig(true);
+      writeTrackerProvisionedFlag(false);
+      tracker_onboarding_required = true;
+      logPrintln("LoRa key rotated because the monotonic boot counter was unavailable; re-register this tracker.");
+      boot_id = 1;
+    } else {
+      boot_id = previous_boot_id + 1;
+    }
     prefs.putUInt("boot_id", boot_id);
+    esp_fill_random(&tx_nonce_prefix, sizeof(tx_nonce_prefix));
+    if (tx_nonce_prefix == 0) tx_nonce_prefix = 1;
+    next_tx_counter = 0;
 
     has_initial_fix = false;
     seconds_since_last_fix = 0;
@@ -3041,6 +3219,30 @@ void setup() {
   } else {
     wakeup_counter++;
     boot_id = prefs.getUInt("boot_id", 1);
+    if (!validateRtcHistory()) {
+      logPrintln("RTC history metadata/CRC validation failed; discarding retained queue.");
+      if (boot_id == UINT32_MAX) {
+        esp_fill_random(
+          tracker_config.lora_aead_key,
+          sizeof(tracker_config.lora_aead_key));
+        saveTrackerConfig(true);
+        writeTrackerProvisionedFlag(false);
+        tracker_onboarding_required = true;
+        boot_id = 1;
+        logPrintln("LoRa key rotated after boot epoch exhaustion; re-register this tracker.");
+      } else {
+        boot_id++;
+      }
+      prefs.putUInt("boot_id", boot_id);
+      esp_fill_random(&tx_nonce_prefix, sizeof(tx_nonce_prefix));
+      if (tx_nonce_prefix == 0) tx_nonce_prefix = 1;
+      next_tx_counter = 0;
+      history_head = 0;
+      history_count = 0;
+      next_point_seq = 0;
+      memset(history_points, 0, sizeof(history_points));
+      memset(&rtc_history_metadata, 0, sizeof(rtc_history_metadata));
+    }
   }
 
   if (seconds_since_daily_reset >= SECONDS_PER_DAY) {
@@ -3107,6 +3309,7 @@ void setup() {
 #endif
       prefs.end();
       const uint64_t sleep_remaining_us = target_wakeup_time_us - now_us;
+      sealRtcHistory();
       esp_sleep_enable_ext0_wakeup((gpio_num_t)USER_BTN_PIN, 0);
       esp_sleep_enable_timer_wakeup(sleep_remaining_us);
       esp_deep_sleep_start();
@@ -3332,16 +3535,53 @@ void performTrackingCycle() {
     for (int tx_loop = 0; lora_initialized && tx_loop < 5; tx_loop++) {
       if (history_count == 0) break;
 
-      uint8_t payload_buffer[240];
+      constexpr size_t MAX_SECURE_PLAINTEXT =
+        255 - sizeof(SecureFrameHeader) - EquineProtocol::AEAD_TAG_SIZE;
+      uint8_t plaintext_buffer[MAX_SECURE_PLAINTEXT];
       uint16_t points_packed = 0;
-      const size_t payload_len = buildDynamicPayload(
-        payload_buffer, sizeof(payload_buffer), points_packed
+      const size_t plaintext_len = buildDynamicPayload(
+        plaintext_buffer, sizeof(plaintext_buffer), points_packed
       );
 
-      if (payload_len == 0 || points_packed == 0) {
+      if (plaintext_len == 0 || points_packed == 0) {
         logPrintln("Skipping LoRa send because payload build failed.");
         break;
       }
+
+      const StoredHistoryPoint& packet_root =
+        history_points[historyIndexToRing(0)];
+      if (next_tx_counter == UINT32_MAX) {
+        esp_fill_random(&tx_nonce_prefix, sizeof(tx_nonce_prefix));
+        if (tx_nonce_prefix == 0) tx_nonce_prefix = 1;
+        next_tx_counter = 0;
+      }
+      const uint32_t transmit_counter = next_tx_counter++;
+      SecureFrameHeader secure_header = EquineProtocol::makeSecureFrameHeader(
+        EquineProtocol::MessageType::HISTORY,
+        EquineProtocol::HISTORY_SCHEMA_VERSION,
+        TRACKER_DEVICE_HASH,
+        tx_nonce_prefix,
+        boot_id,
+        transmit_counter,
+        packet_root.unix_time_s > 0 ? EquineProtocol::FLAG_HAS_TIMESTAMPS
+                                    : EquineProtocol::FLAG_NONE);
+      uint8_t payload_buffer[255];
+      memcpy(payload_buffer, &secure_header, sizeof(secure_header));
+      uint8_t* ciphertext = payload_buffer + sizeof(secure_header);
+      uint8_t* tag = ciphertext + plaintext_len;
+      if (!EquineCrypto::encrypt(
+            tracker_config.lora_aead_key,
+            secure_header,
+            plaintext_buffer,
+            plaintext_len,
+            ciphertext,
+            tag)) {
+        logPrintln("AES-GCM history encryption failed; retaining queued data.");
+        recordLoRaFailure("encryption");
+        break;
+      }
+      const size_t payload_len =
+        sizeof(secure_header) + plaintext_len + EquineProtocol::AEAD_TAG_SIZE;
 
       last_tx_bytes = payload_len;
       last_tx_points = points_packed;
@@ -3361,18 +3601,20 @@ void performTrackingCycle() {
       logPrintf("LoRa sent %u bytes (%u points); ACK window %u ms.\n",
                 payload_len, points_packed, LORA_ACK_TIMEOUT_MS);
 
-      uint8_t rx_buffer[sizeof(AckPayload)];
+      uint8_t rx_buffer[255];
       const int rx_result = receiveLoRaAck(
         rx_buffer, sizeof(rx_buffer), LORA_ACK_TIMEOUT_MS
       );
       bool ack_received = false;
 
-      if (rx_result == sizeof(AckPayload)) {
-        AckPayload ack{};
-        memcpy(&ack, rx_buffer, sizeof(AckPayload));
-
+      const size_t expected_ack_size =
+        sizeof(SecureFrameHeader) + sizeof(AckPayload) +
+        EquineProtocol::AEAD_TAG_SIZE;
+      if (rx_result == static_cast<int>(expected_ack_size)) {
+        SecureFrameHeader ack_header{};
+        memcpy(&ack_header, rx_buffer, sizeof(ack_header));
         const bool supported_ack = EquineProtocol::isSupportedFrame(
-          ack.frame,
+          ack_header.frame,
           EquineProtocol::MessageType::ACK,
           EquineProtocol::ACK_SCHEMA_VERSION
         );
@@ -3381,19 +3623,35 @@ void performTrackingCycle() {
           last_ack_status = 0;
           logPrintf(
             "Ignored unsupported ACK: magic=0x%04X transport=%u type=%u schema=%u.\n",
-            ack.frame.magic,
-            ack.frame.transport_version,
-            ack.frame.message_type,
-            ack.frame.schema_version
+            ack_header.frame.magic,
+            ack_header.frame.transport_version,
+            ack_header.frame.message_type,
+            ack_header.frame.schema_version
           );
-        } else if (ack.frame.device_id_hash != TRACKER_DEVICE_HASH) {
+        } else if (ack_header.frame.device_id_hash != TRACKER_DEVICE_HASH) {
           last_ack_status = 0;
           char received_hash[17];
           EquineProtocol::formatDeviceHash(
-            ack.frame.device_id_hash, received_hash, sizeof(received_hash)
+            ack_header.frame.device_id_hash, received_hash, sizeof(received_hash)
           );
           logPrintf("Ignored ACK for device hash %s.\n", received_hash);
-        } else if (ack.boot_id == boot_id) {
+        } else if (ack_header.boot_id == boot_id) {
+          AckPayload ack{};
+          const uint8_t* ack_ciphertext = rx_buffer + sizeof(ack_header);
+          const uint8_t* ack_tag = ack_ciphertext + sizeof(ack);
+          if (!EquineCrypto::decrypt(
+                tracker_config.lora_aead_key,
+                ack_header,
+                ack_ciphertext,
+                sizeof(ack),
+                ack_tag,
+                reinterpret_cast<uint8_t*>(&ack)) ||
+              ack.acked_seq != ack_header.counter) {
+            last_ack_status = 0;
+            logPrintln("Rejected unauthenticated or inconsistent ACK.");
+            serviceDisplayAndButton(true);
+            continue;
+          }
           last_acked_seq = ack.acked_seq;
           uint16_t points_to_clear = 0;
           const uint16_t original_count = history_count;
@@ -3424,7 +3682,7 @@ void performTrackingCycle() {
         } else {
           last_ack_status = 0;
           logPrintf("Ignored ACK for wrong boot_id: %lu\n",
-                    (unsigned long)ack.boot_id);
+                    (unsigned long)ack_header.boot_id);
         }
       } else if (rx_result > 0) {
         last_ack_status = 0;
@@ -3521,6 +3779,7 @@ void performTrackingCycle() {
       (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;
     target_wakeup_time_us = now_us + next_sleep_duration_us;
 
+    sealRtcHistory();
     esp_sleep_enable_ext0_wakeup((gpio_num_t)USER_BTN_PIN, 0);
     esp_sleep_enable_timer_wakeup(next_sleep_duration_us);
     esp_deep_sleep_start();

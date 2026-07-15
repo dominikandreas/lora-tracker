@@ -10,6 +10,12 @@ the shipped defaults and the operational tradeoffs behind them.
 public routing hashes. Changing either creates a new MQTT identity and loses the
 association with existing deduplication/history state. Names are display-only.
 
+`lora_aead_key` is a 32-byte per-tracker secret represented as exactly 64 hex
+characters. The tracker generates one on erased first boot. The matching
+gateway registry entry must contain the same key; zero, missing and malformed
+keys fail configuration validation. A key change requires an attended
+tracker/gateway maintenance window and creates a new cryptographic trust state.
+
 The factory radio profile is 868.0 MHz, 125 kHz bandwidth, spreading factor 10,
 coding rate 4/5, preamble 8, sync word `0x12`, and 20 dBm requested TX power.
 This is a development profile, not a declaration of legal operation. Set the
@@ -34,7 +40,7 @@ region and hardware. Tracker and gateway values must match exactly.
 | No-fix acquisition | 30, 20, 10, 8 s | Progressively reduces GNSS effort |
 | No-fix sleep | 120, 300, 600, 900 s | Progressively extends retry interval |
 | Forced full GNSS attempt | 3600 s | Periodic recovery from quick-probe failures |
-| RTC history capacity | 448 points | Fits with retained state in 8 KiB RTC slow memory |
+| RTC history capacity | 448 points | Fits with retained state plus metadata/CRC in 8 KiB RTC slow memory |
 
 These values came from the earlier field prototype and are starting points,
 not validated universal settings. Tune only after collecting fix quality,
@@ -48,9 +54,12 @@ missed movement, airtime and measured energy data together.
 - Deduplication cursor checkpoint after 10 updates.
 - Empty tracker allowlist on first boot; every tracker must be registered.
 
-The PEM broker root CA and plaintext-test opt-in remain build-time secrets.
-Broker host, port, credentials, namespace and registry are transactional runtime
-configuration. A TLS setting without a valid CA fails closed.
+The PEM broker root CA, broker host, port, credentials, namespace and registry
+are transactional runtime configuration. The read API exposes only
+`ca_certificate_set`; updates use `mqtt_ca_certificate` with a PEM value or
+`__KEEP__`. `secrets.h` can seed a per-device factory certificate. The
+plaintext-test opt-in remains build-time only, and TLS without a valid CA fails
+closed.
 
 ## Safe change procedure
 

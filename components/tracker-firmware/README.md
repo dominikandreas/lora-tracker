@@ -1,7 +1,7 @@
 # LoRa Tracker firmware
 
-This tracker extends the onboarding/configuration firmware with LoRa history
-schema v2.
+This tracker implements transport v2 with AES-256-GCM-protected LoRa history
+schema 2 and authenticated ACK schema 1.
 
 Each stored route point now carries a GNSS UTC timestamp. On wire, the first
 point uses a 32-bit Unix epoch and every later point uses an unsigned LEB128
@@ -18,7 +18,7 @@ The included `platformio.ini` provides two pinned ESP32 Arduino builds:
 - `heltec_wifi_lora_32_v2` for the BN-220/SX1276/OLED branch;
 - `heltec_wireless_tracker` for the UC6580/SX1262/TFT branch.
 
-Copy `secrets.example.h` to `secrets.h`, set only your factory seed values, and
+Copy `secrets.example.h` to `secrets.h`, set only optional factory seed values, and
 build from the repository root:
 
 ```bash
@@ -27,5 +27,7 @@ pio run -d components/tracker-firmware -e heltec_wireless_tracker
 ```
 
 Use `-t upload` only after selecting the physical board and checking its port.
+Tagged releases also contain merged browser-flashable images; see
+[`docs/FLASHING.md`](../../docs/FLASHING.md).
 The host simulator does not compile this sketch or exercise its peripherals;
 see [`docs/SIMULATION_COVERAGE.md`](../../docs/SIMULATION_COVERAGE.md).

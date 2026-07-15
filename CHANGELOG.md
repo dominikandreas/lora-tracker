@@ -12,6 +12,13 @@
 - Added pinned tracker/gateway PlatformIO builds and embedded contract simulation.
 - Fixed an ESP32 RTC slow-memory link overflow by sizing the history queue to 448 points.
 - Added onboarding, configuration, hardware, operations, security and production-readiness guidance.
+- Added per-tracker AES-256-GCM history/ACK frames and monotonic replay rejection.
+- Added a distinct retained transmit counter so retries cannot reuse GCM nonces.
+- Added BLE Secure Connections, application-session authentication and generated first-boot credentials.
+- Added transactional runtime MQTT root-CA provisioning for generic gateway images.
+- Added RTC retained-history metadata, bounds and CRC validation.
+- Added pinned GitHub Actions CI/release builds, checksums, provenance, merged
+  ESP Web Tools images and browser-flashing instructions.
 
 ## Initial implementation
 

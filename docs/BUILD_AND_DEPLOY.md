@@ -10,9 +10,12 @@
 ## Secrets
 
 Copy `secrets.example.h` to `secrets.h` in each firmware directory. These files
-are git-ignored. Assign every device a unique 12+ character onboarding password
-and a separate OTA password hash. For the gateway, configure a TLS port and PEM
-root CA. Leave `allow_insecure_mqtt=false` outside an isolated test network.
+are git-ignored. Generic release builds leave `factory_admin_password` empty;
+each erased device generates and persists a unique 20-character credential.
+A factory may instead inject a unique 12+ character value per device. For the
+gateway, provision the TLS port and PEM root CA during authenticated onboarding;
+`mqtt_ca_certificate` in `secrets.h` is only an optional factory seed. Leave
+`allow_insecure_mqtt=false` outside an isolated test network.
 
 The archiver uses environment variables documented in `.env.example`. TLS is
 enabled by default; provide `MQTT_CA_FILE`. Set `ALLOW_INSECURE_MQTT=true` only
@@ -112,3 +115,24 @@ maintenance window:
 6. Record the firmware commit and configuration revision for every unit.
 
 Use `lora-tracker.code-workspace` to open both PlatformIO projects in VS Code.
+
+## Automated builds and releases
+
+`.github/workflows/ci.yml` tests Python and browser code and compiles every
+firmware target on pushes and pull requests. `.github/workflows/release.yml`
+runs the same gates for `v*` tags, checks that the tag matches `VERSION`, builds
+secret-free generic firmware, creates merged ESP Web Tools images, publishes
+checksums/ELF files/manifests, and generates build-provenance attestations.
+
+Prepare a release only from a reviewed clean commit:
+
+```bash
+VERSION=$(cat VERSION)
+git tag -s "v${VERSION}" -m "LoRa Tracker ${VERSION}"
+git push origin "v${VERSION}"
+```
+
+The workflow verifies that the remote tag already exists before creating the
+GitHub release. Enable immutable releases in repository settings when the
+project's release policy is finalized. See [browser flashing](FLASHING.md) for
+the operator workflow.

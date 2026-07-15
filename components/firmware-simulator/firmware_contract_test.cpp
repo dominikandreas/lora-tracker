@@ -12,13 +12,31 @@ void testProtocol() {
   const uint64_t hash = deviceIdHash("horse-1");
   assert(hash == 0x320F3B2F2CBE9920ULL);
   const FrameHeaderV1 header = makeFrameHeader(
-      MessageType::HISTORY, HISTORY_SCHEMA_VERSION, hash, FLAG_HAS_TIMESTAMPS);
+      MessageType::HISTORY, HISTORY_SCHEMA_VERSION, hash,
+      FLAG_HAS_TIMESTAMPS | FLAG_ENCRYPTED);
   assert(isSupportedHistoryFrame(header));
   assert(!isSupportedFrame(header, MessageType::ACK, ACK_SCHEMA_VERSION));
 
   char rendered_hash[17]{};
   formatDeviceHash(hash, rendered_hash, sizeof(rendered_hash));
   assert(strcmp(rendered_hash, "320f3b2f2cbe9920") == 0);
+
+  const SecureFrameHeaderV2 secure = makeSecureFrameHeader(
+      MessageType::HISTORY, HISTORY_SCHEMA_VERSION, hash,
+      0x0102030405060708ULL, 7, 42, FLAG_HAS_TIMESTAMPS);
+  uint8_t nonce[AEAD_NONCE_SIZE]{};
+  makeAeadNonce(secure, nonce);
+  const uint8_t expected_nonce[] = {
+    0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+    0x2a, 0x00, 0x00, 0x00};
+  assert(memcmp(nonce, expected_nonce, sizeof(nonce)) == 0);
+  HistoryPayloadV2 payload{};
+  payload.first_seq = 123;
+  assert(payload.first_seq == 123 && sizeof(payload) == 11);
+
+  FrameHeaderV1 unknown_flags = header;
+  unknown_flags.flags |= 0x80;
+  assert(!isSupportedHistoryFrame(unknown_flags));
 
   const uint32_t values[] = {0, 1, 127, 128, 16383, 16384, UINT32_MAX};
   for (uint32_t value : values) {
@@ -40,7 +58,10 @@ void testConfiguration() {
   using namespace EquineConfig;
 
   TrackerConfigV1 tracker{};
-  makeDefaultTrackerConfig(tracker, "horse-1", "Horse 1", "stable", "secret");
+  uint8_t key[EquineProtocol::AEAD_KEY_SIZE];
+  memset(key, 0x5a, sizeof(key));
+  makeDefaultTrackerConfig(
+      tracker, "horse-1", "Horse 1", "stable", "secret", key);
   assert(validateTrackerConfig(tracker));
   tracker.min_satellites = 2;
   assert(!validateTrackerConfig(tracker));
@@ -57,9 +78,11 @@ void testConfiguration() {
   strlcpy(gateway.trackers[0].device_id, "horse-1", sizeof(gateway.trackers[0].device_id));
   strlcpy(gateway.trackers[0].device_name, "Horse 1", sizeof(gateway.trackers[0].device_name));
   gateway.trackers[0].enabled = 1;
+  memcpy(gateway.trackers[0].lora_aead_key, key, sizeof(key));
   strlcpy(gateway.trackers[1].device_id, "horse-2", sizeof(gateway.trackers[1].device_id));
   strlcpy(gateway.trackers[1].device_name, "Horse 2", sizeof(gateway.trackers[1].device_name));
   gateway.trackers[1].enabled = 1;
+  memcpy(gateway.trackers[1].lora_aead_key, key, sizeof(key));
   finalize(gateway, DeviceRole::GATEWAY, 1);
   assert(validateEnvelope(gateway, DeviceRole::GATEWAY));
   assert(isValidCanonicalId(gateway.gateway_id, sizeof(gateway.gateway_id)));

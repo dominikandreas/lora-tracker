@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: components/archiver/pyproject.toml
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Install build dependencies
+        run: python -m pip install --disable-pip-version-check platformio==6.1.18 "./components/archiver[test]"
+      - name: Create generic release configuration
+        run: |
+          cp components/tracker-firmware/secrets.example.h components/tracker-firmware/secrets.h
+          cp components/gateway-firmware/secrets.example.h components/gateway-firmware/secrets.h
+      - name: Test archiver and embedded contracts
+        working-directory: components/archiver
+        run: python -m pytest -q
+      - name: Test browser application
+        working-directory: components/web-app
+        run: npm test
+      - name: Build tracker firmware
+        run: |
+          pio run -d components/tracker-firmware -e heltec_wifi_lora_32_v2
+          pio run -d components/tracker-firmware -e heltec_wireless_tracker
+      - name: Build gateway firmware
+        run: pio run -d components/gateway-firmware -e heltec_wifi_lora_32_v2

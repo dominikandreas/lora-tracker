@@ -13,14 +13,17 @@
 namespace EquineProtocol {
 
 constexpr uint16_t FRAME_MAGIC = 0x5145;  // bytes "EQ" on little-endian targets
-constexpr uint8_t TRANSPORT_VERSION = 1;
+constexpr uint8_t TRANSPORT_VERSION = 2;
 constexpr uint8_t HISTORY_SCHEMA_VERSION = 2;
 constexpr uint8_t ACK_SCHEMA_VERSION = 1;
 constexpr uint8_t MQTT_API_VERSION = 1;
 constexpr size_t MAX_ULEB128_U32_BYTES = 5;
+constexpr size_t AEAD_KEY_SIZE = 32;
+constexpr size_t AEAD_NONCE_SIZE = 12;
+constexpr size_t AEAD_TAG_SIZE = 16;
 
-// Flags are part of the stable envelope so encryption and relaying do not need
-// another envelope layout. FLAG_HAS_TIMESTAMPS applies to history schema v2.
+// All current frames are authenticated and encrypted with AES-256-GCM. The
+// routing header remains visible but is authenticated as associated data.
 enum FrameFlags : uint8_t {
   FLAG_NONE           = 0,
   FLAG_ENCRYPTED      = 1U << 0,
@@ -47,9 +50,14 @@ struct FrameHeaderV1 {
 // Schema v2 adds one absolute UTC timestamp for the root point. Every later
 // point stores an unsigned LEB128 delta in seconds from the previous point.
 // A normal 40-120 second interval costs one byte; up to 16383 seconds costs two.
-struct HistoryHeaderV2 {
+struct SecureFrameHeaderV2 {
   FrameHeaderV1 frame;
+  uint64_t nonce_prefix;
   uint32_t boot_id;
+  uint32_t counter;
+} __attribute__((packed));
+
+struct HistoryPayloadV2 {
   uint32_t first_seq;
   uint32_t root_unix_time_s;
   uint16_t total_dist_dam;
@@ -57,8 +65,6 @@ struct HistoryHeaderV2 {
 } __attribute__((packed));
 
 struct AckPayloadV1 {
-  FrameHeaderV1 frame;
-  uint32_t boot_id;
   uint32_t acked_seq;
 } __attribute__((packed));
 
@@ -73,8 +79,9 @@ struct DeltaPointV1 {
 } __attribute__((packed));
 
 static_assert(sizeof(FrameHeaderV1) == 14, "Unexpected protocol frame size");
-static_assert(sizeof(HistoryHeaderV2) == 29, "Unexpected v2 history header size");
-static_assert(sizeof(AckPayloadV1) == 22, "Unexpected ACK size");
+static_assert(sizeof(SecureFrameHeaderV2) == 30, "Unexpected secure frame size");
+static_assert(sizeof(HistoryPayloadV2) == 11, "Unexpected history payload size");
+static_assert(sizeof(AckPayloadV1) == 4, "Unexpected ACK payload size");
 static_assert(sizeof(AnchorPointV1) == 4, "Unexpected anchor size");
 static_assert(sizeof(DeltaPointV1) == 2, "Unexpected delta size");
 
@@ -110,6 +117,32 @@ inline FrameHeaderV1 makeFrameHeader(
   return header;
 }
 
+inline SecureFrameHeaderV2 makeSecureFrameHeader(
+    MessageType type,
+    uint8_t schema_version,
+    uint64_t device_id_hash,
+    uint64_t nonce_prefix,
+    uint32_t boot_id,
+    uint32_t counter,
+    uint8_t flags = FLAG_NONE) {
+  SecureFrameHeaderV2 header{};
+  header.frame = makeFrameHeader(
+    type, schema_version, device_id_hash,
+    static_cast<uint8_t>(flags | FLAG_ENCRYPTED));
+  header.nonce_prefix = nonce_prefix;
+  header.boot_id = boot_id;
+  header.counter = counter;
+  return header;
+}
+
+inline void makeAeadNonce(
+    const SecureFrameHeaderV2& header,
+    uint8_t nonce[AEAD_NONCE_SIZE]) {
+  memcpy(nonce, &header.nonce_prefix, sizeof(header.nonce_prefix));
+  memcpy(nonce + sizeof(header.nonce_prefix),
+         &header.counter, sizeof(header.counter));
+}
+
 inline bool hasValidMagic(const FrameHeaderV1& header) {
   return header.magic == FRAME_MAGIC;
 }
@@ -118,17 +151,25 @@ inline bool isSupportedFrame(
     const FrameHeaderV1& header,
     MessageType expected_type,
     uint8_t expected_schema_version) {
+  const uint8_t allowed_flags = expected_type == MessageType::HISTORY
+    ? static_cast<uint8_t>(FLAG_ENCRYPTED | FLAG_HAS_TIMESTAMPS)
+    : static_cast<uint8_t>(FLAG_ENCRYPTED);
   return header.magic == FRAME_MAGIC &&
          header.transport_version == TRANSPORT_VERSION &&
          header.message_type == static_cast<uint8_t>(expected_type) &&
-         header.schema_version == expected_schema_version;
+         header.schema_version == expected_schema_version &&
+         (header.flags & FLAG_ENCRYPTED) != 0 &&
+         (header.flags & static_cast<uint8_t>(~allowed_flags)) == 0;
 }
 
 inline bool isSupportedHistoryFrame(const FrameHeaderV1& header) {
   return header.magic == FRAME_MAGIC &&
          header.transport_version == TRANSPORT_VERSION &&
          header.message_type == static_cast<uint8_t>(MessageType::HISTORY) &&
-         header.schema_version == HISTORY_SCHEMA_VERSION;
+         header.schema_version == HISTORY_SCHEMA_VERSION &&
+         (header.flags & FLAG_ENCRYPTED) != 0 &&
+         (header.flags & static_cast<uint8_t>(
+           ~(FLAG_ENCRYPTED | FLAG_HAS_TIMESTAMPS))) == 0;
 }
 
 inline size_t uleb128SizeU32(uint32_t value) {

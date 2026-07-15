@@ -11,7 +11,7 @@ def make_point(seq: int, *, fix_time_ms: int | None = None):
     return {
         "api_version": 1,
         "point_schema_version": 2,
-        "transport_version": 1,
+        "transport_version": 2,
         "schema_version": 2,
         "device_hash": HASH,
         "point_id": f"{HASH}:7:{seq}",

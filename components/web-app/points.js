@@ -3,6 +3,9 @@ export function normalizePoint(raw, fallbackNow = Date.now()) {
   if (!raw || raw.api_version !== 1 || raw.point_schema_version !== 2) {
     throw new Error('Unsupported point schema');
   }
+  if (raw.transport_version !== 2 || raw.schema_version !== 2) {
+    throw new Error('Unsupported radio transport schema');
+  }
   const validTime = raw.timestamp_valid === true
     && Number.isSafeInteger(raw.fix_time_unix_ms)
     && raw.fix_time_unix_ms > 0;

@@ -13,7 +13,7 @@ def point(seq: int = 1, schema: int = 2):
     data = {
         "api_version": 1,
         "point_schema_version": schema,
-        "transport_version": 1,
+        "transport_version": 2,
         "schema_version": 2,
         "device_hash": HASH,
         "point_id": f"{HASH}:5:{seq}",
@@ -54,6 +54,17 @@ def test_old_point_schema_is_rejected():
         assert exc.code == "unsupported_version"
     else:
         raise AssertionError("old point schema accepted")
+
+
+def test_old_radio_transport_is_rejected():
+    old = point()
+    old["transport_version"] = 1
+    try:
+        validate_point(old, HASH)
+    except ProtocolError as exc:
+        assert exc.code == "unsupported_version"
+    else:
+        raise AssertionError("old radio transport accepted")
 
 
 def test_invalid_timestamp_rejected():

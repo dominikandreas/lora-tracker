@@ -133,7 +133,7 @@ def validate_point(data: dict[str, Any], topic_device_hash: str) -> dict[str, An
         raise ProtocolError(
             "unsupported_version", "unsupported point API or schema version"
         )
-    if data.get("transport_version") != 1 or data.get("schema_version") != 2:
+    if data.get("transport_version") != 2 or data.get("schema_version") != 2:
         raise ProtocolError(
             "unsupported_version", "unsupported LoRa transport or history schema"
         )

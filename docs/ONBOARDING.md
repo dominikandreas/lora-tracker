@@ -2,13 +2,18 @@
 
 ## Prepare a device
 
-1. Copy `secrets.example.h` to `secrets.h` in the relevant firmware directory.
-2. Set a unique `onboarding_ap_password` of at least 12 characters. Record it in
-   the device inventory or place it in a protected per-device QR record.
+1. Copy `secrets.example.h` to `secrets.h` in the relevant firmware directory,
+   or install a generic release with the [browser flasher](FLASHING.md).
+2. Leave `factory_admin_password` empty for a generic image. On erased flash,
+   the device generates a unique 20-character credential and prints it while
+   the unprovisioned setup AP starts in the attended serial log. A factory may inject a different 12+
+   character value into each device build instead. Record it in the protected
+   device inventory.
 3. Set `ota_password_hash` to the 64-character lowercase or uppercase SHA-256
    hash of a separate password. Leave it empty to keep OTA disabled.
-4. For a gateway, set a TLS broker port (normally 8883), paste the broker root CA
-   into `mqtt_ca_certificate`, and leave `allow_insecure_mqtt=false`.
+4. For a gateway, set a TLS broker port (normally 8883) and paste the broker root
+   CA into the runtime `mqtt_ca_certificate` field. A source build may seed the
+   same field from `secrets.h`. Leave `allow_insecure_mqtt=false`.
 5. Build, flash and label the device ID, hardware revision, firmware commit,
    region/frequency and provisioning-record identifier.
 
@@ -17,9 +22,10 @@ The CA certificate is public; client and signing keys are not.
 
 ## Tracker first boot
 
-An unprovisioned tracker derives a collision-resistant setup ID from the low
-24 bits of its eFuse MAC, then exposes `LoRaTracker-<device_id>` and BLE name
-`EqTrk-<device_id>`. Connect to the AP with the unique onboarding password,
+An unprovisioned tracker derives a setup ID from the low 24 bits of its eFuse
+MAC, generates a random 256-bit LoRa AEAD key, then exposes
+`LoRaTracker-<device_id>` and BLE name `EqTrk-<device_id>`. Record the generated
+admin credential from the serial console. Connect to the AP with that password,
 then open the AP address shown on serial output. HTTP authentication uses user
 `admin` and the same password.
 
@@ -42,8 +48,12 @@ The confirmation step prevents a single accidental long press from erasing
 state. Never hold GPIO 0 while powering or resetting an ESP32-S3 because it can
 enter the ROM downloader instead of the application.
 
-BLE exposes the same patch model, but is not authenticated in this release.
-Use it only during attended field trials and disable BLE debug afterwards.
+BLE requires LE Secure Connections with MITM protection, then an application
+session command `AUTH <admin-password>` before any configuration or debug logs
+are exposed. The six-digit pairing PIN is shown in the attended serial log when
+the bounded BLE window opens. BLE still lacks the planned QR bootstrap,
+purpose-separated provisioning key and fleet key-rotation workflow; disable BLE
+debug after setup.
 
 ## Gateway first boot
 
@@ -52,6 +62,12 @@ An unprovisioned gateway derives its setup ID from its eFuse MAC and exposes
 `admin`, configure Wi-Fi, TLS MQTT settings, the same regional LoRa settings as
 the trackers, and a registry entry for every allowed tracker. IDs must be unique
 canonical lowercase strings.
+
+For each tracker registry entry, copy `lora_aead_key` from the tracker's
+authenticated `GET /api/v1/config` response into
+`tracker.<index>.lora_aead_key` on the gateway. The value is exactly 64 hex
+characters. Treat it as a secret: it authenticates and decrypts that tracker's
+history and ACK traffic. Never reuse a key between trackers.
 
 On a provisioned gateway, hold the USER button for five seconds to open the
 ten-minute write window. Authentication is still required. Read-only HTTP routes
@@ -73,11 +89,12 @@ The complete endpoint and field reference is in
 
 ## Post-onboarding acceptance checklist
 
-- Device starts without exposing a shared or logged password.
+- Device has a unique generated or factory-injected admin credential; any
+  first-boot log containing it has been closed and handled as a secret.
 - Gateway reports verified TLS and rejects plaintext when the test override is false.
 - Tracker and gateway have identical frequency, bandwidth, spreading factor,
   coding rate, preamble and sync word.
-- Only registered tracker hashes are accepted.
+- Only registered tracker hashes with matching per-device AEAD keys are accepted.
 - `timestamp_valid`, location, battery and sequence values are plausible.
 - Archiver availability is online and a history request ends with `final=true`.
 - Factory-reset and rollback procedure has been tested on a spare unit.

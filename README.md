@@ -7,9 +7,10 @@ deterministic cross-component simulator.
 ## Release status
 
 The repository is suitable for development and controlled field trials, but
-is not approved for unattended production deployment. The remaining release
-blockers are authenticated LoRa telemetry/ACKs, authenticated BLE provisioning,
-signed firmware with ESP32 secure boot, durable gateway delivery and
+is not approved for unattended production deployment. LoRa telemetry/ACKs now
+use per-tracker AES-256-GCM and tracker BLE configuration requires an encrypted,
+authenticated session. The remaining release blockers include signed firmware
+with ESP32 secure boot, durable gateway delivery, key custody/rotation and
 hardware-in-the-loop qualification. See [production readiness](docs/PRODUCTION_READINESS.md)
 and [security](SECURITY.md).
 
@@ -45,9 +46,10 @@ pio run -d components/gateway-firmware -e heltec_wifi_lora_32_v2
 ```
 
 Copy each firmware component's `secrets.example.h` to the git-ignored
-`secrets.h` first. Use a unique onboarding password per device, a separate OTA
-password hash, and a PEM root CA for gateway MQTT. Plain MQTT is disabled by
-default.
+`secrets.h` first. Generic builds generate their admin credential on erased
+first boot; a factory seed and OTA password hash are optional. Provision the
+gateway broker's PEM root CA through the authenticated setup API or a per-device
+factory build. Plain MQTT is disabled by default.
 
 ## Documentation
 
@@ -55,6 +57,7 @@ default.
 - [Onboarding and configuration](docs/ONBOARDING.md)
 - [Configuration reference](docs/CONFIGURATION_REFERENCE.md)
 - [Build and deployment](docs/BUILD_AND_DEPLOY.md)
+- [Browser flashing](docs/FLASHING.md)
 - [Hardware recommendations](docs/HARDWARE.md)
 - [Operations](docs/OPERATIONS.md)
 - [Simulation coverage](docs/SIMULATION_COVERAGE.md)

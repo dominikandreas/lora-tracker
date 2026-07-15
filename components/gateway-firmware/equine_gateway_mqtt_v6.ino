@@ -12,6 +12,7 @@
 #include <WebServer.h>
 #include "secrets.h"
 #include "equine_protocol.h"
+#include "equine_crypto.h"
 #include "equine_config.h"
 #include "equine_config_api.h"
 #include "equine_mqtt_api.h"
@@ -21,6 +22,8 @@
 // ==========================================
 EquineConfig::GatewayConfigV1 gateway_config{};
 Preferences configPrefs;
+char admin_password[25]{};
+String runtime_mqtt_ca_certificate;
 
 #define USER_BTN_PIN 0
 bool gateway_onboarding_required = false;
@@ -95,7 +98,8 @@ const size_t LOG_HISTORY_LINE_LENGTH = 160;
 // VERSIONED PAYLOAD FORMAT
 // ==========================================
 using AckPayload = EquineProtocol::AckPayloadV1;
-using LoRaHeaderV2 = EquineProtocol::HistoryHeaderV2;
+using SecureFrameHeader = EquineProtocol::SecureFrameHeaderV2;
+using HistoryPayload = EquineProtocol::HistoryPayloadV2;
 using AnchorPoint = EquineProtocol::AnchorPointV1;
 
 struct DecodedHistoryHeader {
@@ -129,6 +133,7 @@ unsigned long lastLoRaPacketMs = 0;
 unsigned long lastWiFiReconnectAttemptMs = 0;
 unsigned long lastMqttReconnectAttemptMs = 0;
 unsigned long lastGatewayStatusPublishMs = 0;
+uint64_t gateway_tx_nonce_prefix = 0;
 wl_status_t lastWiFiStatus = WL_IDLE_STATUS;
 
 constexpr uint32_t GATEWAY_STATUS_INTERVAL_MS = 60000;
@@ -270,6 +275,95 @@ bool publishRetainedMessage(const char* topic, const char* payload) {
 // ==========================================
 // CONFIGURATION STORAGE
 // ==========================================
+void initializeAdminCredential() {
+  Preferences credentials;
+  if (!credentials.begin("ltcred", false)) return;
+  const bool factory_valid = factory_admin_password &&
+    strlen(factory_admin_password) >= 12 &&
+    strlen(factory_admin_password) < sizeof(admin_password);
+  String stored = credentials.getString("admin", "");
+  if (stored.length() >= 12 && stored.length() < sizeof(admin_password)) {
+    strlcpy(admin_password, stored.c_str(), sizeof(admin_password));
+  } else if (factory_valid) {
+    strlcpy(admin_password, factory_admin_password, sizeof(admin_password));
+    credentials.putString("admin", admin_password);
+  } else {
+    static const char alphabet[] = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    for (size_t i = 0; i < 20; i++) {
+      admin_password[i] = alphabet[esp_random() % (sizeof(alphabet) - 1)];
+    }
+    admin_password[20] = '\0';
+    credentials.putString("admin", admin_password);
+  }
+  credentials.end();
+}
+
+void clearAdminCredential() {
+  Preferences credentials;
+  if (credentials.begin("ltcred", false)) {
+    credentials.clear();
+    credentials.end();
+  }
+  memset(admin_password, 0, sizeof(admin_password));
+}
+
+constexpr size_t MAX_MQTT_CA_CERTIFICATE_SIZE = 4096;
+
+bool isValidMqttCaCertificate(const String& certificate, bool allow_empty) {
+  if (certificate.isEmpty()) return allow_empty;
+  return certificate.length() <= MAX_MQTT_CA_CERTIFICATE_SIZE &&
+    certificate.indexOf("-----BEGIN CERTIFICATE-----") >= 0 &&
+    certificate.indexOf("-----END CERTIFICATE-----") >= 0;
+}
+
+void initializeMqttCaCertificate() {
+  Preferences trust;
+  if (!trust.begin("lttrust", false)) return;
+  String stored = trust.getString("mqtt_ca", "");
+  if (stored.isEmpty() && mqtt_ca_certificate && mqtt_ca_certificate[0]) {
+    stored = mqtt_ca_certificate;
+    trust.putString("mqtt_ca", stored);
+  }
+  if (isValidMqttCaCertificate(stored, true)) {
+    runtime_mqtt_ca_certificate = stored;
+  }
+  trust.end();
+}
+
+bool readMqttCaCertificateBackup(String& certificate) {
+  Preferences trust;
+  if (!trust.begin("lttrust", true)) return false;
+  const bool present = trust.isKey("mqtt_ca_bak");
+  if (present) certificate = trust.getString("mqtt_ca_bak", "");
+  trust.end();
+  return present && isValidMqttCaCertificate(certificate, true);
+}
+
+bool writeMqttCaCertificate(
+    const String& certificate,
+    bool update_backup) {
+  if (!isValidMqttCaCertificate(certificate, true)) return false;
+  Preferences trust;
+  if (!trust.begin("lttrust", false)) return false;
+  bool ok = true;
+  if (update_backup) {
+    ok = trust.putString("mqtt_ca_bak", runtime_mqtt_ca_certificate) > 0;
+  }
+  if (ok) ok = trust.putString("mqtt_ca", certificate) > 0;
+  trust.end();
+  if (ok) runtime_mqtt_ca_certificate = certificate;
+  return ok;
+}
+
+void clearMqttCaCertificateStorage() {
+  Preferences trust;
+  if (trust.begin("lttrust", false)) {
+    trust.clear();
+    trust.end();
+  }
+  runtime_mqtt_ca_certificate = "";
+}
+
 bool readGatewayConfigBlob(const char* key,
                            EquineConfig::GatewayConfigV1& output) {
   if (!configPrefs.begin(EquineConfig::CONFIG_NAMESPACE, true)) return false;
@@ -400,6 +494,8 @@ void clearGatewayConfigStorage() {
     configPrefs.clear();
     configPrefs.end();
   }
+  clearAdminCredential();
+  clearMqttCaCertificateStorage();
 }
 
 
@@ -407,7 +503,8 @@ bool commitGatewayConfigCandidate(
     EquineConfig::GatewayConfigV1 candidate,
     bool mark_provisioned,
     char* error,
-    size_t error_size) {
+    size_t error_size,
+    const String* mqtt_ca_candidate = nullptr) {
   const uint32_t next_revision =
     gateway_config.header.revision < UINT32_MAX
       ? gateway_config.header.revision + 1
@@ -418,10 +515,26 @@ bool commitGatewayConfigCandidate(
     snprintf(error, error_size, "candidate violates cross-field validation");
     return false;
   }
+  const String previous_ca = runtime_mqtt_ca_certificate;
+  const String& next_ca = mqtt_ca_candidate
+    ? *mqtt_ca_candidate : runtime_mqtt_ca_certificate;
+  if (candidate.mqtt_tls_enabled && !isValidMqttCaCertificate(next_ca, false)) {
+    snprintf(error, error_size, "TLS requires a valid PEM root CA certificate");
+    return false;
+  }
+  if (!candidate.mqtt_tls_enabled && !allow_insecure_mqtt) {
+    snprintf(error, error_size, "plaintext MQTT is disabled by this firmware");
+    return false;
+  }
+  if (!writeMqttCaCertificate(next_ca, true)) {
+    snprintf(error, error_size, "failed to write MQTT CA certificate");
+    return false;
+  }
   const EquineConfig::GatewayConfigV1 previous = gateway_config;
   gateway_config = candidate;
   if (!saveGatewayConfig(false)) {
     gateway_config = previous;
+    writeMqttCaCertificate(previous_ca, false);
     snprintf(error, error_size, "failed to write active configuration");
     return false;
   }
@@ -438,7 +551,13 @@ bool rollbackGatewayConfig(char* error, size_t error_size) {
     snprintf(error, error_size, "no valid rollback configuration");
     return false;
   }
-  return commitGatewayConfigCandidate(backup, true, error, error_size);
+  String backup_ca;
+  if (!readMqttCaCertificateBackup(backup_ca)) {
+    snprintf(error, error_size, "no valid MQTT CA rollback value");
+    return false;
+  }
+  return commitGatewayConfigCandidate(
+    backup, true, error, error_size, &backup_ca);
 }
 
 String gatewayConfigJson() {
@@ -474,6 +593,8 @@ String gatewayConfigJson() {
   appendJsonEscaped(out, gateway_config.mqtt_username);
   out += "\",\"password_set\":" +
          String(gateway_config.mqtt_password[0] ? "true" : "false") +
+         ",\"ca_certificate_set\":" +
+         String(runtime_mqtt_ca_certificate.length() ? "true" : "false") +
          ",\"base_topic\":\"";
   appendJsonEscaped(out, gateway_config.mqtt_base_topic);
   out += "\",\"buffer_size\":" + String(gateway_config.mqtt_buffer_size) + "}";
@@ -500,7 +621,9 @@ String gatewayConfigJson() {
     out += "\",\"name\":\"";
     appendJsonEscaped(out, tracker.device_name);
     out += "\",\"device_hash\":\"" + String(hash) +
-           "\",\"enabled\":" + String(tracker.enabled ? "true" : "false") + "}";
+           "\",\"lora_key_set\":" +
+           String(EquineConfig::hasProvisionedKey(tracker.lora_aead_key) ? "true" : "false") +
+           ",\"enabled\":" + String(tracker.enabled ? "true" : "false") + "}";
   }
   out += "]}";
   return out;
@@ -509,6 +632,7 @@ String gatewayConfigJson() {
 bool applyGatewayWebPatch(EquineConfigApi::PatchStatus& status,
                           bool& reboot_requested) {
   EquineConfig::GatewayConfigV1 candidate = gateway_config;
+  String mqtt_ca_candidate = runtime_mqtt_ca_certificate;
   uint32_t expected_revision = 0;
   bool has_revision = false;
   const int argument_count = webServer.args();
@@ -536,6 +660,21 @@ bool applyGatewayWebPatch(EquineConfigApi::PatchStatus& status,
       continue;
     }
     if (EquineConfigApi::isControlField(key)) continue;
+    if (strcmp(key, "mqtt_ca_certificate") == 0) {
+      if (strcmp(value, EquineConfigApi::KEEP_SECRET) == 0) continue;
+      const String proposed = value;
+      if (!isValidMqttCaCertificate(proposed, true)) {
+        EquineConfigApi::setError(
+          status, key, "expected a PEM certificate no larger than 4096 bytes");
+        return false;
+      }
+      if (mqtt_ca_candidate != proposed) {
+        mqtt_ca_candidate = proposed;
+        status.changed = true;
+        status.reboot_required = true;
+      }
+      continue;
+    }
     const auto result = EquineConfigApi::applyGatewayField(
       candidate, key, value, status);
     if (result == EquineConfigApi::FieldResult::UNKNOWN) {
@@ -562,7 +701,7 @@ bool applyGatewayWebPatch(EquineConfigApi::PatchStatus& status,
     return true;
   }
   return commitGatewayConfigCandidate(
-    candidate, true, status.error, sizeof(status.error));
+    candidate, true, status.error, sizeof(status.error), &mqtt_ca_candidate);
 }
 
 bool gatewayConfigWritesAllowed() {
@@ -928,7 +1067,7 @@ bool isNewPoint(const TrackerRuntime& tracker, uint32_t boot_id, uint32_t seq) {
   }
 
   if (boot_id != tracker.last_processed_boot_id) {
-    return true;
+    return boot_id > tracker.last_processed_boot_id;
   }
 
   return seq > tracker.last_processed_seq;
@@ -1056,11 +1195,11 @@ void setupRemoteLogging() {
 }
 
 bool requireWebAuthentication() {
-  if (strlen(onboarding_ap_password) < 12) {
+  if (strlen(admin_password) < 12) {
     webServer.send(503, "application/json", "{\"error\":\"admin_credentials_not_configured\"}");
     return false;
   }
-  if (webServer.authenticate("admin", onboarding_ap_password)) return true;
+  if (webServer.authenticate("admin", admin_password)) return true;
   webServer.requestAuthentication(BASIC_AUTH, "LoRa Tracker gateway");
   return false;
 }
@@ -1120,6 +1259,7 @@ void setupWebInterface() {
       html += "MQTT port: <input name='mqtt_port' value='" + String(gateway_config.mqtt_port) + "'><br>";
       html += "MQTT user: <input name='mqtt_username' value='" + String(gateway_config.mqtt_username) + "'><br>";
       html += "MQTT password: <input type='password' name='mqtt_password' value='__KEEP__'><br>";
+      html += "MQTT root CA (PEM): <textarea name='mqtt_ca_certificate' rows='8' cols='48' placeholder='-----BEGIN CERTIFICATE----- ... -----END CERTIFICATE-----'>__KEEP__</textarea><br>";
       html += "<input type='hidden' name='reboot' value='1'><button>Validate, save and reboot</button></form>";
     }
     html += "<p>Full registry and radio configuration uses <code>POST /api/v1/config</code>; tracker fields are named <code>tracker.0.id</code>, <code>tracker.0.name</code>, and so on.</p>";
@@ -1492,13 +1632,17 @@ void startGatewayFallbackAp() {
   WiFi.disconnect(false, false);
   WiFi.mode(WIFI_AP);
   String ap_name = "LoRaGateway-" + String(GATEWAY_ID);
-  if (strlen(onboarding_ap_password) < 12) {
+  if (strlen(admin_password) < 12) {
     logPrintln("Fallback AP disabled: onboarding password must be at least 12 characters.");
-  } else if (WiFi.softAP(ap_name.c_str(), onboarding_ap_password)) {
+  } else if (WiFi.softAP(ap_name.c_str(), admin_password)) {
     gateway_ap_active = true;
     gateway_network_ip = WiFi.softAPIP().toString();
     logPrintf("Gateway setup AP '%s' active at %s.\n",
               ap_name.c_str(), gateway_network_ip.c_str());
+    if (gateway_onboarding_required) {
+      logPrintf("FIRST-BOOT ADMIN CREDENTIAL (record securely): admin / %s\n",
+                admin_password);
+    }
   } else {
     logPrintln("Failed to start gateway fallback AP.");
   }
@@ -1582,7 +1726,7 @@ void reconnectMqttIfNeeded() {
 
   lastMqttReconnectAttemptMs = now;
 
-  if (gateway_config.mqtt_tls_enabled && mqtt_ca_certificate[0] == '\0') {
+  if (gateway_config.mqtt_tls_enabled && runtime_mqtt_ca_certificate.isEmpty()) {
     logPrintln("MQTT disabled: TLS is enabled but no CA certificate is configured.");
     return;
   }
@@ -1618,6 +1762,14 @@ void reconnectMqttIfNeeded() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
+  if (!EquineCrypto::selfTest()) {
+    Serial.println("Fatal: AES-GCM self-test failed.");
+    while (true) delay(1000);
+  }
+  esp_fill_random(&gateway_tx_nonce_prefix, sizeof(gateway_tx_nonce_prefix));
+  if (gateway_tx_nonce_prefix == 0) gateway_tx_nonce_prefix = 1;
+  initializeAdminCredential();
+  initializeMqttCaCertificate();
 
   if (!loadGatewayConfig()) {
     makeGatewayFactoryConfig();
@@ -1657,7 +1809,7 @@ void setup() {
   setupWebInterface();
 
   if (gateway_config.mqtt_tls_enabled) {
-    secureMqttClient.setCACert(mqtt_ca_certificate);
+    secureMqttClient.setCACert(runtime_mqtt_ca_certificate.c_str());
     client.setClient(secureMqttClient);
   } else {
     client.setClient(plainMqttClient);
@@ -1724,8 +1876,10 @@ void loop() {
   if (!packetSize) return;
 
   do {
-    // Versioned history header + root coordinates + anchor and batch counts.
-    if (packetSize < (int)(sizeof(LoRaHeaderV2) + 8 + 2) ||
+    // Authenticated envelope + encrypted history, root and batch metadata.
+    if (packetSize < (int)(sizeof(SecureFrameHeader) +
+                           sizeof(HistoryPayload) + 8 + 2 +
+                           EquineProtocol::AEAD_TAG_SIZE) ||
         packetSize > 255) {
       logPrintf("Ignored invalid packet size: %d bytes.\n", packetSize);
       break;
@@ -1746,7 +1900,7 @@ void loop() {
     DecodedHistoryHeader header{};
     TrackerRuntime* tracker = nullptr;
 
-    LoRaHeaderV2 wire_header{};
+    SecureFrameHeader wire_header{};
     memcpy(&wire_header, payload_buffer, sizeof(wire_header));
     const EquineProtocol::FrameHeaderV1& frame = wire_header.frame;
     if (!EquineProtocol::isSupportedHistoryFrame(frame)) {
@@ -1765,17 +1919,41 @@ void loop() {
       break;
     }
 
+    const size_t ciphertext_size =
+      packetSize - sizeof(wire_header) - EquineProtocol::AEAD_TAG_SIZE;
+    uint8_t plaintext_buffer[255];
+    const uint8_t* ciphertext = payload_buffer + sizeof(wire_header);
+    const uint8_t* tag = ciphertext + ciphertext_size;
+    if (!EquineCrypto::decrypt(
+          tracker->config->lora_aead_key,
+          wire_header,
+          ciphertext,
+          ciphertext_size,
+          tag,
+          plaintext_buffer)) {
+      logPrintf("Rejected history frame with invalid AES-GCM tag from %s.\n",
+                tracker->config->device_id);
+      break;
+    }
+    const size_t payload_size = ciphertext_size;
+    if (payload_size < sizeof(HistoryPayload) + 8 + 2) {
+      logPrintln("Authenticated history payload is too short.");
+      break;
+    }
+    HistoryPayload history_payload{};
+    memcpy(&history_payload, plaintext_buffer, sizeof(history_payload));
+
     header.transport_version = frame.transport_version;
     header.schema_version = frame.schema_version;
     header.device_id_hash = frame.device_id_hash;
     header.boot_id = wire_header.boot_id;
-    header.first_seq = wire_header.first_seq;
-    header.root_unix_time_s = wire_header.root_unix_time_s;
+    header.first_seq = history_payload.first_seq;
+    header.root_unix_time_s = history_payload.root_unix_time_s;
     header.timestamps_present =
       (frame.flags & EquineProtocol::FLAG_HAS_TIMESTAMPS) != 0;
-    header.total_dist_dam = wire_header.total_dist_dam;
-    header.batt_pct = wire_header.batt_pct;
-    offset = sizeof(wire_header);
+    header.total_dist_dam = history_payload.total_dist_dam;
+    header.batt_pct = history_payload.batt_pct;
+    offset = sizeof(history_payload);
 
     if (header.timestamps_present &&
         (header.root_unix_time_s < 946684800UL ||
@@ -1793,37 +1971,37 @@ void loop() {
     tracker->last_seen_ms = millis();
     tracker->last_rssi = packet_rssi;
 
-    if (offset + 9 > (size_t)packetSize) {
+    if (offset + 9 > payload_size) {
       logPrintln("Packet ended before root and anchor metadata.");
       break;
     }
 
     int32_t root_lat = 0;
     int32_t root_lon = 0;
-    memcpy(&root_lat, payload_buffer + offset, 4); offset += 4;
-    memcpy(&root_lon, payload_buffer + offset, 4); offset += 4;
+    memcpy(&root_lat, plaintext_buffer + offset, 4); offset += 4;
+    memcpy(&root_lon, plaintext_buffer + offset, 4); offset += 4;
 
-    const uint8_t num_anchors = payload_buffer[offset++];
+    const uint8_t num_anchors = plaintext_buffer[offset++];
     AnchorPoint anchors[64]{};
     if (num_anchors > 64) {
       logPrintln("Too many anchors; packet rejected.");
       break;
     }
     const size_t anchors_bytes = num_anchors * sizeof(AnchorPoint);
-    if (offset + anchors_bytes > (size_t)packetSize) {
+    if (offset + anchors_bytes > payload_size) {
       logPrintln("Packet ended while reading anchors.");
       break;
     }
     if (anchors_bytes > 0) {
-      memcpy(anchors, payload_buffer + offset, anchors_bytes);
+      memcpy(anchors, plaintext_buffer + offset, anchors_bytes);
       offset += anchors_bytes;
     }
 
-    if (offset >= (size_t)packetSize) {
+    if (offset >= payload_size) {
       logPrintln("Packet ended before batch count.");
       break;
     }
-    const uint8_t num_batches = payload_buffer[offset++];
+    const uint8_t num_batches = plaintext_buffer[offset++];
 
     logPrintf(
       "Received packet [%s/%s]: transport=%u schema=%u boot=%lu "
@@ -1960,14 +2138,14 @@ void loop() {
     for (uint8_t batch = 0;
          batch < num_batches && packet_valid && publish_success;
          batch++) {
-      if (offset + 2 > (size_t)packetSize) {
+      if (offset + 2 > payload_size) {
         logPrintln("Packet ended before batch metadata.");
         packet_valid = false;
         break;
       }
 
-      const uint8_t anchor_idx = payload_buffer[offset++];
-      const uint8_t count = payload_buffer[offset++];
+      const uint8_t anchor_idx = plaintext_buffer[offset++];
+      const uint8_t count = plaintext_buffer[offset++];
       if (anchor_idx >= num_anchors) {
         logPrintln("Invalid anchor index in batch.");
         packet_valid = false;
@@ -1980,13 +2158,13 @@ void loop() {
         root_lon + (int32_t)anchors[anchor_idx].dlon * DELTA_UNIT_MICRODEG;
 
       for (uint8_t point = 0; point < count; point++) {
-        if (offset + 2 > (size_t)packetSize) {
+        if (offset + 2 > payload_size) {
           logPrintln("Batch point ended before coordinate delta.");
           packet_valid = false;
           break;
         }
-        const int8_t rel_dlat = (int8_t)payload_buffer[offset++];
-        const int8_t rel_dlon = (int8_t)payload_buffer[offset++];
+        const int8_t rel_dlat = (int8_t)plaintext_buffer[offset++];
+        const int8_t rel_dlon = (int8_t)plaintext_buffer[offset++];
         const int32_t p_lat_micro =
           anchor_lat_micro + (int32_t)rel_dlat * DELTA_UNIT_MICRODEG;
         const int32_t p_lon_micro =
@@ -1995,8 +2173,8 @@ void loop() {
         uint32_t delta_time_s = 0;
         size_t timestamp_bytes = 0;
         if (!EquineProtocol::decodeUleb128U32(
-              payload_buffer + offset,
-              (size_t)packetSize - offset,
+              plaintext_buffer + offset,
+              payload_size - offset,
               delta_time_s,
               timestamp_bytes)) {
           logPrintln("Invalid or truncated ULEB128 timestamp delta.");
@@ -2024,9 +2202,9 @@ void loop() {
       }
     }
 
-    if (packet_valid && publish_success && offset != (size_t)packetSize) {
+    if (packet_valid && publish_success && offset != payload_size) {
       logPrintf("Unexpected %u trailing packet bytes; ACK withheld.\n",
-                (unsigned)((size_t)packetSize - offset));
+                (unsigned)(payload_size - offset));
       packet_valid = false;
     }
 
@@ -2041,15 +2219,33 @@ void loop() {
 
     saveDedupState(*tracker, false);
 
-    LoRa.beginPacket();
     AckPayload ack{};
-    ack.frame = EquineProtocol::makeFrameHeader(
+    ack.acked_seq = highest_ackable_seq;
+    SecureFrameHeader ack_header = EquineProtocol::makeSecureFrameHeader(
       EquineProtocol::MessageType::ACK,
       EquineProtocol::ACK_SCHEMA_VERSION,
-      tracker->device_id_hash);
-    ack.boot_id = header.boot_id;
-    ack.acked_seq = highest_ackable_seq;
-    LoRa.write((uint8_t*)&ack, sizeof(ack));
+      tracker->device_id_hash,
+      gateway_tx_nonce_prefix,
+      header.boot_id,
+      highest_ackable_seq);
+    uint8_t ack_packet[
+      sizeof(ack_header) + sizeof(ack) + EquineProtocol::AEAD_TAG_SIZE];
+    memcpy(ack_packet, &ack_header, sizeof(ack_header));
+    uint8_t* ack_ciphertext = ack_packet + sizeof(ack_header);
+    uint8_t* ack_tag = ack_ciphertext + sizeof(ack);
+    if (!EquineCrypto::encrypt(
+          tracker->config->lora_aead_key,
+          ack_header,
+          reinterpret_cast<const uint8_t*>(&ack),
+          sizeof(ack),
+          ack_ciphertext,
+          ack_tag)) {
+      logPrintf("Failed to encrypt ACK for tracker %s.\n",
+                tracker->config->device_id);
+      break;
+    }
+    LoRa.beginPacket();
+    LoRa.write(ack_packet, sizeof(ack_packet));
 
     const int txResult = LoRa.endPacket();
     if (txResult) {

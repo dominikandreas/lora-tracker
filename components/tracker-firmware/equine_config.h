@@ -10,7 +10,7 @@
 namespace EquineConfig {
 
 constexpr uint32_t CONFIG_MAGIC = 0x45434647UL;  // "ECFG"
-constexpr uint16_t CONFIG_SCHEMA_VERSION = 2;
+constexpr uint16_t CONFIG_SCHEMA_VERSION = 3;
 constexpr uint8_t MAX_GATEWAY_TRACKERS = 12;
 constexpr size_t DEVICE_ID_SIZE = 25;       // 24 chars + NUL
 constexpr size_t DEVICE_NAME_SIZE = 33;     // 32 chars + NUL
@@ -62,6 +62,7 @@ struct TrackerConfigV1 {
   uint8_t ble_debug_enabled;
   uint8_t battery_sense_enabled;
   uint8_t reserved_flags[2];
+  uint8_t lora_aead_key[EquineProtocol::AEAD_KEY_SIZE];
 
   LoRaConfigV1 lora;
   uint32_t lora_tx_interval_s;
@@ -107,6 +108,7 @@ struct TrackerConfigV1 {
 struct GatewayTrackerConfigV1 {
   char device_id[DEVICE_ID_SIZE];
   char device_name[DEVICE_NAME_SIZE];
+  uint8_t lora_aead_key[EquineProtocol::AEAD_KEY_SIZE];
   uint8_t enabled;
   uint8_t reserved[3];
 } __attribute__((packed));
@@ -139,8 +141,8 @@ struct GatewayConfigV1 {
 
 static_assert(sizeof(TrackerConfigV1) < 1024,
               "Tracker config should remain a compact NVS blob");
-static_assert(sizeof(GatewayConfigV1) < 1600,
-              "Gateway config should remain below the practical NVS blob limit");
+static_assert(sizeof(GatewayConfigV1) < 2048,
+              "Gateway config should remain a compact NVS blob");
 
 inline uint32_t crc32(const uint8_t* data, size_t length) {
   uint32_t crc = 0xFFFFFFFFUL;
@@ -186,6 +188,13 @@ inline bool isValidDisplayName(const char* name, size_t capacity) {
 
 inline bool isFiniteRange(float value, float minimum, float maximum) {
   return isfinite(value) && value >= minimum && value <= maximum;
+}
+
+inline bool hasProvisionedKey(
+    const uint8_t key[EquineProtocol::AEAD_KEY_SIZE]) {
+  uint8_t combined = 0;
+  for (size_t i = 0; i < EquineProtocol::AEAD_KEY_SIZE; i++) combined |= key[i];
+  return combined != 0;
 }
 
 inline bool isSupportedBandwidth(uint32_t bandwidth_hz) {
@@ -241,6 +250,7 @@ inline bool validateTrackerConfig(const TrackerConfigV1& config) {
       !isValidDisplayName(config.device_name, sizeof(config.device_name)) ||
       !isNullTerminated(config.wifi_ssid, sizeof(config.wifi_ssid)) ||
       !isNullTerminated(config.wifi_password, sizeof(config.wifi_password)) ||
+      !hasProvisionedKey(config.lora_aead_key) ||
       !validateLoRa(config.lora)) {
     return false;
   }
@@ -329,7 +339,8 @@ inline bool validateGatewayConfig(const GatewayConfigV1& config) {
     const GatewayTrackerConfigV1& tracker = config.trackers[i];
     if (!tracker.enabled) continue;
     if (!isValidCanonicalId(tracker.device_id, sizeof(tracker.device_id)) ||
-        !isValidDisplayName(tracker.device_name, sizeof(tracker.device_name))) {
+        !isValidDisplayName(tracker.device_name, sizeof(tracker.device_name)) ||
+        !hasProvisionedKey(tracker.lora_aead_key)) {
       return false;
     }
     const uint64_t hash = EquineProtocol::deviceIdHash(tracker.device_id);
@@ -360,7 +371,8 @@ inline void makeDefaultTrackerConfig(
     const char* device_id,
     const char* device_name,
     const char* default_wifi_ssid,
-    const char* default_wifi_password) {
+    const char* default_wifi_password,
+    const uint8_t default_lora_key[EquineProtocol::AEAD_KEY_SIZE]) {
   memset(&config, 0, sizeof(config));
   strlcpy(config.device_id, device_id, sizeof(config.device_id));
   strlcpy(config.device_name, device_name, sizeof(config.device_name));
@@ -371,6 +383,9 @@ inline void makeDefaultTrackerConfig(
           sizeof(config.wifi_password));
   config.ble_debug_enabled = 0;
   config.battery_sense_enabled = 1;
+  if (default_lora_key) {
+    memcpy(config.lora_aead_key, default_lora_key, sizeof(config.lora_aead_key));
+  }
   setDefaultLoRa(config.lora);
   config.lora_tx_interval_s = 300;
   config.lora_tx_min_points = 3;

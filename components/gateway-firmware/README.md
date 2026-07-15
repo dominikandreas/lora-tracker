@@ -1,6 +1,7 @@
 # LoRa Tracker gateway firmware
 
-The gateway accepts only the current versioned LoRa history frame. It
+The gateway accepts only AES-256-GCM-authenticated transport-v2 history frames
+from registry entries with a matching per-tracker key. It
 reconstructs GNSS timestamps from one absolute root epoch and ULEB128
 per-point deltas; unsupported schemas are rejected.
 
@@ -33,6 +34,11 @@ simulator validates shared binary/configuration contracts, not gateway Wi-Fi,
 MQTT, NVS, or radio hardware; see
 [`docs/SIMULATION_COVERAGE.md`](../../docs/SIMULATION_COVERAGE.md).
 
-The default MQTT transport verifies the broker with the PEM root CA in
-`secrets.h`. Plain MQTT requires the explicit `allow_insecure_mqtt` test-only
-override. Unauthenticated telnet logging is disabled by default.
+Tagged releases contain merged browser-flashable images and provenance; see
+[`docs/FLASHING.md`](../../docs/FLASHING.md).
+
+The default MQTT transport verifies the broker with a PEM root CA provisioned
+through the authenticated configuration API. `secrets.h` may provide a factory
+seed, but generic release images leave it empty. Plain MQTT requires the
+explicit `allow_insecure_mqtt` test-only build override. Unauthenticated telnet
+logging is disabled by default.

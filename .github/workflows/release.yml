@@ -1,0 +1,81 @@
+name: Release firmware
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing version/tag to package without publishing
+        required: false
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: components/archiver/pyproject.toml
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Resolve and validate version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            VERSION="${INPUT_VERSION#v}"
+            [[ -n "$VERSION" ]] || VERSION="$(cat VERSION)"
+          fi
+          [[ "$VERSION" == "$(cat VERSION)" ]] || { echo "tag/input does not match VERSION" >&2; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Install pinned toolchain
+        run: python -m pip install --disable-pip-version-check platformio==6.1.18 esptool==4.5.1 "./components/archiver[test]"
+      - name: Create secret-free generic build configuration
+        run: |
+          cp components/tracker-firmware/secrets.example.h components/tracker-firmware/secrets.h
+          cp components/gateway-firmware/secrets.example.h components/gateway-firmware/secrets.h
+      - name: Test release source
+        run: |
+          python -m pytest -q components/archiver
+          (cd components/web-app && npm test)
+      - name: Build every supported firmware target
+        run: |
+          pio run -d components/tracker-firmware -e heltec_wifi_lora_32_v2
+          pio run -d components/tracker-firmware -e heltec_wireless_tracker
+          pio run -d components/gateway-firmware -e heltec_wifi_lora_32_v2
+      - name: Package browser-flashable images
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}"
+          for TARGET in tracker-v2 tracker-wireless-tracker gateway-v2; do
+            python tools/package_firmware.py --target "$TARGET" --version "$VERSION" --output dist --download-base "$BASE"
+          done
+          (cd dist && sha256sum * > SHA256SUMS)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lora-tracker-firmware-${{ steps.version.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+      - uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        if: github.ref_type == 'tag'
+        with:
+          subject-path: dist/*
+      - name: Publish immutable-ready GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes --latest
