@@ -11,8 +11,8 @@ is not approved for unattended production deployment. LoRa telemetry/ACKs now
 use per-tracker AES-256-GCM and tracker BLE configuration requires an encrypted,
 authenticated session. The remaining release blockers include signed firmware
 with ESP32 secure boot, durable gateway delivery, key custody/rotation and
-hardware-in-the-loop qualification. See [production readiness](docs/PRODUCTION_READINESS.md)
-and [security](SECURITY.md).
+hardware-in-the-loop qualification. See [production readiness](https://dominikandreas.github.io/lora-tracker-docs/reference/production-readiness.html)
+and [security](https://dominikandreas.github.io/lora-tracker-docs/reference/security.html).
 
 ## Components
 
@@ -53,22 +53,24 @@ factory build. Plain MQTT is disabled by default.
 
 ## Documentation
 
-- [Architecture](docs/ARCHITECTURE.md)
-- [Onboarding and configuration](docs/ONBOARDING.md)
-- [Configuration reference](docs/CONFIGURATION_REFERENCE.md)
-- [Build and deployment](docs/BUILD_AND_DEPLOY.md)
-- [Browser flashing](docs/FLASHING.md)
-- [Hardware recommendations](docs/HARDWARE.md)
-- [Operations](docs/OPERATIONS.md)
-- [Simulation coverage](docs/SIMULATION_COVERAGE.md)
-- [Production readiness](docs/PRODUCTION_READINESS.md)
-- [Protocol specifications](docs/protocols/README.md)
-- [Roadmap and larger refactors](ROADMAP.md)
+The complete reader-facing documentation is rendered on [GitHub Pages](https://dominikandreas.github.io/lora-tracker-docs/).
+
+- [Architecture](https://dominikandreas.github.io/lora-tracker-docs/reference/architecture.html)
+- [Onboarding and configuration](https://dominikandreas.github.io/lora-tracker-docs/reference/onboarding.html)
+- [Configuration reference](https://dominikandreas.github.io/lora-tracker-docs/reference/configuration.html)
+- [Build and deployment](https://dominikandreas.github.io/lora-tracker-docs/reference/build-and-deploy.html)
+- [Browser flashing](https://dominikandreas.github.io/lora-tracker-docs/reference/flashing.html)
+- [Hardware recommendations](https://dominikandreas.github.io/lora-tracker-docs/reference/hardware.html)
+- [Operations](https://dominikandreas.github.io/lora-tracker-docs/reference/operations.html)
+- [Simulation coverage](https://dominikandreas.github.io/lora-tracker-docs/reference/simulation-coverage.html)
+- [Production readiness](https://dominikandreas.github.io/lora-tracker-docs/reference/production-readiness.html)
+- [Protocol specifications](https://dominikandreas.github.io/lora-tracker-docs/protocols.html)
+- [Roadmap and larger refactors](https://dominikandreas.github.io/lora-tracker-docs/reference/roadmap.html)
 
 The simulator validates cross-component contracts, both copies of the embedded
 headers, storage, MQTT callbacks and browser payload normalization. It does not
 simulate RF, GNSS, power, flash failure, real brokers or browsers. Those limits
-are listed in [simulation coverage](docs/SIMULATION_COVERAGE.md).
+are listed in [simulation coverage](https://dominikandreas.github.io/lora-tracker-docs/reference/simulation-coverage.html).
 
 ## Default namespace
 
