@@ -31,6 +31,33 @@ cannot make a mismatched RF network or antenna compliant.
 GPIO 0 is a boot-strapping pin. Do not hold it while applying power or reset;
 wait for the firmware prompt before using a setup gesture.
 
+## Observed 1000 mAh prototype runtime
+
+This is an early field observation, not a battery specification. With a 1000 mAh
+LiPo, BLE off, adaptive batching, a 60-second moving interval, poor GNSS
+conditions and normal LoRa connectivity, the reported state of charge moved from
+82% to 76% over 12 hours. That is approximately 0.5% per hour, 12% per day and
+an eight-day linear extrapolation. Voltage-derived percentages can be noisy, so
+controlled coulomb-counted tests across temperature and activity profiles are
+still required.
+
+| Operating condition | Preliminary estimate |
+|---|---:|
+| Current live tracking (observed conditions) | 7–9 days |
+| Excellent GNSS conditions | 10–14 days |
+| Very poor GNSS or frequent retries | 5–7 days |
+
+Longer intervals are exploratory projections from the observation, not measured
+claims: about 30–45 days at five minutes, 2–3 months at ten minutes, 5–8 months
+at 30 minutes and 9–12 months at one hour. At intervals of four hours and above,
+cell self-discharge, aging, temperature and quiescent current dominate, so
+multi-year arithmetic is not a practical runtime promise.
+
+A low-power wake-on-motion accelerometer remains the most promising next hardware
+change: it could keep the tracker asleep while stationary and wake it promptly
+on movement. Validate any expected 2×–5× improvement with measured animal-use
+duty cycles before treating it as a product requirement.
+
 ## Production tracker direction
 
 A custom tracker should be based on measured prototype results, not simply copy
