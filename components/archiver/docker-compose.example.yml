@@ -1,0 +1,10 @@
+services:
+  equine-archiver:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - equine-history:/data
+
+volumes:
+  equine-history:

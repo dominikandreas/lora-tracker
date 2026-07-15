@@ -1,0 +1,340 @@
+--- /mnt/data/equine_tracker_optimized_v4_ble_fix.ino	2026-07-14 17:58:39.372315570 +0000
++++ /mnt/data/equine_tracker_optimized_v5_retry_speed.ino	2026-07-14 18:01:28.770058887 +0000
+@@ -113,6 +113,14 @@
+ const uint16_t LORA_TX_MIN_POINTS = 3;
+ const uint32_t LORA_ACK_TIMEOUT_MS = 800;
+ 
++// Missing ACKs are usually caused by temporary loss of coverage. Retrying on
++// every tracking cycle wastes energy without improving delivery. Back off from
++// 1 minute to 10 minutes and reset immediately after a valid ACK.
++const uint32_t LORA_RETRY_BACKOFF_1_S = 60;
++const uint32_t LORA_RETRY_BACKOFF_2_S = 120;
++const uint32_t LORA_RETRY_BACKOFF_3_S = 300;
++const uint32_t LORA_RETRY_BACKOFF_MAX_S = 600;
++
+ // --- History encoding ---
+ const double HISTORY_POINT_SPACING_M = 15.0;   // only store a history point every 15m
+ const int32_t DELTA_UNIT_MICRODEG = 10;        // 1e-5 degree steps expressed in microdegrees
+@@ -221,8 +229,12 @@
+ RTC_DATA_ATTR uint16_t stationary_fix_streak = 0;
+ RTC_DATA_ATTR uint8_t consecutive_no_fix_cycles = 0;
+ RTC_DATA_ATTR uint32_t seconds_since_last_tx = LORA_TX_INTERVAL_S;
++RTC_DATA_ATTR uint32_t seconds_since_last_lora_attempt = LORA_RETRY_BACKOFF_MAX_S;
++RTC_DATA_ATTR uint8_t consecutive_lora_failures = 0;
+ RTC_DATA_ATTR uint32_t seconds_since_last_nvs_save = 0;
+ RTC_DATA_ATTR uint32_t seconds_since_last_full_gnss_attempt = GPS_FULL_RETRY_INTERVAL_S;
++RTC_DATA_ATTR uint32_t seconds_since_last_accepted_position = 0;
++RTC_DATA_ATTR double last_effective_speed_kmph = 0.0;
+ 
+ // Raw-fix history for movement hysteresis. These are deliberately separate
+ // from last_lat/last_lng, which represent the last accepted tracking position.
+@@ -794,8 +806,8 @@
+   refreshBatteryCache(false);
+   logPrintf("RTC state -> has_fix: %s, dist: %.2f m, age: %u s, daily_reset_age: %u s, "
+             "strikes: %u, hist_count: %u, next_seq: %lu, stationary: %u, "
+-            "since_tx: %u s, since_nvs: %u s, full_gnss_age: %u s, "
+-            "batt: %.2fV (%u%%)\n",
++            "since_tx: %u s, retry_age: %u s, lora_fail: %u, "
++            "since_nvs: %u s, full_gnss_age: %u s, batt: %.2fV (%u%%)\n",
+             has_initial_fix ? "true" : "false",
+             total_distance_meters,
+             seconds_since_last_fix,
+@@ -805,6 +817,8 @@
+             (unsigned long)next_point_seq,
+             stationary_fix_streak,
+             seconds_since_last_tx,
++            seconds_since_last_lora_attempt,
++            consecutive_lora_failures,
+             seconds_since_last_nvs_save,
+             seconds_since_last_full_gnss_attempt,
+             cached_battery_voltage,
+@@ -1633,7 +1647,7 @@
+       // GPS
+       {
+         const uint32_t sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
+-        const double speed = gps.speed.isValid() ? gps.speed.kmph() : 0.0;
++        const double speed = last_effective_speed_kmph;
+         snprintf(lines[0], sizeof(lines[0]), "GPS (2/4)");
+         snprintf(lines[1], sizeof(lines[1]), "Sats: %lu", (unsigned long)sats);
+         snprintf(lines[2], sizeof(lines[2]), "Spd: %.1f", speed);
+@@ -1887,7 +1901,9 @@
+ 
+ bool listenForGpsFix(uint32_t listen_duration_ms,
+                      uint32_t current_elapsed_s,
+-                     bool& movement_accepted) {
++                     uint32_t cycle_start_ms,
++                     bool& movement_accepted,
++                     bool& position_accepted) {
+   const uint32_t listen_start_ms = millis();
+ 
+   while ((uint32_t)(millis() - listen_start_ms) < listen_duration_ms) {
+@@ -1939,12 +1955,30 @@
+           }
+ 
+           teleport_strikes = 0;
+-          const bool speed_fresh =
+-            gps.speed.isValid() && gps.speed.age() < 1500;
+-          const double current_speed =
+-            speed_fresh ? gps.speed.kmph() : 0.0;
++
++          // TinyGPS++ fields are updated by different NMEA sentences. Only use
++          // receiver speed when it was updated during this acquisition; always
++          // calculate a second, epoch-independent speed from displacement and
++          // elapsed time since last_lat/last_lng were accepted.
++          const bool nmea_speed_updated = gps.speed.isUpdated();
++          const bool nmea_speed_fresh =
++            nmea_speed_updated && gps.speed.isValid() && gps.speed.age() < 1500;
++          const double nmea_speed_kmph =
++            nmea_speed_fresh ? gps.speed.kmph() : 0.0;
++
++          uint32_t accepted_position_age_s =
++            seconds_since_last_accepted_position +
++            (uint32_t)((millis() - cycle_start_ms) / 1000U);
++          if (accepted_position_age_s == 0) accepted_position_age_s = 1;
++          const double derived_speed_kmph =
++            (distance_from_accepted * 3.6) / accepted_position_age_s;
++          const double effective_speed_kmph =
++            nmea_speed_fresh ?
++            max(nmea_speed_kmph, derived_speed_kmph) : derived_speed_kmph;
++          last_effective_speed_kmph = effective_speed_kmph;
++
+           const bool movement_by_speed =
+-            speed_fresh && current_speed >= MOVEMENT_SPEED_THRESHOLD_KMPH;
++            effective_speed_kmph >= MOVEMENT_SPEED_THRESHOLD_KMPH;
+           const bool movement_by_large_displacement =
+             distance_from_accepted >= MOVEMENT_DISPLACEMENT_THRESHOLD_M;
+ 
+@@ -2007,8 +2041,12 @@
+             last_lat = candidate_lat;
+             last_lng = candidate_lng;
+             movement_evidence_streak = 0;
+-            logPrintf("Accepted movement -> %.2f m, speed %.2f km/h, total %.2f m\n",
+-                      distance_from_accepted, current_speed,
++            position_accepted = true;
++            logPrintf("Accepted movement -> %.2f m, effective %.2f km/h "
++                      "(derived %.2f, GNSS %.2f%s), total %.2f m\n",
++                      distance_from_accepted, effective_speed_kmph,
++                      derived_speed_kmph, nmea_speed_kmph,
++                      nmea_speed_fresh ? " fresh" : " stale/unavailable",
+                       total_distance_meters);
+             maybeAppendSignificantHistoryPoint(candidate_lat, candidate_lng);
+           } else if (movement_detected) {
+@@ -2016,8 +2054,11 @@
+                       distance_from_accepted);
+           } else {
+             logPrintf("Stationary evidence -> offset %.2f m, raw step %.2f m, "
+-                      "speed %.2f km/h, direction diff %.0f deg, streak %u/%u\n",
+-                      distance_from_accepted, raw_step_m, current_speed,
++                      "effective %.2f km/h (derived %.2f, GNSS %.2f%s), "
++                      "direction diff %.0f deg, streak %u/%u\n",
++                      distance_from_accepted, raw_step_m, effective_speed_kmph,
++                      derived_speed_kmph, nmea_speed_kmph,
++                      nmea_speed_fresh ? " fresh" : " stale/unavailable",
+                       direction_difference_deg, movement_evidence_streak,
+                       MOVEMENT_EVIDENCE_REQUIRED);
+           }
+@@ -2029,6 +2070,9 @@
+           has_previous_raw_fix = true;
+           movement_evidence_streak = 0;
+           has_initial_fix = true;
++          position_accepted = true;
++          seconds_since_last_accepted_position = 0;
++          last_effective_speed_kmph = 0.0;
+           maybeAppendSignificantHistoryPoint(candidate_lat, candidate_lng);
+         }
+ 
+@@ -2107,6 +2151,31 @@
+   }
+ }
+ 
++uint32_t getLoRaRetryBackoffSeconds() {
++  if (consecutive_lora_failures == 0) return 0;
++  if (consecutive_lora_failures == 1) return LORA_RETRY_BACKOFF_1_S;
++  if (consecutive_lora_failures == 2) return LORA_RETRY_BACKOFF_2_S;
++  if (consecutive_lora_failures == 3) return LORA_RETRY_BACKOFF_3_S;
++  return LORA_RETRY_BACKOFF_MAX_S;
++}
++
++void recordLoRaFailure(const char* reason) {
++  if (consecutive_lora_failures < UINT8_MAX) {
++    consecutive_lora_failures++;
++  }
++  seconds_since_last_lora_attempt = 0;
++  logPrintf("LoRa failure #%u (%s); next retry in %u s.\n",
++            consecutive_lora_failures,
++            reason ? reason : "unknown",
++            getLoRaRetryBackoffSeconds());
++}
++
++void recordLoRaAckSuccess() {
++  consecutive_lora_failures = 0;
++  seconds_since_last_lora_attempt = 0;
++  seconds_since_last_tx = 0;
++}
++
+ void setup() {
+   // Determine wake type before any optional USB wait.
+   last_reset_reason = esp_reset_reason();
+@@ -2155,8 +2224,12 @@
+     stationary_fix_streak = 0;
+     consecutive_no_fix_cycles = 0;
+     seconds_since_last_tx = LORA_TX_INTERVAL_S;
++    seconds_since_last_lora_attempt = LORA_RETRY_BACKOFF_MAX_S;
++    consecutive_lora_failures = 0;
+     seconds_since_last_nvs_save = 0;
+     seconds_since_last_full_gnss_attempt = GPS_FULL_RETRY_INTERVAL_S;
++    seconds_since_last_accepted_position = 0;
++    last_effective_speed_kmph = 0.0;
+     has_previous_raw_fix = false;
+     movement_evidence_streak = 0;
+     last_gnss_utc_epoch_s = 0;
+@@ -2309,6 +2382,7 @@
+   const uint32_t acquisition_start_ms = millis();
+   bool cycle_fix_found = false;
+   bool cycle_movement_accepted = false;
++  bool cycle_position_accepted = false;
+ 
+   if (has_initial_fix && fix_age_at_cycle_start > MAX_FIX_AGE_S) {
+     logPrintf("WARNING: Last fix is %u seconds old. Discarding it!\n",
+@@ -2326,7 +2400,9 @@
+   cycle_fix_found = listenForGpsFix(
+     first_window_ms,
+     fix_age_at_cycle_start,
+-    cycle_movement_accepted
++    cycle_start_ms,
++    cycle_movement_accepted,
++    cycle_position_accepted
+   );
+ 
+   while (!cycle_fix_found) {
+@@ -2368,7 +2444,9 @@
+     cycle_fix_found = listenForGpsFix(
+       listen_ms,
+       current_elapsed_s,
+-      cycle_movement_accepted
++      cycle_start_ms,
++      cycle_movement_accepted,
++      cycle_position_accepted
+     );
+   }
+ 
+@@ -2427,11 +2505,16 @@
+   // =====================================================
+   // PACK AND TRANSMIT
+   // =====================================================
+-  const bool tx_due =
++  const bool lora_batch_ready =
+     history_count > 0 &&
+     (history_count >= LORA_TX_MIN_POINTS ||
+      seconds_since_last_tx >= LORA_TX_INTERVAL_S ||
+      history_count >= (HISTORY_SIZE - 16));
++  const uint32_t lora_retry_backoff_s = getLoRaRetryBackoffSeconds();
++  const bool lora_retry_ready =
++    consecutive_lora_failures == 0 ||
++    seconds_since_last_lora_attempt >= lora_retry_backoff_s;
++  const bool tx_due = lora_batch_ready && lora_retry_ready;
+ 
+   if (tx_due) {
+     setTrackerPhase("LoRa transmit");
+@@ -2439,12 +2522,14 @@
+     logPrintf("LoRa batch due: %u queued points, %u s since last ACK.\n",
+               history_count, seconds_since_last_tx);
+ 
++    seconds_since_last_lora_attempt = 0;
+     setTrackerPhase("LoRa init");
+     lora_initialized = initLoRaRadio();
+     if (!lora_initialized) {
+       setLastError("LoRa initialization failed");
+       last_tx_status = 0;
+       logPrintln("LoRa initialization failed; retaining queued data for retry.");
++      recordLoRaFailure("radio init");
+     }
+ 
+     for (int tx_loop = 0; lora_initialized && tx_loop < 5; tx_loop++) {
+@@ -2471,6 +2556,7 @@
+       if (!tx_result) {
+         setLastError("LoRa transmit failed");
+         logPrintln("LoRa transmit failed.");
++        recordLoRaFailure("transmit");
+         break;
+       }
+ 
+@@ -2507,7 +2593,7 @@
+             history_count -= points_to_clear;
+             ack_received = true;
+             last_ack_status = 1;
+-            seconds_since_last_tx = 0;
++            recordLoRaAckSuccess();
+             setLastError(nullptr);
+             logPrintf("ACK cleared %u points; %u remain.\n",
+                       points_to_clear, history_count);
+@@ -2533,11 +2619,11 @@
+       if (!ack_received) {
+         setLastError("LoRa ACK not received");
+         logPrintln("No valid ACK; retaining queued data for retry.");
++        recordLoRaFailure("missing/invalid ACK");
+         break;
+       }
+ 
+       if (history_count == 0) {
+-        seconds_since_last_tx = 0;
+         logPrintln("All queued points acknowledged.");
+         break;
+       }
+@@ -2547,9 +2633,19 @@
+ 
+     sleepLoRaRadio();
+   } else if (history_count > 0) {
+-    setTrackerPhase("LoRa batching");
+-    logPrintf("Deferring LoRa: %u points queued, %u/%u s elapsed.\n",
+-              history_count, seconds_since_last_tx, LORA_TX_INTERVAL_S);
++    if (lora_batch_ready && !lora_retry_ready) {
++      setTrackerPhase("LoRa backoff");
++      const uint32_t retry_remaining_s =
++        lora_retry_backoff_s - seconds_since_last_lora_attempt;
++      logPrintf("Deferring LoRa retry: %u points queued, failure #%u, "
++                "%u s remaining.\n",
++                history_count, consecutive_lora_failures,
++                retry_remaining_s);
++    } else {
++      setTrackerPhase("LoRa batching");
++      logPrintf("Deferring LoRa: %u points queued, %u/%u s elapsed.\n",
++                history_count, seconds_since_last_tx, LORA_TX_INTERVAL_S);
++    }
+   } else {
+     setTrackerPhase("No queued points");
+     logPrintln("No valid history points available.");
+@@ -2586,6 +2682,16 @@
+ 
+     saturatingAddSeconds(seconds_since_daily_reset, elapsed_to_next_wake_s);
+     saturatingAddSeconds(seconds_since_last_tx, elapsed_to_next_wake_s);
++    saturatingAddSeconds(seconds_since_last_lora_attempt, elapsed_to_next_wake_s);
++    if (cycle_position_accepted) {
++      const uint32_t post_fix_awake_s =
++        last_fix_acquired_ms > 0 ?
++        (millis() - last_fix_acquired_ms) / 1000U : 0;
++      seconds_since_last_accepted_position = post_fix_awake_s + next_sleep_s;
++    } else {
++      saturatingAddSeconds(seconds_since_last_accepted_position,
++                           elapsed_to_next_wake_s);
++    }
+     saturatingAddSeconds(seconds_since_last_nvs_save, elapsed_to_next_wake_s);
+     saturatingAddSeconds(seconds_since_last_full_gnss_attempt,
+                          elapsed_to_next_wake_s);
+@@ -2620,6 +2726,16 @@
+     }
+     saturatingAddSeconds(seconds_since_daily_reset, debug_elapsed_s);
+     saturatingAddSeconds(seconds_since_last_tx, debug_elapsed_s);
++    saturatingAddSeconds(seconds_since_last_lora_attempt, debug_elapsed_s);
++    if (cycle_position_accepted) {
++      const uint32_t post_fix_awake_s =
++        last_fix_acquired_ms > 0 ?
++        (millis() - last_fix_acquired_ms) / 1000U : 0;
++      seconds_since_last_accepted_position = post_fix_awake_s + debug_pause_s;
++    } else {
++      saturatingAddSeconds(seconds_since_last_accepted_position,
++                           debug_elapsed_s);
++    }
+     saturatingAddSeconds(seconds_since_last_nvs_save, debug_elapsed_s);
+     saturatingAddSeconds(seconds_since_last_full_gnss_attempt,
+                          debug_elapsed_s);

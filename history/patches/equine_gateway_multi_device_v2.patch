@@ -1,0 +1,1356 @@
+--- a/equine_gateway_protocol_v1.ino
++++ b/equine_gateway_multi_v2.ino
+@@ -11,25 +11,36 @@
+ #include <WebServer.h>
+ #include "secrets.h"
+ #include "equine_protocol.h"
++#include "equine_gateway_registry.h"
+ 
+ // ==========================================
+-// TRACKER IDENTITY
++// GATEWAY / MULTI-TRACKER REGISTRY
+ // ==========================================
+-const char* TRACKER_ID   = "wera";
+-const char* TRACKER_NAME = "Wera";
++constexpr uint16_t MQTT_BUFFER_SIZE = 1024;
+ 
+-constexpr uint16_t MQTT_BUFFER_SIZE = 768;
++struct TrackerRuntime {
++  const GatewayTrackerConfig* config;
++  uint64_t device_id_hash;
++  char hash_text[17];
++  char state_topic[96];
++  char availability_topic[96];
++  char legacy_state_topic[64];
++  char legacy_availability_topic[64];
++  char dedup_namespace[16];
++
++  bool has_processed_point;
++  uint32_t last_processed_boot_id;
++  uint32_t last_processed_seq;
++  uint32_t unsaved_dedup_updates;
++
++  bool has_been_seen;
++  uint32_t last_seen_ms;
++  int16_t last_rssi;
++};
+ 
+-// The v1 routing hash is public and identifies the configured tracker on the
+-// wire and in MQTT topics. It is not an encryption key.
+-const uint64_t EXPECTED_DEVICE_HASH = EquineProtocol::deviceIdHash(TRACKER_ID);
+-char device_hash_text[17];
+-
+-// Canonical versioned topics plus the old topics during migration.
+-char state_topic[96];
+-char availability_topic[96];
+-char legacy_state_topic[64];
+-char legacy_availability_topic[64];
++TrackerRuntime tracker_runtime[GATEWAY_TRACKER_COUNT];
++char gateway_hash_text[17];
++char gateway_availability_topic[96];
+ char ota_hostname[64];
+ 
+ // --- Heltec V2 Internal LoRa Pins ---
+@@ -92,7 +103,6 @@
+ 
+ WiFiClient espClient;
+ PubSubClient client(espClient);
+-Preferences prefs;
+ WiFiServer telnetServer(23);
+ WiFiClient telnetClient;
+ WebServer webServer(80);
+@@ -105,12 +115,6 @@
+ unsigned long lastMqttReconnectAttemptMs = 0;
+ wl_status_t lastWiFiStatus = WL_IDLE_STATUS;
+ 
+-// Dedup state: last successfully published point identity
+-uint32_t last_processed_boot_id = 0;
+-uint32_t last_processed_seq = 0;
+-bool has_processed_point = false;
+-uint32_t unsaved_dedup_updates = 0;
+-
+ // ==========================================
+ // HELPERS
+ // ==========================================
+@@ -226,20 +230,144 @@
+   return published;
+ }
+ 
+-void publishAvailability(const char* payload) {
+-  publishRetainedMessage(availability_topic, payload);
+-  // Migration topic is best-effort and does not affect protocol ACKs.
+-  client.publish(legacy_availability_topic, payload, true);
++void buildDedupNamespace(uint64_t hash, char* output, size_t output_size) {
++  // ESP32 Preferences namespaces are limited to 15 characters. Keep 56 bits
++  // of the public hash, prefixed with 'd'. Registry collisions are checked at
++  // startup before any state is loaded.
++  const uint32_t high = static_cast<uint32_t>(hash >> 32);
++  const uint32_t low = static_cast<uint32_t>(hash & 0xFFFFFFFFULL);
++  snprintf(output, output_size, "d%06lx%08lx",
++           static_cast<unsigned long>(high & 0x00FFFFFFUL),
++           static_cast<unsigned long>(low));
++}
++
++TrackerRuntime* findTrackerByHash(uint64_t hash) {
++  for (size_t i = 0; i < GATEWAY_TRACKER_COUNT; i++) {
++    if (tracker_runtime[i].device_id_hash == hash) {
++      return &tracker_runtime[i];
++    }
++  }
++  return nullptr;
++}
++
++TrackerRuntime* findLegacyTracker() {
++  TrackerRuntime* result = nullptr;
++  for (size_t i = 0; i < GATEWAY_TRACKER_COUNT; i++) {
++    if (!tracker_runtime[i].config->accepts_legacy_lora) continue;
++    if (result != nullptr) {
++      logPrintln("Registry error: multiple trackers accept legacy LoRa.");
++      return nullptr;
++    }
++    result = &tracker_runtime[i];
++  }
++  return result;
+ }
+ 
+-bool publishTrackerState(const char* payload) {
+-  if (!client.publish(state_topic, payload)) {
+-    logPrintf("Failed to publish canonical state topic %s.\n", state_topic);
++bool initializeTrackerRegistry() {
++  const uint64_t gateway_hash = EquineProtocol::deviceIdHash(GATEWAY_ID);
++  EquineProtocol::formatDeviceHash(
++    gateway_hash, gateway_hash_text, sizeof(gateway_hash_text)
++  );
++  snprintf(
++    gateway_availability_topic, sizeof(gateway_availability_topic),
++    "equine/v%u/gateways/%s/availability",
++    EquineProtocol::MQTT_API_VERSION, gateway_hash_text
++  );
++  snprintf(ota_hostname, sizeof(ota_hostname), "equine-gateway-%s", GATEWAY_ID);
++
++  uint8_t legacy_count = 0;
++  for (size_t i = 0; i < GATEWAY_TRACKER_COUNT; i++) {
++    TrackerRuntime& tracker = tracker_runtime[i];
++    memset(&tracker, 0, sizeof(tracker));
++    tracker.config = &GATEWAY_TRACKERS[i];
++    tracker.device_id_hash = EquineProtocol::deviceIdHash(tracker.config->id);
++    tracker.last_rssi = 0;
++
++    EquineProtocol::formatDeviceHash(
++      tracker.device_id_hash, tracker.hash_text, sizeof(tracker.hash_text)
++    );
++    buildDedupNamespace(
++      tracker.device_id_hash,
++      tracker.dedup_namespace,
++      sizeof(tracker.dedup_namespace)
++    );
++
++    char tracker_hash_copy[17];
++    strlcpy(tracker_hash_copy, tracker.hash_text, sizeof(tracker_hash_copy));
++    snprintf(
++      tracker.state_topic, sizeof(tracker.state_topic),
++      "equine/v%u/trackers/%s/state",
++      EquineProtocol::MQTT_API_VERSION, tracker_hash_copy
++    );
++    snprintf(
++      tracker.availability_topic, sizeof(tracker.availability_topic),
++      "equine/v%u/trackers/%s/availability",
++      EquineProtocol::MQTT_API_VERSION, tracker_hash_copy
++    );
++    snprintf(
++      tracker.legacy_state_topic, sizeof(tracker.legacy_state_topic),
++      "horse/%s/state", tracker.config->id
++    );
++    snprintf(
++      tracker.legacy_availability_topic,
++      sizeof(tracker.legacy_availability_topic),
++      "horse/%s/availability", tracker.config->id
++    );
++
++    if (tracker.config->accepts_legacy_lora) legacy_count++;
++
++    for (size_t previous = 0; previous < i; previous++) {
++      if (tracker_runtime[previous].device_id_hash == tracker.device_id_hash) {
++        logPrintf("Registry error: duplicate device hash %s for '%s' and '%s'.\n",
++                  tracker.hash_text,
++                  tracker_runtime[previous].config->id,
++                  tracker.config->id);
++        return false;
++      }
++      if (strcmp(tracker_runtime[previous].dedup_namespace,
++                 tracker.dedup_namespace) == 0) {
++        logPrintf("Registry error: dedup namespace collision for %s.\n",
++                  tracker.hash_text);
++        return false;
++      }
++    }
++  }
++
++  if (legacy_count > 1) {
++    logPrintln("Registry error: only one tracker may accept legacy LoRa.");
+     return false;
+   }
+ 
+-  // Keep existing Home Assistant/users working while clients migrate.
+-  client.publish(legacy_state_topic, payload);
++  return true;
++}
++
++void publishGatewayAvailability(const char* payload) {
++  publishRetainedMessage(gateway_availability_topic, payload);
++
++  // Per-tracker availability topics remain useful to apps and preserve the
++  // protocol-v1 topic layout. Home Assistant entities use the gateway LWT so
++  // all registered trackers become unavailable if this gateway disappears.
++  for (size_t i = 0; i < GATEWAY_TRACKER_COUNT; i++) {
++    TrackerRuntime& tracker = tracker_runtime[i];
++    client.publish(tracker.availability_topic, payload, true);
++    if (tracker.config->publish_legacy_mqtt_aliases) {
++      client.publish(tracker.legacy_availability_topic, payload, true);
++    }
++  }
++}
++
++bool publishTrackerState(TrackerRuntime& tracker, const char* payload) {
++  if (!client.publish(tracker.state_topic, payload)) {
++    logPrintf("Failed to publish canonical state topic %s.\n",
++              tracker.state_topic);
++    return false;
++  }
++
++  // Legacy aliases are migration-only and never determine whether the tracker
++  // receives an ACK. The canonical publish is the source of truth.
++  if (tracker.config->publish_legacy_mqtt_aliases) {
++    client.publish(tracker.legacy_state_topic, payload);
++  }
+   return true;
+ }
+ 
+@@ -267,61 +395,119 @@
+   }
+ }
+ 
+-bool isNewPoint(uint32_t boot_id, uint32_t seq) {
+-  if (!has_processed_point) {
++bool isNewPoint(const TrackerRuntime& tracker, uint32_t boot_id, uint32_t seq) {
++  if (!tracker.has_processed_point) {
+     return true;
+   }
+ 
+-  if (boot_id != last_processed_boot_id) {
++  if (boot_id != tracker.last_processed_boot_id) {
+     return true;
+   }
+ 
+-  return seq > last_processed_seq;
++  return seq > tracker.last_processed_seq;
+ }
+ 
+-void loadDedupState() {
+-  prefs.begin("gateway", false);
++void loadDedupState(TrackerRuntime& tracker) {
++  Preferences dedupPrefs;
++  if (!dedupPrefs.begin(tracker.dedup_namespace, false)) {
++    logPrintf("Failed to open dedup namespace %s for %s.\n",
++              tracker.dedup_namespace, tracker.config->id);
++    return;
++  }
++
++  const bool has_new_namespace_state = dedupPrefs.isKey("has");
++  tracker.has_processed_point = dedupPrefs.getBool("has", false);
++  tracker.last_processed_boot_id = dedupPrefs.getULong("boot", 0);
++  tracker.last_processed_seq = dedupPrefs.getULong("seq", 0);
++  tracker.unsaved_dedup_updates = 0;
++  dedupPrefs.end();
++
++  // One-time migration from the protocol-v1 single-tracker gateway. Legacy
++  // firmware stored Wera's cursor in namespace "gateway" with longer keys.
++  if (!has_new_namespace_state && tracker.config->accepts_legacy_lora) {
++    Preferences legacyPrefs;
++    if (legacyPrefs.begin("gateway", true)) {
++      const bool legacy_state_exists = legacyPrefs.isKey("has_point");
++      const bool legacy_has_point = legacyPrefs.getBool("has_point", false);
++      const uint32_t legacy_boot = legacyPrefs.getULong("boot_id", 0);
++      const uint32_t legacy_seq = legacyPrefs.getULong("seq", 0);
++      legacyPrefs.end();
++
++      if (legacy_state_exists && legacy_has_point) {
++        tracker.has_processed_point = true;
++        tracker.last_processed_boot_id = legacy_boot;
++        tracker.last_processed_seq = legacy_seq;
++
++        Preferences migrationTarget;
++        if (migrationTarget.begin(tracker.dedup_namespace, false)) {
++          migrationTarget.putBool("has", true);
++          migrationTarget.putULong("boot", legacy_boot);
++          migrationTarget.putULong("seq", legacy_seq);
++          migrationTarget.end();
++          logPrintf("Migrated legacy dedup cursor to %s for %s.\n",
++                    tracker.dedup_namespace, tracker.config->id);
++        }
++      }
++    }
++  }
+ 
+-  has_processed_point = prefs.getBool("has_point", false);
+-  last_processed_boot_id = prefs.getULong("boot_id", 0);
+-  last_processed_seq = prefs.getULong("seq", 0);
+-  unsaved_dedup_updates = 0;
++  logPrintf("Loaded dedup [%s/%s] -> has=%s boot_id=%lu seq=%lu\n",
++            tracker.config->id,
++            tracker.hash_text,
++            tracker.has_processed_point ? "true" : "false",
++            (unsigned long)tracker.last_processed_boot_id,
++            (unsigned long)tracker.last_processed_seq);
++}
+ 
+-  logPrintf("Loaded dedup state -> has_point=%s boot_id=%lu seq=%lu\n",
+-            has_processed_point ? "true" : "false",
+-            (unsigned long)last_processed_boot_id,
+-            (unsigned long)last_processed_seq);
++void loadAllDedupStates() {
++  for (size_t i = 0; i < GATEWAY_TRACKER_COUNT; i++) {
++    loadDedupState(tracker_runtime[i]);
++  }
+ }
+ 
+-void saveDedupState(bool force = false) {
+-  if (!has_processed_point) {
++void saveDedupState(TrackerRuntime& tracker, bool force = false) {
++  if (!tracker.has_processed_point) return;
++  if (!force && tracker.unsaved_dedup_updates < DEDUP_SAVE_INTERVAL) return;
++
++  Preferences dedupPrefs;
++  if (!dedupPrefs.begin(tracker.dedup_namespace, false)) {
++    logPrintf("Failed to open dedup namespace %s for saving.\n",
++              tracker.dedup_namespace);
+     return;
+   }
+ 
+-  if (!force && unsaved_dedup_updates < DEDUP_SAVE_INTERVAL) {
++  const bool ok =
++    dedupPrefs.putBool("has", tracker.has_processed_point) > 0 &&
++    dedupPrefs.putULong("boot", tracker.last_processed_boot_id) > 0 &&
++    dedupPrefs.putULong("seq", tracker.last_processed_seq) > 0;
++  dedupPrefs.end();
++
++  if (!ok) {
++    logPrintf("Failed to save dedup state for %s.\n", tracker.config->id);
+     return;
+   }
+ 
+-  prefs.putBool("has_point", has_processed_point);
+-  prefs.putULong("boot_id", last_processed_boot_id);
+-  prefs.putULong("seq", last_processed_seq);
+-  unsaved_dedup_updates = 0;
++  tracker.unsaved_dedup_updates = 0;
++  logPrintf("Saved dedup [%s] -> boot_id=%lu seq=%lu\n",
++            tracker.config->id,
++            (unsigned long)tracker.last_processed_boot_id,
++            (unsigned long)tracker.last_processed_seq);
++}
+ 
+-  logPrintf("Saved dedup state -> boot_id=%lu seq=%lu\n",
+-            (unsigned long)last_processed_boot_id,
+-            (unsigned long)last_processed_seq);
++void saveAllDedupStates(bool force = false) {
++  for (size_t i = 0; i < GATEWAY_TRACKER_COUNT; i++) {
++    saveDedupState(tracker_runtime[i], force);
++  }
+ }
+ 
+-void updateDedupState(uint32_t boot_id, uint32_t seq) {
+-  last_processed_boot_id = boot_id;
+-  last_processed_seq = seq;
+-  has_processed_point = true;
+-  unsaved_dedup_updates++;
++void updateDedupState(TrackerRuntime& tracker, uint32_t boot_id, uint32_t seq) {
++  tracker.last_processed_boot_id = boot_id;
++  tracker.last_processed_seq = seq;
++  tracker.has_processed_point = true;
++  tracker.unsaved_dedup_updates++;
+ }
+ 
+ void setupOTA() {
+-  snprintf(ota_hostname, sizeof(ota_hostname), "equine-gateway-%s", TRACKER_ID);
+-
+   ArduinoOTA.setHostname(ota_hostname);
+ 
+   ArduinoOTA
+@@ -330,10 +516,10 @@
+       logPrintln((String("OTA Start updating ") + type).c_str());
+ 
+       // Flush dedup state before OTA reboot
+-      saveDedupState(true);
++      saveAllDedupStates(true);
+ 
+       // Let HA know we are going away during update
+-      publishAvailability("offline");
++      publishGatewayAvailability("offline");
+     })
+     .onEnd([]() {
+       logPrintln("\nOTA End");
+@@ -366,21 +552,83 @@
+ void setupWebInterface() {
+   webServer.on("/", HTTP_GET, []() {
+     logPrintln("Web UI accessed by a client.");
+-    String html = "<html><head><title>Equine Gateway (" + String(TRACKER_ID) + ")</title><meta name='viewport' content='width=device-width, initial-scale=1'>";
+-    html += "<style>body{font-family:sans-serif;margin:20px;} pre{background:#f4f4f4;padding:10px;min-height:300px;overflow-y:auto;}</style></head><body>";
+-    html += "<h1>Equine Gateway (" + String(TRACKER_ID) + ")</h1>";
+-    html += "<h3>Live Logs</h3><pre id='logs'>Loading...</pre>";
+-    html += "<script>setInterval(function(){ fetch('/logs').then(r=>r.text()).then(t=>{let el=document.getElementById('logs');let auto=Math.abs(el.scrollHeight-el.scrollTop-el.clientHeight)<5;el.innerText=t;if(auto)el.scrollTop=el.scrollHeight;}); }, 2000);</script>";
++    String html;
++    html.reserve(6000);
++    html = "<html><head><title>" + String(GATEWAY_NAME) +
++           "</title><meta name='viewport' content='width=device-width,initial-scale=1'>";
++    html += "<style>body{font-family:sans-serif;margin:20px}table{border-collapse:collapse;width:100%;max-width:1000px}th,td{border:1px solid #ccc;padding:6px;text-align:left}th{background:#eee}code{font-size:.9em}pre{background:#f4f4f4;padding:10px;min-height:260px;overflow-y:auto}</style></head><body>";
++    html += "<h1>" + String(GATEWAY_NAME) + "</h1>";
++    html += "<p>Gateway ID: <code>" + String(GATEWAY_ID) +
++            "</code><br>Gateway hash: <code>" + String(gateway_hash_text) +
++            "</code><br>Registered trackers: " + String(GATEWAY_TRACKER_COUNT) + "</p>";
++    html += "<h2>Tracker registry</h2><table><tr><th>Name</th><th>ID</th><th>Hash</th><th>Legacy</th><th>Last seen</th><th>RSSI</th><th>Dedup cursor</th></tr>";
++
++    const uint32_t now = millis();
++    for (size_t i = 0; i < GATEWAY_TRACKER_COUNT; i++) {
++      const TrackerRuntime& tracker = tracker_runtime[i];
++      html += "<tr><td>" + String(tracker.config->name) + "</td><td><code>" +
++              String(tracker.config->id) + "</code></td><td><code>" +
++              String(tracker.hash_text) + "</code></td><td>" +
++              String(tracker.config->accepts_legacy_lora ? "LoRa " : "") +
++              String(tracker.config->publish_legacy_mqtt_aliases ? "MQTT" : "") +
++              "</td><td>";
++      if (tracker.has_been_seen) {
++        html += String((now - tracker.last_seen_ms) / 1000UL) + " s ago";
++      } else {
++        html += "never";
++      }
++      html += "</td><td>";
++      html += tracker.has_been_seen ? String(tracker.last_rssi) + " dBm" : "--";
++      html += "</td><td>";
++      if (tracker.has_processed_point) {
++        html += "boot " + String(tracker.last_processed_boot_id) +
++                ", seq " + String(tracker.last_processed_seq);
++      } else {
++        html += "none";
++      }
++      html += "</td></tr>";
++    }
++    html += "</table>";
++    html += "<h2>Live logs</h2><pre id='logs'>Loading...</pre>";
++    html += "<script>setInterval(function(){fetch('/logs').then(r=>r.text()).then(t=>{let e=document.getElementById('logs');let a=Math.abs(e.scrollHeight-e.scrollTop-e.clientHeight)<5;e.innerText=t;if(a)e.scrollTop=e.scrollHeight;});},2000);</script>";
+     html += "</body></html>";
+     webServer.send(200, "text/html", html);
+   });
+ 
++  webServer.on("/api/v1/trackers", HTTP_GET, []() {
++    String out;
++    out.reserve(2500);
++    out = "{\"api_version\":1,\"gateway_id\":\"" + String(GATEWAY_ID) +
++          "\",\"gateway_hash\":\"" + String(gateway_hash_text) +
++          "\",\"trackers\":[";
++    const uint32_t now = millis();
++    for (size_t i = 0; i < GATEWAY_TRACKER_COUNT; i++) {
++      const TrackerRuntime& tracker = tracker_runtime[i];
++      if (i > 0) out += ',';
++      out += "{\"id\":\"" + String(tracker.config->id) +
++             "\",\"name\":\"" + String(tracker.config->name) +
++             "\",\"device_hash\":\"" + String(tracker.hash_text) +
++             "\",\"state_topic\":\"" + String(tracker.state_topic) +
++             "\",\"seen\":" + String(tracker.has_been_seen ? "true" : "false") +
++             ",\"last_seen_ms_ago\":" +
++             String(tracker.has_been_seen ? now - tracker.last_seen_ms : 0) +
++             ",\"last_rssi\":" + String(tracker.last_rssi) +
++             ",\"has_dedup_cursor\":" +
++             String(tracker.has_processed_point ? "true" : "false") +
++             ",\"last_boot_id\":" + String(tracker.last_processed_boot_id) +
++             ",\"last_seq\":" + String(tracker.last_processed_seq) + "}";
++    }
++    out += "]}";
++    webServer.send(200, "application/json", out);
++  });
++
+   webServer.on("/logs", HTTP_GET, []() {
+     String out = "";
+     if (logHistoryCount == 0) {
+       out = "No logs yet.";
+     } else {
+-      const uint8_t oldestIndex = (logHistoryHead + LOG_HISTORY_LINES - logHistoryCount) % LOG_HISTORY_LINES;
++      const uint8_t oldestIndex =
++        (logHistoryHead + LOG_HISTORY_LINES - logHistoryCount) % LOG_HISTORY_LINES;
+       for (uint8_t i = 0; i < logHistoryCount; i++) {
+         const uint8_t index = (oldestIndex + i) % LOG_HISTORY_LINES;
+         out += logHistory[index];
+@@ -419,18 +667,27 @@
+ void logReceiverHeartbeat() {
+   const unsigned long now = millis();
+ 
+-  if (lastHeartbeatMs != 0 && (now - lastHeartbeatMs) < LOG_HEARTBEAT_INTERVAL_MS) {
++  if (lastHeartbeatMs != 0 &&
++      (now - lastHeartbeatMs) < LOG_HEARTBEAT_INTERVAL_MS) {
+     return;
+   }
+ 
+   lastHeartbeatMs = now;
+-
+   const unsigned long secondsSincePacket =
+-    (lastLoRaPacketMs == 0 || now < lastLoRaPacketMs) ? 0 : (now - lastLoRaPacketMs) / 1000UL;
++    (lastLoRaPacketMs == 0 || now < lastLoRaPacketMs)
++      ? 0
++      : (now - lastLoRaPacketMs) / 1000UL;
++
++  size_t seen_count = 0;
++  for (size_t i = 0; i < GATEWAY_TRACKER_COUNT; i++) {
++    if (tracker_runtime[i].has_been_seen) seen_count++;
++  }
+ 
+-  logPrintf("Heartbeat: wifi=%s mqtt=%s last_lora=%lus ago\n",
++  logPrintf("Heartbeat: wifi=%s mqtt=%s trackers=%u/%u seen last_lora=%lus ago\n",
+             WiFi.status() == WL_CONNECTED ? "up" : "down",
+             client.connected() ? "up" : "down",
++            (unsigned)seen_count,
++            (unsigned)GATEWAY_TRACKER_COUNT,
+             secondsSincePacket);
+ }
+ 
+@@ -456,55 +713,88 @@
+ // ==========================================
+ // HOME ASSISTANT AUTO-DISCOVERY
+ // ==========================================
+-void publishAutoDiscovery() {
+-  logPrintln("Publishing Home Assistant Auto-Discovery payloads...");
+-
+-  char topic[128];
+-  char payload[512];
+-
+-  // Device tracker
+-  snprintf(topic, sizeof(topic), "homeassistant/device_tracker/%s/location/config", TRACKER_ID);
++void publishAutoDiscoveryForTracker(const TrackerRuntime& tracker) {
++  char topic[160];
++  char payload[768];
++  char device_registry_id[48];
++  snprintf(device_registry_id, sizeof(device_registry_id),
++           "equine_tracker_%s", tracker.hash_text);
++
++  // Keep the discovery path human-readable while using the hash in unique IDs.
++  snprintf(topic, sizeof(topic),
++           "homeassistant/device_tracker/%s/location/config",
++           tracker.config->id);
+   snprintf(payload, sizeof(payload),
+-    "{\"name\":\"%s Location\",\"stat_t\":\"%s\",\"json_attr_t\":\"%s\",\"source_type\":\"gps\","
++    "{\"name\":\"%s Location\",\"stat_t\":\"%s\","
++    "\"json_attr_t\":\"%s\",\"source_type\":\"gps\","
+     "\"uniq_id\":\"%s_loc\",\"avty_t\":\"%s\","
+-    "\"dev\":{\"ids\":[\"%s\"],\"name\":\"%s Tracker\",\"mdl\":\"Equine Telemetry\"}}",
+-    TRACKER_NAME, state_topic, state_topic, TRACKER_ID, availability_topic, TRACKER_ID, TRACKER_NAME);
++    "\"dev\":{\"ids\":[\"%s\"],\"name\":\"%s Tracker\","
++    "\"mdl\":\"Equine Telemetry v1\"}}",
++    tracker.config->name,
++    tracker.state_topic,
++    tracker.state_topic,
++    tracker.hash_text,
++    gateway_availability_topic,
++    device_registry_id,
++    tracker.config->name);
+   publishRetainedMessage(topic, payload);
+ 
+-  // Total distance
+-  snprintf(topic, sizeof(topic), "homeassistant/sensor/%s/distance/config", TRACKER_ID);
++  snprintf(topic, sizeof(topic),
++           "homeassistant/sensor/%s/distance/config",
++           tracker.config->id);
+   snprintf(payload, sizeof(payload),
+     "{\"name\":\"%s Total Distance\",\"stat_t\":\"%s\","
+     "\"val_tpl\":\"{{(value_json.dist_m/1000)|round(2)}}\","
+-    "\"unit_of_meas\":\"km\",\"ic\":\"mdi:horse\",\"stat_cla\":\"measurement\","
+-    "\"uniq_id\":\"%s_dist\",\"avty_t\":\"%s\","
+-    "\"dev\":{\"ids\":[\"%s\"]}}",
+-    TRACKER_NAME, state_topic, TRACKER_ID, availability_topic, TRACKER_ID);
++    "\"unit_of_meas\":\"km\",\"ic\":\"mdi:horse\","
++    "\"stat_cla\":\"measurement\",\"uniq_id\":\"%s_dist\","
++    "\"avty_t\":\"%s\",\"dev\":{\"ids\":[\"%s\"]}}",
++    tracker.config->name,
++    tracker.state_topic,
++    tracker.hash_text,
++    gateway_availability_topic,
++    device_registry_id);
+   publishRetainedMessage(topic, payload);
+ 
+-  // Battery
+-  snprintf(topic, sizeof(topic), "homeassistant/sensor/%s/battery/config", TRACKER_ID);
++  snprintf(topic, sizeof(topic),
++           "homeassistant/sensor/%s/battery/config",
++           tracker.config->id);
+   snprintf(payload, sizeof(payload),
+     "{\"name\":\"%s Battery\",\"stat_t\":\"%s\","
+-    "\"val_tpl\":\"{{value_json.battery_level}}\",\"unit_of_meas\":\"%%\","
+-    "\"dev_cla\":\"battery\",\"stat_cla\":\"measurement\","
+-    "\"uniq_id\":\"%s_batt\",\"avty_t\":\"%s\","
+-    "\"dev\":{\"ids\":[\"%s\"]}}",
+-    TRACKER_NAME, state_topic, TRACKER_ID, availability_topic, TRACKER_ID);
++    "\"val_tpl\":\"{{value_json.battery_level}}\","
++    "\"unit_of_meas\":\"%%\",\"dev_cla\":\"battery\","
++    "\"stat_cla\":\"measurement\",\"uniq_id\":\"%s_batt\","
++    "\"avty_t\":\"%s\",\"dev\":{\"ids\":[\"%s\"]}}",
++    tracker.config->name,
++    tracker.state_topic,
++    tracker.hash_text,
++    gateway_availability_topic,
++    device_registry_id);
+   publishRetainedMessage(topic, payload);
+ 
+-  // RSSI
+-  snprintf(topic, sizeof(topic), "homeassistant/sensor/%s/rssi/config", TRACKER_ID);
++  snprintf(topic, sizeof(topic),
++           "homeassistant/sensor/%s/rssi/config",
++           tracker.config->id);
+   snprintf(payload, sizeof(payload),
+     "{\"name\":\"%s LoRa Signal\",\"stat_t\":\"%s\","
+     "\"val_tpl\":\"{{value_json.rssi}}\",\"unit_of_meas\":\"dBm\","
+     "\"dev_cla\":\"signal_strength\",\"stat_cla\":\"measurement\","
+     "\"uniq_id\":\"%s_rssi\",\"avty_t\":\"%s\","
+     "\"dev\":{\"ids\":[\"%s\"]}}",
+-    TRACKER_NAME, state_topic, TRACKER_ID, availability_topic, TRACKER_ID);
++    tracker.config->name,
++    tracker.state_topic,
++    tracker.hash_text,
++    gateway_availability_topic,
++    device_registry_id);
+   publishRetainedMessage(topic, payload);
++}
+ 
+-  logPrintln("Auto-Discovery complete!");
++void publishAutoDiscovery() {
++  logPrintf("Publishing Home Assistant discovery for %u trackers...\n",
++            (unsigned)GATEWAY_TRACKER_COUNT);
++  for (size_t i = 0; i < GATEWAY_TRACKER_COUNT; i++) {
++    publishAutoDiscoveryForTracker(tracker_runtime[i]);
++  }
++  logPrintln("Auto-Discovery complete.");
+ }
+ 
+ void handleWiFiConnection() {
+@@ -548,15 +838,21 @@
+   }
+ 
+   lastMqttReconnectAttemptMs = now;
+-
+   logPrint("Attempting MQTT connection...");
+ 
+   char clientId[48];
+-  snprintf(clientId, sizeof(clientId), "Gateway-%s", device_hash_text);
++  snprintf(clientId, sizeof(clientId), "EqGw-%s", gateway_hash_text);
+ 
+-  if (client.connect(clientId, mqtt_user, mqtt_pass, availability_topic, 1, true, "offline")) {
++  if (client.connect(
++        clientId,
++        mqtt_user,
++        mqtt_pass,
++        gateway_availability_topic,
++        1,
++        true,
++        "offline")) {
+     logPrintln("CONNECTED!");
+-    publishAvailability("online");
++    publishGatewayAvailability("online");
+     publishAutoDiscovery();
+   } else {
+     logPrint("failed, rc=");
+@@ -569,32 +865,30 @@
+   Serial.begin(115200);
+   delay(1000);
+ 
+-  EquineProtocol::formatDeviceHash(
+-    EXPECTED_DEVICE_HASH, device_hash_text, sizeof(device_hash_text)
+-  );
+-  snprintf(
+-    state_topic, sizeof(state_topic),
+-    "equine/v%u/trackers/%s/state",
+-    EquineProtocol::MQTT_API_VERSION, device_hash_text
+-  );
+-  snprintf(
+-    availability_topic, sizeof(availability_topic),
+-    "equine/v%u/trackers/%s/availability",
+-    EquineProtocol::MQTT_API_VERSION, device_hash_text
+-  );
+-  snprintf(legacy_state_topic, sizeof(legacy_state_topic),
+-           "horse/%s/state", TRACKER_ID);
+-  snprintf(legacy_availability_topic, sizeof(legacy_availability_topic),
+-           "horse/%s/availability", TRACKER_ID);
+-
+-  logPrintf("\n--- Equine Gateway Booting for: %s ---\n", TRACKER_NAME);
+-  logPrintf(
+-    "Protocol v%u expected_tracker_id=%s device_hash=%s mqtt_api=v%u\n",
+-    EquineProtocol::TRANSPORT_VERSION, TRACKER_ID, device_hash_text,
+-    EquineProtocol::MQTT_API_VERSION
+-  );
++  if (!initializeTrackerRegistry()) {
++    logPrintln("Fatal tracker registry error; gateway halted.");
++    while (true) delay(1000);
++  }
++
++  logPrintf("\n--- %s booting ---\n", GATEWAY_NAME);
++  logPrintf("Gateway id=%s hash=%s protocol=v%u mqtt_api=v%u trackers=%u\n",
++            GATEWAY_ID,
++            gateway_hash_text,
++            EquineProtocol::TRANSPORT_VERSION,
++            EquineProtocol::MQTT_API_VERSION,
++            (unsigned)GATEWAY_TRACKER_COUNT);
++  for (size_t i = 0; i < GATEWAY_TRACKER_COUNT; i++) {
++    const TrackerRuntime& tracker = tracker_runtime[i];
++    logPrintf("  registry[%u] id=%s name=%s hash=%s legacy_lora=%s legacy_mqtt=%s\n",
++              (unsigned)i,
++              tracker.config->id,
++              tracker.config->name,
++              tracker.hash_text,
++              tracker.config->accepts_legacy_lora ? "yes" : "no",
++              tracker.config->publish_legacy_mqtt_aliases ? "yes" : "no");
++  }
+ 
+-  loadDedupState();
++  loadAllDedupStates();
+ 
+   WiFi.begin(ssid, password);
+   while (WiFi.status() != WL_CONNECTED) {
+@@ -616,13 +910,12 @@
+ 
+   if (!LoRa.begin(LORA_FREQ)) {
+     logPrintln("LoRa initialization failed!");
+-    while (true) { }
++    while (true) delay(1000);
+   }
+ 
+   configureLoRaRadio();
+-
+   LoRa.receive();
+-  logPrintln("Gateway is listening for LoRa packets...");
++  logPrintln("Gateway is listening for registered LoRa trackers...");
+ }
+ 
+ void loop() {
+@@ -632,42 +925,36 @@
+   logReceiverHeartbeat();
+ 
+   handleWiFiConnection();
+-
+   if (WiFi.status() == WL_CONNECTED) {
+     reconnectMqttIfNeeded();
+-    if (client.connected()) {
+-      client.loop();
+-    }
++    if (client.connected()) client.loop();
+   }
+ 
+-  int packetSize = LoRa.parsePacket();
+-
+-  if (!packetSize) {
+-    return;
+-  }
++  const int packetSize = LoRa.parsePacket();
++  if (!packetSize) return;
+ 
+   do {
+-    // Accept variable length payloads. The smallest valid packet is the legacy
+-    // history header plus root coordinates and the two batch-count bytes.
++    // Legacy history header + root coordinates + anchor count + batch count.
+     if (packetSize < (int)(sizeof(LegacyLoRaHeader) + 8 + 2) ||
+         packetSize > 255) {
+-      logPrintf("Ignored invalid packet size. Got: %d\n", packetSize);
++      logPrintf("Ignored invalid packet size: %d bytes.\n", packetSize);
+       break;
+     }
+ 
+     uint8_t payload_buffer[255];
+-    int bytesRead = LoRa.readBytes(payload_buffer, packetSize);
+-
++    const int bytesRead = LoRa.readBytes(payload_buffer, packetSize);
+     if (bytesRead != packetSize) {
+-      logPrintf("Short LoRa read. Expected: %d, Got: %d\n",
++      logPrintf("Short LoRa read. Expected %d, got %d.\n",
+                 packetSize, bytesRead);
+       break;
+     }
+ 
++    const int packet_rssi = LoRa.packetRssi();
+     lastLoRaPacketMs = millis();
+ 
+     size_t offset = 0;
+     DecodedHistoryHeader header{};
++    TrackerRuntime* tracker = nullptr;
+ 
+     bool has_v1_magic = false;
+     if (packetSize >= (int)sizeof(EquineProtocol::FrameHeaderV1)) {
+@@ -684,7 +971,6 @@
+ 
+       LoRaHeader wire_header{};
+       memcpy(&wire_header, payload_buffer, sizeof(wire_header));
+-
+       if (!EquineProtocol::isSupportedFrame(
+             wire_header.frame,
+             EquineProtocol::MessageType::HISTORY,
+@@ -694,20 +980,18 @@
+           wire_header.frame.transport_version,
+           wire_header.frame.message_type,
+           wire_header.frame.schema_version,
+-          wire_header.frame.flags
+-        );
++          wire_header.frame.flags);
+         break;
+       }
+ 
+-      if (wire_header.frame.device_id_hash != EXPECTED_DEVICE_HASH) {
++      tracker = findTrackerByHash(wire_header.frame.device_id_hash);
++      if (!tracker) {
+         char unknown_hash[17];
+         EquineProtocol::formatDeviceHash(
+-          wire_header.frame.device_id_hash, unknown_hash, sizeof(unknown_hash)
+-        );
+-        logPrintf(
+-          "Ignored packet from unregistered device hash %s; expected %s.\n",
+-          unknown_hash, device_hash_text
+-        );
++          wire_header.frame.device_id_hash,
++          unknown_hash,
++          sizeof(unknown_hash));
++        logPrintf("Ignored unregistered device hash %s.\n", unknown_hash);
+         break;
+       }
+ 
+@@ -721,197 +1005,259 @@
+       header.batt_pct = wire_header.batt_pct;
+       offset = sizeof(wire_header);
+     } else {
++      tracker = findLegacyTracker();
++      if (!tracker) {
++        logPrintln("Ignored legacy packet: no unique legacy tracker registered.");
++        break;
++      }
++
+       LegacyLoRaHeader legacy_header{};
+       memcpy(&legacy_header, payload_buffer, sizeof(legacy_header));
+       header.legacy = true;
+       header.transport_version = 0;
+       header.schema_version = 0;
+-      header.device_id_hash = EXPECTED_DEVICE_HASH;
++      header.device_id_hash = tracker->device_id_hash;
+       header.boot_id = legacy_header.boot_id;
+       header.first_seq = legacy_header.first_seq;
+       header.total_dist_dam = legacy_header.total_dist_dam;
+       header.batt_pct = legacy_header.batt_pct;
+       offset = sizeof(legacy_header);
+-      logPrintln("Accepted legacy unversioned packet during migration.");
++      logPrintf("Mapped legacy packet to registered tracker %s.\n",
++                tracker->config->id);
++    }
++
++    tracker->has_been_seen = true;
++    tracker->last_seen_ms = millis();
++    tracker->last_rssi = packet_rssi;
++
++    if (offset + 9 > (size_t)packetSize) {
++      logPrintln("Packet ended before root and anchor metadata.");
++      break;
+     }
+ 
+-    int32_t root_lat, root_lon;
++    int32_t root_lat = 0;
++    int32_t root_lon = 0;
+     memcpy(&root_lat, payload_buffer + offset, 4); offset += 4;
+     memcpy(&root_lon, payload_buffer + offset, 4); offset += 4;
+ 
+-    uint8_t num_anchors = payload_buffer[offset++];
+-    AnchorPoint anchors[64];
+-    if (num_anchors > 0 && num_anchors <= 64) {
+-      if (offset + num_anchors * sizeof(AnchorPoint) <= packetSize) {
+-        memcpy(anchors, payload_buffer + offset, num_anchors * sizeof(AnchorPoint));
+-        offset += num_anchors * sizeof(AnchorPoint);
+-      } else {
+-        logPrintln("Packet size mismatch during anchors reading.");
+-        break;
+-      }
+-    } else if (num_anchors > 64) {
+-      logPrintln("Too many anchors, ignoring packet");
++    const uint8_t num_anchors = payload_buffer[offset++];
++    AnchorPoint anchors[64]{};
++    if (num_anchors > 64) {
++      logPrintln("Too many anchors; packet rejected.");
+       break;
+     }
+-
+-    if (offset >= packetSize) {
+-      logPrintln("Packet ended before batch metadata.");
++    const size_t anchors_bytes = num_anchors * sizeof(AnchorPoint);
++    if (offset + anchors_bytes > (size_t)packetSize) {
++      logPrintln("Packet ended while reading anchors.");
+       break;
+     }
++    if (anchors_bytes > 0) {
++      memcpy(anchors, payload_buffer + offset, anchors_bytes);
++      offset += anchors_bytes;
++    }
+ 
+-    uint8_t num_batches = payload_buffer[offset++];
+-
+-    uint32_t current_seq = header.first_seq;
++    if (offset >= (size_t)packetSize) {
++      logPrintln("Packet ended before batch count.");
++      break;
++    }
++    const uint8_t num_batches = payload_buffer[offset++];
+ 
+     logPrintf(
+-      "Received %s packet: transport=%u schema=%u hash=%s boot_id=%lu "
+-      "first_seq=%lu root_lat=%.6f root_lon=%.6f anchors=%u batches=%u RSSI=%d\n",
++      "Received %s packet [%s/%s]: transport=%u schema=%u boot=%lu "
++      "first_seq=%lu root=%.6f,%.6f anchors=%u batches=%u RSSI=%d\n",
+       header.legacy ? "legacy" : "v1",
++      tracker->config->id,
++      tracker->hash_text,
+       header.transport_version,
+       header.schema_version,
+-      device_hash_text,
+       (unsigned long)header.boot_id,
+       (unsigned long)header.first_seq,
+-      root_lat / 1000000.0f, root_lon / 1000000.0f,
+-      num_anchors, num_batches, LoRa.packetRssi()
+-    );
++      root_lat / 1000000.0f,
++      root_lon / 1000000.0f,
++      num_anchors,
++      num_batches,
++      packet_rssi);
+ 
++    bool packet_valid = true;
+     bool publish_success = true;
++    bool processed_any_point = false;
++    uint32_t current_seq = header.first_seq;
++    uint32_t highest_ackable_seq = header.first_seq;
+ 
+     auto processPoint = [&](int32_t p_lat, int32_t p_lon, uint32_t p_seq) {
+-      if (!publish_success) {
+-        return;
+-      }
++      if (!packet_valid || !publish_success) return;
+ 
+       if (!isValidCoordinateMicrodeg(p_lat, p_lon)) {
+-        logPrintf("Ignoring out-of-range point: seq=%lu lat=%ld lon=%ld\n",
++        logPrintf("Invalid coordinate: tracker=%s seq=%lu lat=%ld lon=%ld\n",
++                  tracker->config->id,
+                   (unsigned long)p_seq,
+                   (long)p_lat,
+                   (long)p_lon);
++        packet_valid = false;
+         return;
+       }
+ 
+-      if (isNewPoint(header.boot_id, p_seq)) {
+-        float real_lat = p_lat / 1000000.0f;
+-        float real_lon = p_lon / 1000000.0f;
+-        uint32_t dist_m = (uint32_t)header.total_dist_dam * 10U;
++      if (isNewPoint(*tracker, header.boot_id, p_seq)) {
++        const float real_lat = p_lat / 1000000.0f;
++        const float real_lon = p_lon / 1000000.0f;
++        const uint32_t dist_m = (uint32_t)header.total_dist_dam * 10U;
++
++        char point_id[64];
++        snprintf(point_id, sizeof(point_id), "%s:%lu:%lu",
++                 tracker->hash_text,
++                 (unsigned long)header.boot_id,
++                 (unsigned long)p_seq);
+ 
+-        logPrintf("  -> New point: boot_id=%lu seq=%lu lat=%.6f lon=%.6f dist=%u m\n",
+-                  (unsigned long)header.boot_id,
++        logPrintf("  -> New point [%s]: seq=%lu lat=%.6f lon=%.6f dist=%u m\n",
++                  tracker->config->id,
+                   (unsigned long)p_seq,
+                   real_lat,
+                   real_lon,
+                   dist_m);
+ 
+-        char jsonBuffer[384];
+-        int written = snprintf(
++        char jsonBuffer[512];
++        const int written = snprintf(
+           jsonBuffer,
+           sizeof(jsonBuffer),
+           "{\"api_version\":%u,\"transport_version\":%u,"
+-          "\"schema_version\":%u,\"device_hash\":\"%s\","
+-          "\"latitude\":%.6f,\"longitude\":%.6f,\"dist_m\":%u,"
++          "\"schema_version\":%u,\"device_id\":\"%s\","
++          "\"device_name\":\"%s\",\"device_hash\":\"%s\","
++          "\"gateway_id\":\"%s\",\"gateway_hash\":\"%s\","
++          "\"point_id\":\"%s\",\"latitude\":%.6f,"
++          "\"longitude\":%.6f,\"dist_m\":%u,"
+           "\"battery_level\":%u,\"rssi\":%d,\"seq\":%lu,"
+           "\"boot_id\":%lu}",
+           EquineProtocol::MQTT_API_VERSION,
+           header.transport_version,
+           header.schema_version,
+-          device_hash_text,
++          tracker->config->id,
++          tracker->config->name,
++          tracker->hash_text,
++          GATEWAY_ID,
++          gateway_hash_text,
++          point_id,
+           real_lat,
+           real_lon,
+           dist_m,
+           header.batt_pct,
+-          LoRa.packetRssi(),
++          packet_rssi,
+           (unsigned long)p_seq,
+-          (unsigned long)header.boot_id
+-        );
++          (unsigned long)header.boot_id);
++
++        if (written <= 0 || written >= (int)sizeof(jsonBuffer)) {
++          logPrintln("MQTT JSON overflow; packet retained for retry.");
++          publish_success = false;
++          return;
++        }
+ 
+-        if (written > 0 && written < (int)sizeof(jsonBuffer)) {
+-          if (publishTrackerState(jsonBuffer)) {
+-            updateDedupState(header.boot_id, p_seq);
+-          } else {
+-            logPrintln("MQTT publish failed. Halting parsing for this packet.");
+-            publish_success = false;
+-          }
+-        } else {
+-          logPrintln("MQTT JSON buffer overflow; retaining packet for retry.");
++        if (!publishTrackerState(*tracker, jsonBuffer)) {
++          logPrintln("MQTT publish failed; packet retained for retry.");
+           publish_success = false;
++          return;
+         }
++
++        updateDedupState(*tracker, header.boot_id, p_seq);
++      } else {
++        logPrintf("  -> Duplicate already published [%s] boot=%lu seq=%lu\n",
++                  tracker->config->id,
++                  (unsigned long)header.boot_id,
++                  (unsigned long)p_seq);
+       }
++
++      processed_any_point = true;
++      highest_ackable_seq = p_seq;
+     };
+ 
+-    processPoint(root_lat, root_lon, current_seq);
+-    current_seq++;
++    processPoint(root_lat, root_lon, current_seq++);
+ 
+-    for (uint8_t b = 0; b < num_batches; b++) {
+-      if (offset + 2 > packetSize || !publish_success) {
++    for (uint8_t batch = 0;
++         batch < num_batches && packet_valid && publish_success;
++         batch++) {
++      if (offset + 2 > (size_t)packetSize) {
++        logPrintln("Packet ended before batch metadata.");
++        packet_valid = false;
+         break;
+       }
+ 
+-      uint8_t anchor_idx = payload_buffer[offset++];
+-      uint8_t count = payload_buffer[offset++];
+-
++      const uint8_t anchor_idx = payload_buffer[offset++];
++      const uint8_t count = payload_buffer[offset++];
+       if (anchor_idx >= num_anchors) {
+-        logPrintln("Invalid anchor index in batch!");
++        logPrintln("Invalid anchor index in batch.");
++        packet_valid = false;
+         break;
+       }
+ 
+-      int32_t anchor_lat_micro = root_lat + (int32_t)anchors[anchor_idx].dlat * DELTA_UNIT_MICRODEG;
+-      int32_t anchor_lon_micro = root_lon + (int32_t)anchors[anchor_idx].dlon * DELTA_UNIT_MICRODEG;
+-
+-      if (offset + count * 2 > packetSize) {
+-        logPrintln("Batch count exceeds remaining packet bytes!");
++      const size_t points_bytes = (size_t)count * 2U;
++      if (offset + points_bytes > (size_t)packetSize) {
++        logPrintln("Batch point count exceeds remaining packet bytes.");
++        packet_valid = false;
+         break;
+       }
+ 
+-      for (uint8_t p = 0; p < count; p++) {
+-        int8_t rel_dlat = (int8_t)payload_buffer[offset++];
+-        int8_t rel_dlon = (int8_t)payload_buffer[offset++];
++      const int32_t anchor_lat_micro =
++        root_lat + (int32_t)anchors[anchor_idx].dlat * DELTA_UNIT_MICRODEG;
++      const int32_t anchor_lon_micro =
++        root_lon + (int32_t)anchors[anchor_idx].dlon * DELTA_UNIT_MICRODEG;
++
++      for (uint8_t point = 0; point < count; point++) {
++        const int8_t rel_dlat = (int8_t)payload_buffer[offset++];
++        const int8_t rel_dlon = (int8_t)payload_buffer[offset++];
++        const int32_t p_lat_micro =
++          anchor_lat_micro + (int32_t)rel_dlat * DELTA_UNIT_MICRODEG;
++        const int32_t p_lon_micro =
++          anchor_lon_micro + (int32_t)rel_dlon * DELTA_UNIT_MICRODEG;
++        processPoint(p_lat_micro, p_lon_micro, current_seq++);
++        if (!packet_valid || !publish_success) break;
++      }
++    }
+ 
+-        int32_t p_lat_micro = anchor_lat_micro + (int32_t)rel_dlat * DELTA_UNIT_MICRODEG;
+-        int32_t p_lon_micro = anchor_lon_micro + (int32_t)rel_dlon * DELTA_UNIT_MICRODEG;
++    if (packet_valid && publish_success && offset != (size_t)packetSize) {
++      logPrintf("Unexpected %u trailing packet bytes; ACK withheld.\n",
++                (unsigned)((size_t)packetSize - offset));
++      packet_valid = false;
++    }
+ 
+-        processPoint(p_lat_micro, p_lon_micro, current_seq);
+-        current_seq++;
+-      }
++    if (!packet_valid || !publish_success || !processed_any_point) {
++      logPrintf("ACK withheld for tracker %s (valid=%s publish=%s points=%s).\n",
++                tracker->config->id,
++                packet_valid ? "yes" : "no",
++                publish_success ? "yes" : "no",
++                processed_any_point ? "yes" : "no");
++      break;
+     }
+ 
+-    if (publish_success) {
+-      saveDedupState(false);
++    saveDedupState(*tracker, false);
+ 
+-      LoRa.beginPacket();
++    LoRa.beginPacket();
++    if (header.legacy) {
++      LegacyAckPayload ack{};
++      ack.boot_id = header.boot_id;
++      ack.acked_seq = highest_ackable_seq;
++      LoRa.write((uint8_t*)&ack, sizeof(ack));
++    } else {
++      AckPayload ack{};
++      ack.frame = EquineProtocol::makeFrameHeader(
++        EquineProtocol::MessageType::ACK,
++        EquineProtocol::ACK_SCHEMA_VERSION,
++        tracker->device_id_hash);
++      ack.boot_id = header.boot_id;
++      ack.acked_seq = highest_ackable_seq;
++      LoRa.write((uint8_t*)&ack, sizeof(ack));
++    }
+ 
+-      uint32_t ack_boot_id = header.boot_id;
+-      uint32_t acked_seq = current_seq - 1;
+-      if (header.legacy) {
+-        LegacyAckPayload ack{};
+-        ack.boot_id = ack_boot_id;
+-        ack.acked_seq = acked_seq;
+-        LoRa.write((uint8_t*)&ack, sizeof(ack));
+-      } else {
+-        AckPayload ack{};
+-        ack.frame = EquineProtocol::makeFrameHeader(
+-          EquineProtocol::MessageType::ACK,
+-          EquineProtocol::ACK_SCHEMA_VERSION,
+-          header.device_id_hash
+-        );
+-        ack.boot_id = ack_boot_id;
+-        ack.acked_seq = acked_seq;
+-        LoRa.write((uint8_t*)&ack, sizeof(ack));
+-      }
+-
+-      int txResult = LoRa.endPacket();
+-
+-      if (txResult) {
+-        logPrintf("Sent %s ACK for boot_id=%lu seq=%lu\n",
+-                  header.legacy ? "legacy" : "v1",
+-                  (unsigned long)ack_boot_id,
+-                  (unsigned long)acked_seq);
+-      } else {
+-        logPrintln("Failed to transmit ACK payload.");
+-      }
++    const int txResult = LoRa.endPacket();
++    if (txResult) {
++      logPrintf("Sent %s ACK [%s] boot=%lu seq=%lu\n",
++                header.legacy ? "legacy" : "v1",
++                tracker->config->id,
++                (unsigned long)header.boot_id,
++                (unsigned long)highest_ackable_seq);
++    } else {
++      logPrintf("Failed to transmit ACK for tracker %s.\n",
++                tracker->config->id);
+     }
+   } while (false);
+ 
+-  // Always resume RX mode after processing a received packet.
+   LoRa.receive();
+-}
+\ No newline at end of file
++}
++
+--- /dev/null
++++ b/equine_gateway_registry.h
+@@ -0,0 +1,44 @@
++#pragma once
++
++#include <stddef.h>
++#include <stdint.h>
++
++// Compile-time gateway and tracker registry.
++//
++// This is intentionally static for protocol step 2. A later configuration
++// step will move these values into a versioned, persistent configuration that
++// can be edited through onboarding without recompiling the firmware.
++
++struct GatewayTrackerConfig {
++  // Stable canonical ID used to derive the public 64-bit routing hash.
++  // Keep this lowercase and do not reuse an ID for a different physical unit.
++  const char* id;
++
++  // Human-readable name used by logs and Home Assistant discovery.
++  const char* name;
++
++  // Map old unversioned LoRa packets to this tracker. At most one registry
++  // entry should set this to true because legacy packets contain no identity.
++  bool accepts_legacy_lora;
++
++  // Also publish the old horse/<id>/... MQTT aliases during migration.
++  bool publish_legacy_mqtt_aliases;
++};
++
++static const char* const GATEWAY_ID = "home";
++static const char* const GATEWAY_NAME = "Home Equine Gateway";
++
++static const GatewayTrackerConfig GATEWAY_TRACKERS[] = {
++  {"wera", "Wera", true, true},
++
++  // Add more protocol-v1 trackers here. Example:
++  // {"hugo", "Hugo", false, false},
++};
++
++static constexpr size_t GATEWAY_TRACKER_COUNT =
++  sizeof(GATEWAY_TRACKERS) / sizeof(GATEWAY_TRACKERS[0]);
++
++static constexpr size_t MAX_GATEWAY_TRACKERS = 12;
++static_assert(GATEWAY_TRACKER_COUNT > 0, "Register at least one tracker");
++static_assert(GATEWAY_TRACKER_COUNT <= MAX_GATEWAY_TRACKERS,
++              "Increase MAX_GATEWAY_TRACKERS or reduce registry size");
+--- /dev/null
++++ b/README_MULTI_DEVICE_GATEWAY_V2.md
+@@ -0,0 +1,107 @@
++# Equine Gateway v2 — Multi-device registry
++
++This step upgrades the protocol-v1 gateway from one hard-coded tracker to a
++compile-time registry of trackers. The tracker firmware and the protocol-v1
++wire format are unchanged.
++
++## Configure trackers
++
++Edit `equine_gateway_registry.h`:
++
++```cpp
++static const GatewayTrackerConfig GATEWAY_TRACKERS[] = {
++  {"wera", "Wera", true, true},
++  {"hugo", "Hugo", false, false},
++};
++```
++
++Fields:
++
++1. `id`: stable canonical identifier. It produces the public 64-bit routing
++   hash. Do not reuse an ID for another physical tracker.
++2. `name`: human-readable display name.
++3. `accepts_legacy_lora`: maps old packets without a device hash to this
++   tracker. At most one entry may enable it.
++4. `publish_legacy_mqtt_aliases`: additionally publishes `horse/<id>/...`
++   topics while old clients migrate.
++
++`GATEWAY_ID` identifies the receiver node independently from the trackers.
++
++## Routing
++
++Protocol-v1 history frames are routed by `device_id_hash` to the matching
++registry entry. Unknown hashes are rejected and do not receive an ACK.
++
++Legacy packets contain no identity. They are accepted only when exactly one
++registry entry has `accepts_legacy_lora=true`.
++
++## MQTT topics
++
++Each tracker publishes to its own canonical topic:
++
++```text
++equine/v1/trackers/<device_hash>/state
++equine/v1/trackers/<device_hash>/availability
++```
++
++The receiver has a separate LWT topic:
++
++```text
++equine/v1/gateways/<gateway_hash>/availability
++```
++
++Home Assistant discovery uses the gateway LWT. Per-tracker availability topics
++are also published for applications and migration, but only the gateway topic
++is guaranteed to become `offline` after an ungraceful receiver disconnect.
++
++Each state event contains:
++
++- `device_id`, `device_name`, and `device_hash`
++- `gateway_id` and `gateway_hash`
++- `point_id = <device_hash>:<boot_id>:<seq>`
++- position, distance, battery, RSSI, sequence and protocol versions
++
++`point_id` gives servers and apps a stable key for deduplicating the same point
++when several gateways publish it.
++
++## Per-tracker deduplication
++
++Every tracker has an independent NVS namespace derived from 56 bits of its
++public hash. The full 64-bit hashes and shortened NVS namespaces are checked
++for collisions at startup.
++
++The old single-tracker `gateway` NVS cursor is automatically migrated to the
++entry marked `accepts_legacy_lora`.
++
++A packet is ACKed only after:
++
++- the complete packet structure is valid,
++- every new point has been published to the canonical MQTT topic, and
++- duplicates have already been published according to that tracker's cursor.
++
++If MQTT fails part-way through a packet, already published points remain in the
++cursor, no ACK is sent, and the next retry skips those points before continuing.
++
++## Local gateway API
++
++The web interface now shows the tracker registry, last-seen age, RSSI and dedup
++cursor. Machine-readable registry state is available at:
++
++```text
++GET /api/v1/trackers
++```
++
++## Upgrade sequence
++
++1. Flash this gateway firmware.
++2. Keep the current protocol-v1 tracker firmware unchanged.
++3. Verify Wera still publishes and receives ACKs.
++4. Add further tracker entries and flash those trackers with their own canonical
++   IDs.
++
++## Deliberately deferred
++
++This step does not yet provide persistent editable configuration, onboarding,
++encryption, or relay forwarding. Simultaneous ACKs from multiple gateways that
++hear the same LoRa frame also require a later coordination/relay design. MQTT
++consumers should already deduplicate using `point_id`.
+--- /dev/null
++++ b/secrets.example.h
+@@ -0,0 +1,9 @@
++#pragma once
++
++const char* ssid = "your-wifi";
++const char* password = "your-wifi-password";
++
++const char* mqtt_server = "mqtt.example.net";
++const int mqtt_port = 1883;
++const char* mqtt_user = "gateway-user";
++const char* mqtt_pass = "gateway-password";

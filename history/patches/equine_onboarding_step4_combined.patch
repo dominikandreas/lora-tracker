@@ -1,0 +1,1492 @@
+--- /mnt/data/equine_tracker_config_v2.ino	2026-07-15 08:39:44.273279802 +0000
++++ /mnt/data/equine_tracker_onboarding_v3.ino	2026-07-15 09:11:07.397754566 +0000
+@@ -14,6 +14,9 @@
+ #endif
+ 
+ #define USER_BTN_PIN 0
++#ifndef EQUINE_ONBOARDING_AP_PASSWORD
++#define EQUINE_ONBOARDING_AP_PASSWORD "EquineSetup!"
++#endif
+ 
+ #include <Preferences.h>
+ #include <WiFi.h>
+@@ -26,9 +29,11 @@
+ #include <BLEServer.h>
+ #include <BLEUtils.h>
+ #include <BLE2902.h>
++#include <string>
+ #include "secrets.h"
+ #include "equine_protocol.h"
+ #include "equine_config.h"
++#include "equine_config_api.h"
+ 
+ // ==========================================
+ // VERSIONED PERSISTENT CONFIGURATION
+@@ -304,7 +309,8 @@
+ void renderDisplayLines(char lines[5][18]);
+ void sleepGPS();
+ void sleepLoRaRadio();
+-void startBleDebugWindow(uint32_t duration_ms);
++void startBleDebugWindow(uint32_t duration_ms, bool force_provisioning = false);
++void processBleConfigCommand(const char* command);
+ void stopBleDebug();
+ void serviceBleDebug();
+ bool isBleConnectionWindowActive();
+@@ -329,6 +335,45 @@
+ bool ble_enable_transition_requested = false;
+ RTC_DATA_ATTR bool ble_open_window_on_next_wake = false;
+ 
++// Configuration/onboarding lifecycle. Configuration writes are transactional:
++// a complete candidate is patched, finalized, validated, and only then replaces
++// the active CRC-protected blob. Reboot/factory-reset work is deferred outside
++// HTTP and BLE callbacks so responses can finish cleanly.
++bool tracker_onboarding_required = false;
++bool config_reboot_requested = false;
++bool config_factory_reset_requested = false;
++bool ble_provisioning_mode = false;
++BLECharacteristic *pRxCharacteristic = NULL;
++constexpr size_t BLE_CONFIG_COMMAND_MAX = 1536;
++char ble_config_command[BLE_CONFIG_COMMAND_MAX];
++size_t ble_config_command_length = 0;
++
++
++class BleConfigCallbacks: public BLECharacteristicCallbacks {
++ public:
++  void onWrite(BLECharacteristic* characteristic) override {
++    if (!characteristic) return;
++    const std::string value = characteristic->getValue();
++    for (char c : value) {
++      if (c == '\r') continue;
++      if (c == '\n') {
++        ble_config_command[ble_config_command_length] = '\0';
++        if (ble_config_command_length > 0) {
++          processBleConfigCommand(ble_config_command);
++        }
++        ble_config_command_length = 0;
++        continue;
++      }
++      if (ble_config_command_length + 1 >= BLE_CONFIG_COMMAND_MAX) {
++        ble_config_command_length = 0;
++        processBleConfigCommand("__OVERFLOW__");
++        continue;
++      }
++      ble_config_command[ble_config_command_length++] = c;
++    }
++  }
++};
++
+ class MyServerCallbacks: public BLEServerCallbacks {
+     void onConnect(BLEServer* server) override {
+         (void)server;
+@@ -537,29 +582,51 @@
+     tracker_config, EquineConfig::DeviceRole::TRACKER, 1);
+ }
+ 
++
++bool readTrackerProvisionedFlag(bool default_value) {
++  if (!configPrefs.begin(EquineConfig::CONFIG_NAMESPACE, true)) {
++    return default_value;
++  }
++  const bool result = configPrefs.getBool(
++    EquineConfigApi::PROVISIONED_KEY, default_value);
++  configPrefs.end();
++  return result;
++}
++
++void writeTrackerProvisionedFlag(bool provisioned) {
++  if (!configPrefs.begin(EquineConfig::CONFIG_NAMESPACE, false)) return;
++  configPrefs.putBool(EquineConfigApi::PROVISIONED_KEY, provisioned);
++  configPrefs.end();
++}
++
+ bool loadTrackerConfig() {
+   const char* source = "active";
++  bool created_factory = false;
+   if (!readTrackerConfigBlob(
+         EquineConfig::ACTIVE_CONFIG_KEY, tracker_config)) {
+     source = "backup";
+     if (!readTrackerConfigBlob(
+           EquineConfig::BACKUP_CONFIG_KEY, tracker_config)) {
+       source = "factory/migrated";
++      created_factory = true;
+       makeTrackerFactoryConfig();
+       if (!saveTrackerConfig(false)) return false;
++      writeTrackerProvisionedFlag(false);
+     } else {
+       // Repair the active slot from the valid rollback copy.
+       writeTrackerConfigBlob(EquineConfig::ACTIVE_CONFIG_KEY, tracker_config);
+     }
+   }
+ 
++  tracker_onboarding_required = !readTrackerProvisionedFlag(!created_factory);
+   applyTrackerConfigRuntimeState();
+-  logPrintf("Loaded tracker config from %s: schema=%u revision=%lu id=%s name=%s.\n",
++  logPrintf("Loaded tracker config from %s: schema=%u revision=%lu id=%s name=%s onboarding=%s.\n",
+             source,
+             tracker_config.header.schema_version,
+             (unsigned long)tracker_config.header.revision,
+             tracker_config.device_id,
+-            tracker_config.device_name);
++            tracker_config.device_name,
++            tracker_onboarding_required ? "required" : "complete");
+   return true;
+ }
+ 
+@@ -570,6 +637,376 @@
+   }
+ }
+ 
++
++bool commitTrackerConfigCandidate(
++    EquineConfig::TrackerConfigV1 candidate,
++    bool mark_provisioned,
++    char* error,
++    size_t error_size) {
++  const uint32_t next_revision =
++    tracker_config.header.revision < UINT32_MAX
++      ? tracker_config.header.revision + 1
++      : tracker_config.header.revision;
++  EquineConfig::finalize(
++    candidate, EquineConfig::DeviceRole::TRACKER, next_revision);
++  if (!EquineConfig::validateTrackerConfig(candidate)) {
++    snprintf(error, error_size, "candidate violates cross-field validation");
++    return false;
++  }
++
++  const EquineConfig::TrackerConfigV1 previous = tracker_config;
++  tracker_config = candidate;
++  if (!saveTrackerConfig(false)) {
++    tracker_config = previous;
++    applyTrackerConfigRuntimeState();
++    snprintf(error, error_size, "failed to write active configuration");
++    return false;
++  }
++
++  if (mark_provisioned) {
++    writeTrackerProvisionedFlag(true);
++    tracker_onboarding_required = false;
++  }
++  return true;
++}
++
++bool rollbackTrackerConfig(char* error, size_t error_size) {
++  EquineConfig::TrackerConfigV1 backup{};
++  if (!readTrackerConfigBlob(EquineConfig::BACKUP_CONFIG_KEY, backup)) {
++    snprintf(error, error_size, "no valid rollback configuration");
++    return false;
++  }
++  return commitTrackerConfigCandidate(backup, true, error, error_size);
++}
++
++String trackerConfigJson() {
++  using EquineConfigApi::appendJsonEscaped;
++  char hash_text[17];
++  EquineProtocol::formatDeviceHash(
++    TRACKER_DEVICE_HASH, hash_text, sizeof(hash_text));
++
++  String out;
++  out.reserve(3600);
++  out = "{\"api_version\":" + String(EquineConfigApi::API_VERSION) +
++        ",\"role\":\"tracker\",\"config_schema\":" +
++        String(tracker_config.header.schema_version) +
++        ",\"revision\":" + String(tracker_config.header.revision) +
++        ",\"onboarding_required\":" +
++        String(tracker_onboarding_required ? "true" : "false") +
++        ",\"device_id\":\"";
++  appendJsonEscaped(out, tracker_config.device_id);
++  out += "\",\"device_name\":\"";
++  appendJsonEscaped(out, tracker_config.device_name);
++  out += "\",\"device_hash\":\"" + String(hash_text) +
++         "\",\"wifi_ssid\":\"";
++  appendJsonEscaped(out, tracker_config.wifi_ssid);
++  out += "\",\"wifi_password_set\":" +
++         String(tracker_config.wifi_password[0] ? "true" : "false") +
++         ",\"ble_debug_enabled\":" +
++         String(tracker_config.ble_debug_enabled ? "true" : "false") +
++         ",\"battery_sense_enabled\":" +
++         String(tracker_config.battery_sense_enabled ? "true" : "false") +
++         ",\"lora\":{" +
++         String("\"frequency_hz\":") + String(tracker_config.lora.frequency_hz) +
++         ",\"bandwidth_hz\":" + String(tracker_config.lora.bandwidth_hz) +
++         ",\"tx_power_dbm\":" + String(tracker_config.lora.tx_power_dbm) +
++         ",\"sf\":" + String(tracker_config.lora.spreading_factor) +
++         ",\"coding_rate\":" + String(tracker_config.lora.coding_rate_denominator) +
++         ",\"preamble_length\":" + String(tracker_config.lora.preamble_length) +
++         ",\"sync_word\":" + String(tracker_config.lora.sync_word) + "}";
++  out += ",\"communication\":{";
++  out += "\"tx_interval_s\":" + String(tracker_config.lora_tx_interval_s) +
++         ",\"tx_min_points\":" + String(tracker_config.lora_tx_min_points) +
++         ",\"ack_timeout_ms\":" + String(tracker_config.lora_ack_timeout_ms) +
++         ",\"retry_backoff_s\":[";
++  for (uint8_t i = 0; i < 4; i++) {
++    if (i) out += ',';
++    out += String(tracker_config.lora_retry_backoff_s[i]);
++  }
++  out += "]}";
++  out += ",\"gps\":{";
++  out += "\"min_distance_m\":" + String(tracker_config.min_distance_m, 2) +
++         ",\"min_speed_kmph\":" + String(tracker_config.min_speed_kmph, 2) +
++         ",\"max_hdop\":" + String(tracker_config.max_hdop, 2) +
++         ",\"min_satellites\":" + String(tracker_config.min_satellites) +
++         ",\"max_speed_mps\":" + String(tracker_config.max_speed_mps, 2) +
++         ",\"max_fix_age_s\":" + String(tracker_config.max_fix_age_s) +
++         ",\"timeouts_ms\":[";
++  for (uint8_t i = 0; i < 4; i++) {
++    if (i) out += ',';
++    out += String(tracker_config.gps_timeout_ms[i]);
++  }
++  out += "],\"full_retry_interval_s\":" +
++         String(tracker_config.gps_full_retry_interval_s) +
++         ",\"initial_listen_ms\":" + String(tracker_config.gps_initial_listen_ms) +
++         ",\"light_sleep_chunk_ms\":" + String(tracker_config.gps_light_sleep_chunk_ms) +
++         ",\"listen_window_ms\":" + String(tracker_config.gps_listen_window_ms) + "}";
++  out += ",\"movement\":{";
++  out += "\"speed_threshold_kmph\":" +
++         String(tracker_config.movement_speed_threshold_kmph, 2) +
++         ",\"displacement_threshold_m\":" +
++         String(tracker_config.movement_displacement_threshold_m, 2) +
++         ",\"evidence_distance_m\":" +
++         String(tracker_config.movement_evidence_distance_m, 2) +
++         ",\"evidence_step_m\":" +
++         String(tracker_config.movement_evidence_step_m, 2) +
++         ",\"direction_tolerance_deg\":" +
++         String(tracker_config.movement_direction_tolerance_deg, 1) +
++         ",\"evidence_required\":" +
++         String(tracker_config.movement_evidence_required) + "}";
++  out += ",\"storage\":{";
++  out += "\"history_point_spacing_m\":" +
++         String(tracker_config.history_point_spacing_m, 2) +
++         ",\"save_distance_threshold_m\":" +
++         String(tracker_config.save_distance_threshold_m, 2) +
++         ",\"nvs_save_interval_s\":" +
++         String(tracker_config.nvs_save_interval_s) + "}";
++  out += ",\"sleep\":{";
++  out += "\"moving_s\":" + String(tracker_config.moving_sleep_s) +
++         ",\"stationary_s\":" + String(tracker_config.stationary_sleep_s) +
++         ",\"long_stationary_s\":" + String(tracker_config.long_stationary_sleep_s) +
++         ",\"no_fix_s\":[";
++  for (uint8_t i = 0; i < 4; i++) {
++    if (i) out += ',';
++    out += String(tracker_config.no_fix_sleep_s[i]);
++  }
++  out += "],\"stationary_fixes_for_long_sleep\":" +
++         String(tracker_config.stationary_fixes_for_long_sleep) +
++         ",\"stationary_fixes_for_max_sleep\":" +
++         String(tracker_config.stationary_fixes_for_max_sleep) + "}}";
++  return out;
++}
++
++void sendBleConfigText(const String& response) {
++  if (!deviceConnected || !pTxCharacteristic) return;
++  // 18-byte pieces remain valid with the default 23-byte BLE MTU. The newline
++  // terminates one response; app clients concatenate notifications until then.
++  String framed = response;
++  if (framed.length() == 0 || framed.c_str()[framed.length() - 1] != '\n') {
++    framed += '\n';
++  }
++  constexpr size_t payload_size = 18;
++  for (size_t offset = 0; offset < framed.length(); offset += payload_size) {
++    const size_t length = min(payload_size, framed.length() - offset);
++    pTxCharacteristic->setValue(
++      reinterpret_cast<uint8_t*>(const_cast<char*>(framed.c_str() + offset)),
++      length);
++    pTxCharacteristic->notify();
++    delay(8);
++  }
++}
++
++void sendBleConfigError(const char* code, const char* detail) {
++  String out = "{\"ok\":false,\"error\":\"";
++  EquineConfigApi::appendJsonEscaped(out, code);
++  out += "\",\"detail\":\"";
++  EquineConfigApi::appendJsonEscaped(out, detail);
++  out += "\"}";
++  sendBleConfigText(out);
++}
++
++bool applyTrackerUrlPatch(char* encoded,
++                          uint32_t& expected_revision,
++                          bool& reboot_requested,
++                          EquineConfigApi::PatchStatus& status,
++                          EquineConfig::TrackerConfigV1& candidate) {
++  bool has_revision = false;
++  char parse_error[EquineConfigApi::ERROR_SIZE] = {};
++  const bool parsed = EquineConfigApi::forEachUrlEncodedPair(
++    encoded,
++    [&](const char* key, const char* value) {
++      if (strcmp(key, "expected_revision") == 0) {
++        has_revision = EquineConfigApi::parseUnsigned(
++          value, 1, UINT32_MAX, expected_revision);
++        if (!has_revision) {
++          EquineConfigApi::setError(status, key, "invalid revision");
++          return false;
++        }
++        return true;
++      }
++      if (strcmp(key, "reboot") == 0) {
++        uint8_t parsed_bool = 0;
++        if (!EquineConfigApi::parseBool(value, parsed_bool)) {
++          EquineConfigApi::setError(status, key, "invalid boolean");
++          return false;
++        }
++        reboot_requested = parsed_bool != 0;
++        return true;
++      }
++      if (EquineConfigApi::isControlField(key)) return true;
++      const auto result = EquineConfigApi::applyTrackerField(
++        candidate, key, value, status);
++      if (result == EquineConfigApi::FieldResult::UNKNOWN) {
++        EquineConfigApi::setError(status, key, "unknown setting");
++        return false;
++      }
++      return result == EquineConfigApi::FieldResult::APPLIED;
++    },
++    parse_error, sizeof(parse_error));
++  if (!parsed && status.error[0] == '\0') {
++    strlcpy(status.error, parse_error, sizeof(status.error));
++  }
++  if (!parsed) return false;
++  if (!has_revision) {
++    EquineConfigApi::setError(status, "expected_revision", "required");
++    return false;
++  }
++  return true;
++}
++
++bool applyTrackerWebPatch(EquineConfigApi::PatchStatus& status,
++                          bool& reboot_requested) {
++  EquineConfig::TrackerConfigV1 candidate = tracker_config;
++  uint32_t expected_revision = 0;
++  bool has_revision = false;
++  const int argument_count = webServer.args();
++  for (int i = 0; i < argument_count; i++) {
++    const String key_string = webServer.argName(i);
++    const String value_string = webServer.arg(i);
++    const char* key = key_string.c_str();
++    const char* value = value_string.c_str();
++    if (strcmp(key, "expected_revision") == 0) {
++      has_revision = EquineConfigApi::parseUnsigned(
++        value, 1, UINT32_MAX, expected_revision);
++      if (!has_revision) {
++        EquineConfigApi::setError(status, key, "invalid revision");
++        return false;
++      }
++      continue;
++    }
++    if (strcmp(key, "reboot") == 0) {
++      uint8_t parsed = 0;
++      if (!EquineConfigApi::parseBool(value, parsed)) {
++        EquineConfigApi::setError(status, key, "invalid boolean");
++        return false;
++      }
++      reboot_requested = parsed != 0;
++      continue;
++    }
++    if (EquineConfigApi::isControlField(key)) continue;
++    const auto result = EquineConfigApi::applyTrackerField(
++      candidate, key, value, status);
++    if (result == EquineConfigApi::FieldResult::UNKNOWN) {
++      EquineConfigApi::setError(status, key, "unknown setting");
++      return false;
++    }
++    if (result == EquineConfigApi::FieldResult::INVALID) return false;
++  }
++  if (!has_revision) {
++    EquineConfigApi::setError(status, "expected_revision", "required");
++    return false;
++  }
++  if (expected_revision != tracker_config.header.revision) {
++    snprintf(status.error, sizeof(status.error),
++             "revision conflict: current=%lu",
++             (unsigned long)tracker_config.header.revision);
++    return false;
++  }
++  if (!status.changed) {
++    if (tracker_onboarding_required) {
++      writeTrackerProvisionedFlag(true);
++      tracker_onboarding_required = false;
++    }
++    return true;
++  }
++  return commitTrackerConfigCandidate(
++    candidate, true, status.error, sizeof(status.error));
++}
++
++void processBleConfigCommand(const char* command) {
++  if (!command) return;
++  if (strcmp(command, "__OVERFLOW__") == 0) {
++    sendBleConfigError("command_too_large", "maximum is 1535 bytes");
++    return;
++  }
++  if (strcmp(command, "HELLO") == 0) {
++    String out = "{\"ok\":true,\"api_version\":" +
++      String(EquineConfigApi::API_VERSION) +
++      ",\"role\":\"tracker\",\"revision\":" +
++      String(tracker_config.header.revision) +
++      ",\"onboarding_required\":" +
++      String(tracker_onboarding_required ? "true" : "false") + "}";
++    sendBleConfigText(out);
++    return;
++  }
++  if (strcmp(command, "GET CONFIG") == 0) {
++    sendBleConfigText(trackerConfigJson());
++    return;
++  }
++  if (strncmp(command, "PATCH ", 6) == 0) {
++    const size_t length = strlen(command + 6);
++    if (length >= BLE_CONFIG_COMMAND_MAX) {
++      sendBleConfigError("command_too_large", "patch exceeds buffer");
++      return;
++    }
++    char encoded[BLE_CONFIG_COMMAND_MAX];
++    memcpy(encoded, command + 6, length + 1);
++    EquineConfigApi::PatchStatus status;
++    EquineConfig::TrackerConfigV1 candidate = tracker_config;
++    uint32_t expected_revision = 0;
++    bool reboot = false;
++    if (!applyTrackerUrlPatch(encoded, expected_revision, reboot,
++                              status, candidate)) {
++      sendBleConfigError("invalid_patch", status.error);
++      return;
++    }
++    if (expected_revision != tracker_config.header.revision) {
++      char detail[96];
++      snprintf(detail, sizeof(detail), "revision conflict: current=%lu",
++               (unsigned long)tracker_config.header.revision);
++      sendBleConfigError("revision_conflict", detail);
++      return;
++    }
++    if (status.changed) {
++      if (!commitTrackerConfigCandidate(
++            candidate, true, status.error, sizeof(status.error))) {
++        sendBleConfigError("commit_failed", status.error);
++        return;
++      }
++    } else if (tracker_onboarding_required) {
++      writeTrackerProvisionedFlag(true);
++      tracker_onboarding_required = false;
++    }
++    const bool needs_reboot = status.reboot_required || reboot;
++    String out = "{\"ok\":true,\"revision\":" +
++      String(tracker_config.header.revision) +
++      ",\"changed\":" + String(status.changed ? "true" : "false") +
++      ",\"reboot_required\":" +
++      String(needs_reboot ? "true" : "false") + "}";
++    sendBleConfigText(out);
++    config_reboot_requested |= needs_reboot;
++    return;
++  }
++  if (strncmp(command, "ROLLBACK ", 9) == 0) {
++    uint32_t expected = 0;
++    if (!EquineConfigApi::parseUnsigned(command + 9, 1, UINT32_MAX, expected) ||
++        expected != tracker_config.header.revision) {
++      sendBleConfigError("revision_conflict", "send current revision");
++      return;
++    }
++    char error[EquineConfigApi::ERROR_SIZE] = {};
++    if (!rollbackTrackerConfig(error, sizeof(error))) {
++      sendBleConfigError("rollback_failed", error);
++      return;
++    }
++    sendBleConfigText("{\"ok\":true,\"reboot_required\":true}");
++    config_reboot_requested = true;
++    return;
++  }
++  if (strcmp(command, "FACTORY_RESET FACTORY_RESET") == 0) {
++    sendBleConfigText("{\"ok\":true,\"factory_reset\":true}");
++    config_factory_reset_requested = true;
++    return;
++  }
++  if (strcmp(command, "REBOOT") == 0) {
++    sendBleConfigText("{\"ok\":true,\"rebooting\":true}");
++    config_reboot_requested = true;
++    return;
++  }
++  sendBleConfigError("unknown_command",
++    "use HELLO, GET CONFIG, PATCH, ROLLBACK, FACTORY_RESET or REBOOT");
++}
++
+ void stopBleDebug() {
+   if (!ble_initialized) {
+     ble_connection_window_active = false;
+@@ -585,19 +1022,24 @@
+   BLEDevice::deinit(true);
+   pServer = NULL;
+   pTxCharacteristic = NULL;
++  pRxCharacteristic = NULL;
+   deviceConnected = false;
+   debug_mode = false;
+   ble_initialized = false;
+   ble_advertising = false;
+   ble_connection_window_active = false;
++  ble_provisioning_mode = false;
++  ble_config_command_length = 0;
+ }
+ 
+-void startBleDebugWindow(uint32_t duration_ms) {
+-  if (!ble_debug_enabled) return;
++void startBleDebugWindow(uint32_t duration_ms, bool force_provisioning) {
++  if (!ble_debug_enabled && !force_provisioning) return;
++  ble_provisioning_mode = force_provisioning;
+ 
+   if (!ble_initialized) {
+-    logPrintln("Starting bounded BLE debug window...");
+-    BLEDevice::init("EquineTracker");
++    logPrintln("Starting bounded BLE/configuration window...");
++    String ble_name = "EqTrk-" + String(TRACKER_ID);
++    BLEDevice::init(ble_name.c_str());
+     pServer = BLEDevice::createServer();
+     pServer->setCallbacks(new MyServerCallbacks());
+ 
+@@ -608,11 +1050,11 @@
+     );
+     pTxCharacteristic->addDescriptor(new BLE2902());
+ 
+-    BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(
++    pRxCharacteristic = pService->createCharacteristic(
+       CHARACTERISTIC_UUID_RX,
+       BLECharacteristic::PROPERTY_WRITE
+     );
+-    (void)pRxCharacteristic;
++    pRxCharacteristic->setCallbacks(new BleConfigCallbacks());
+ 
+     pService->start();
+     BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+@@ -1132,8 +1574,12 @@
+   String savedPw = String(tracker_config.wifi_password);
+   ble_debug_enabled = tracker_config.ble_debug_enabled != 0;
+ 
++  // Configuration BLE is available during an explicit setup/onboarding session
++  // even when ordinary BLE debug logging is disabled.
++  startBleDebugWindow(tracker_onboarding_required ? 600000UL : 120000UL, true);
++
+   bool connected = false;
+-  if (savedSsid.length() > 0) {
++  if (savedSsid.length() > 0 && !tracker_onboarding_required) {
+     for (uint8_t attempt = 1; attempt <= WIFI_MAX_CONNECT_ATTEMPTS && !connected; attempt++) {
+       wifi_connect_attempt = attempt;
+       setTrackerPhase("WiFi connect");
+@@ -1184,14 +1630,17 @@
+     logPrintln("Starting fallback AP mode...");
+     WiFi.disconnect(false, false);
+     WiFi.mode(WIFI_AP);
+-    if (WiFi.softAP("EquineTracker", "WannWieviel!4")) {
++    String onboarding_ap = "EquineTracker-" + String(TRACKER_ID);
++    if (WiFi.softAP(onboarding_ap.c_str(), EQUINE_ONBOARDING_AP_PASSWORD)) {
+       wifi_ap_active = true;
+       wifi_station_connected = false;
+       responsiveDelay(500);
+       last_wifi_ip = WiFi.softAPIP().toString();
+       last_wifi_rssi = 0;
+       setLastError(savedSsid.length() > 0 ? "STA failed; fallback AP" : "No SSID; fallback AP");
+-      logPrintln("AP started. IP: " + last_wifi_ip);
++      logPrintf("AP '%s' started at %s (setup password: %s).\n",
++                onboarding_ap.c_str(), last_wifi_ip.c_str(),
++                EQUINE_ONBOARDING_AP_PASSWORD);
+     } else {
+       setLastError("Fallback AP failed");
+       logPrintln("Fallback AP failed.");
+@@ -1205,82 +1654,167 @@
+   webServer.on("/", HTTP_GET, []() {
+     wifi_client_connected = true;
+     last_web_activity_ms = millis();
+-    logPrintln("Web UI accessed by a client.");
+-    String html = "<html><head><title>Equine Tracker</title><meta name='viewport' content='width=device-width, initial-scale=1'>";
+-    html += "<style>body{font-family:sans-serif;margin:20px;} input[type=text],input[type=password]{padding:8px;width:100%;box-sizing:border-box;}</style></head><body>";
+-    html += "<h1>" + String(TRACKER_NAME) + " Tracker Setup</h1>";
+-    html += "<p>Config schema " + String(tracker_config.header.schema_version) +
+-            ", revision " + String(tracker_config.header.revision) +
+-            ", ID <code>" + String(TRACKER_ID) + "</code></p>";
++    logPrintln("Web onboarding UI accessed by a client.");
++    String html;
++    html.reserve(7000);
++    html = "<html><head><title>Equine Tracker</title><meta name='viewport' content='width=device-width,initial-scale=1'>";
++    html += "<style>body{font-family:sans-serif;margin:20px;max-width:760px}label{display:block;margin-top:12px}input{padding:8px;width:100%;box-sizing:border-box}button{margin-top:18px;padding:10px 16px}code,pre{background:#f4f4f4;padding:4px}small{color:#555}</style></head><body>";
++    html += "<h1>" + String(TRACKER_NAME) + " Tracker Onboarding</h1>";
++    html += "<p>Schema/revision: " + String(tracker_config.header.schema_version) +
++            "/" + String(tracker_config.header.revision) +
++            "<br>Status: <b>" +
++            String(tracker_onboarding_required ? "onboarding required" : "configured") +
++            "</b></p>";
+     html += "<form action='/save' method='POST'>";
+-    html += "SSID:<br><input type='text' name='ssid' value='" + String(tracker_config.wifi_ssid) + "'><br><br>";
+-    html += "Password:<br><input type='password' name='pw' value=''><br>";
+-    html += "<small>Leave blank to keep the stored password.</small><br><br>";
+-    html += "<input type='checkbox' name='ble_log' value='1' ";
+-    if(ble_debug_enabled) html += "checked";
+-    html += "> Enable BLE Debug Logs<br>";
+-    html += "<small style='color:red;'><b>Warning:</b> BLE debugging is opened only in a bounded connection window; a connected client keeps the tracker awake.</small><br><br>";
+-    html += "<input type='submit' value='Save Settings' style='padding:10px;background:#007BFF;color:white;border:none;border-radius:4px;'></form>";
+-    html += "<hr><form action='/start' method='POST'><input type='submit' value='Turn Off WiFi & Start Tracking' style='padding:10px;background:#28A745;color:white;border:none;border-radius:4px;width:100%;'></form>";
+-    html += "<hr><h3>Live Logs</h3><pre id='logs' style='background:#f4f4f4;padding:10px;max-height:300px;overflow-y:auto;'>Loading...</pre>";
+-    html += "<script>setInterval(function(){ fetch('/logs').then(r=>r.text()).then(t=>document.getElementById('logs').innerText=t); }, 2000);</script>";
++    html += "<input type='hidden' name='expected_revision' value='" +
++            String(tracker_config.header.revision) + "'>";
++    html += "<label>Tracker ID<input name='device_id' value='" +
++            String(tracker_config.device_id) + "'></label>";
++    html += "<label>Name<input name='device_name' value='" +
++            String(tracker_config.device_name) + "'></label>";
++    html += "<label>Wi-Fi SSID<input name='wifi_ssid' value='" +
++            String(tracker_config.wifi_ssid) + "'></label>";
++    html += "<label>Wi-Fi password<input type='password' name='wifi_password' value='";
++    html += EquineConfigApi::KEEP_SECRET;
++    html += "'></label><small>Leave as __KEEP__ to preserve it; use __CLEAR__ to erase it.</small>";
++    html += "<label><input style='width:auto' type='checkbox' name='ble_debug_enabled' value='1' ";
++    if (tracker_config.ble_debug_enabled) html += "checked";
++    html += "> Enable bounded BLE debug logging</label>";
++    html += "<label>Moving interval (s)<input type='number' name='moving_sleep_s' value='" +
++            String(tracker_config.moving_sleep_s) + "'></label>";
++    html += "<label>Stationary interval (s)<input type='number' name='stationary_sleep_s' value='" +
++            String(tracker_config.stationary_sleep_s) + "'></label>";
++    html += "<label>Maximum HDOP<input name='max_hdop' value='" +
++            String(tracker_config.max_hdop, 2) + "'></label>";
++    html += "<label>Minimum satellites<input type='number' name='min_satellites' value='" +
++            String(tracker_config.min_satellites) + "'></label>";
++    html += "<label>LoRa spreading factor<input type='number' name='lora_sf' value='" +
++            String(tracker_config.lora.spreading_factor) + "'></label>";
++    html += "<input type='hidden' name='reboot' value='1'>";
++    html += "<button type='submit'>Validate, save and reboot</button></form>";
++    html += "<p>The complete transactional API is available at <code>GET/POST /api/v1/config</code>. POST bodies use <code>application/x-www-form-urlencoded</code> and must include <code>expected_revision</code>.</p>";
++    html += "<form action='/start' method='POST'><button>Close setup and start tracking</button></form>";
++    html += "<h3>Live logs</h3><pre id='logs'>Loading...</pre>";
++    html += "<script>setInterval(()=>fetch('/logs').then(r=>r.text()).then(t=>document.getElementById('logs').innerText=t),2000)</script>";
+     html += "</body></html>";
+     webServer.send(200, "text/html", html);
+   });
+ 
++  // Compatibility HTML form. It uses the same transactional candidate/validate
++  // path as the REST and BLE transports.
+   webServer.on("/save", HTTP_POST, []() {
+     wifi_client_connected = true;
+     last_web_activity_ms = millis();
+-    String newSsid = webServer.arg("ssid");
+-    String newPw = webServer.arg("pw");
+-    bool newBle = webServer.hasArg("ble_log");
+-    strlcpy(tracker_config.wifi_ssid, newSsid.c_str(),
+-            sizeof(tracker_config.wifi_ssid));
+-    if (newPw.length() > 0) {
+-      strlcpy(tracker_config.wifi_password, newPw.c_str(),
+-              sizeof(tracker_config.wifi_password));
+-    }
+-    tracker_config.ble_debug_enabled = newBle ? 1 : 0;
+-    if (!saveTrackerConfig(true)) {
+-      webServer.send(500, "text/plain", "Configuration validation or save failed");
++    EquineConfig::TrackerConfigV1 candidate = tracker_config;
++    EquineConfigApi::PatchStatus status;
++    uint32_t expected = 0;
++    if (!EquineConfigApi::parseUnsigned(
++          webServer.arg("expected_revision").c_str(), 1, UINT32_MAX, expected) ||
++        expected != tracker_config.header.revision) {
++      webServer.send(409, "text/plain", "Configuration revision conflict; reload the page");
+       return;
+     }
+-    logPrintf("Versioned settings saved. BLE Debug is now: %s\n",
+-              newBle ? "ON" : "OFF");
+-    webServer.sendHeader("Location", "/");
+-    webServer.send(303);
++    const char* fields[] = {
++      "device_id", "device_name", "wifi_ssid", "wifi_password",
++      "moving_sleep_s", "stationary_sleep_s", "max_hdop",
++      "min_satellites", "lora_sf"
++    };
++    for (const char* field : fields) {
++      if (!webServer.hasArg(field)) continue;
++      const String value = webServer.arg(field);
++      const auto result = EquineConfigApi::applyTrackerField(
++        candidate, field, value.c_str(), status);
++      if (result != EquineConfigApi::FieldResult::APPLIED) {
++        webServer.send(400, "text/plain", status.error[0] ? status.error : "Invalid field");
++        return;
++      }
++    }
++    const auto ble_result = EquineConfigApi::applyTrackerField(
++      candidate, "ble_debug_enabled",
++      webServer.hasArg("ble_debug_enabled") ? "1" : "0", status);
++    if (ble_result == EquineConfigApi::FieldResult::INVALID ||
++        !commitTrackerConfigCandidate(
++          candidate, true, status.error, sizeof(status.error))) {
++      webServer.send(400, "text/plain", status.error[0] ? status.error : "Configuration validation failed");
++      return;
++    }
++    config_reboot_requested = true;
++    webServer.send(200, "text/html",
++      "Configuration saved and validated. The tracker will reboot shortly.");
++  });
++
++  webServer.on("/api/v1/onboarding", HTTP_GET, []() {
++    String out = "{\"api_version\":" + String(EquineConfigApi::API_VERSION) +
++      ",\"role\":\"tracker\",\"onboarding_required\":" +
++      String(tracker_onboarding_required ? "true" : "false") +
++      ",\"revision\":" + String(tracker_config.header.revision) +
++      ",\"transports\":[\"wifi\",\"ble_nus\"],\"config_post_content_type\":\"application/x-www-form-urlencoded\"}";
++    webServer.send(200, "application/json", out);
+   });
+ 
+   webServer.on("/api/v1/config", HTTP_GET, []() {
+-    char hash_text[17];
+-    EquineProtocol::formatDeviceHash(
+-      TRACKER_DEVICE_HASH, hash_text, sizeof(hash_text));
+-    char json[768];
+-    const int written = snprintf(
+-      json, sizeof(json),
+-      "{\"config_schema\":%u,\"revision\":%lu,"
+-      "\"device_id\":\"%s\",\"device_name\":\"%s\","
+-      "\"device_hash\":\"%s\",\"ble_debug_enabled\":%s,"
+-      "\"moving_sleep_s\":%lu,\"stationary_sleep_s\":%lu,"
+-      "\"long_stationary_sleep_s\":%lu,\"max_hdop\":%.2f,"
+-      "\"min_satellites\":%u,\"lora_frequency_hz\":%lu,"
+-      "\"lora_sf\":%u,\"lora_bandwidth_hz\":%lu}",
+-      tracker_config.header.schema_version,
+-      (unsigned long)tracker_config.header.revision,
+-      tracker_config.device_id, tracker_config.device_name, hash_text,
+-      ble_debug_enabled ? "true" : "false",
+-      (unsigned long)tracker_config.moving_sleep_s,
+-      (unsigned long)tracker_config.stationary_sleep_s,
+-      (unsigned long)tracker_config.long_stationary_sleep_s,
+-      tracker_config.max_hdop, tracker_config.min_satellites,
+-      (unsigned long)tracker_config.lora.frequency_hz,
+-      tracker_config.lora.spreading_factor,
+-      (unsigned long)tracker_config.lora.bandwidth_hz);
+-    if (written <= 0 || written >= (int)sizeof(json)) {
+-      webServer.send(500, "text/plain", "Configuration JSON overflow");
+-    } else {
+-      webServer.send(200, "application/json", json);
++    webServer.send(200, "application/json", trackerConfigJson());
++  });
++
++  webServer.on("/api/v1/config", HTTP_POST, []() {
++    wifi_client_connected = true;
++    last_web_activity_ms = millis();
++    EquineConfigApi::PatchStatus status;
++    bool reboot = false;
++    if (!applyTrackerWebPatch(status, reboot)) {
++      const int code = strstr(status.error, "revision conflict") ? 409 : 400;
++      String out = "{\"ok\":false,\"error\":\"";
++      EquineConfigApi::appendJsonEscaped(out, status.error);
++      out += "\",\"current_revision\":" +
++             String(tracker_config.header.revision) + "}";
++      webServer.send(code, "application/json", out);
++      return;
++    }
++    const bool needs_reboot = status.reboot_required || reboot;
++    String out = "{\"ok\":true,\"revision\":" +
++      String(tracker_config.header.revision) +
++      ",\"changed\":" + String(status.changed ? "true" : "false") +
++      ",\"reboot_required\":" + String(needs_reboot ? "true" : "false") + "}";
++    webServer.send(200, "application/json", out);
++    config_reboot_requested |= needs_reboot;
++  });
++
++  webServer.on("/api/v1/config/rollback", HTTP_POST, []() {
++    uint32_t expected = 0;
++    if (!EquineConfigApi::parseUnsigned(
++          webServer.arg("expected_revision").c_str(), 1, UINT32_MAX, expected) ||
++        expected != tracker_config.header.revision) {
++      webServer.send(409, "application/json",
++        "{\"ok\":false,\"error\":\"revision_conflict\"}");
++      return;
++    }
++    char error[EquineConfigApi::ERROR_SIZE] = {};
++    if (!rollbackTrackerConfig(error, sizeof(error))) {
++      String out = "{\"ok\":false,\"error\":\"";
++      EquineConfigApi::appendJsonEscaped(out, error);
++      out += "\"}";
++      webServer.send(400, "application/json", out);
++      return;
++    }
++    webServer.send(200, "application/json",
++      "{\"ok\":true,\"reboot_required\":true}");
++    config_reboot_requested = true;
++  });
++
++  webServer.on("/api/v1/factory-reset", HTTP_POST, []() {
++    if (webServer.arg("confirm") != "FACTORY_RESET") {
++      webServer.send(400, "application/json",
++        "{\"ok\":false,\"error\":\"confirmation_required\"}");
++      return;
+     }
++    webServer.send(200, "application/json",
++      "{\"ok\":true,\"factory_reset\":true,\"onboarding_required_after_reboot\":true}");
++    config_factory_reset_requested = true;
++  });
++
++  webServer.on("/api/v1/reboot", HTTP_POST, []() {
++    webServer.send(200, "application/json", "{\"ok\":true,\"rebooting\":true}");
++    config_reboot_requested = true;
+   });
+ 
+   webServer.on("/start", HTTP_POST, []() {
+@@ -1312,10 +1846,12 @@
+   logPrintln("Ready for OTA or Web UI on port 80.");
+ 
+   const uint32_t ota_start_time = millis();
+-  const uint32_t timeout_window = 30000;
++  const uint32_t timeout_window =
++    tracker_onboarding_required ? 600000UL : 120000UL;
+ 
+   while (!force_tracking_mode) {
+     const uint32_t now = millis();
++    if (config_reboot_requested || config_factory_reset_requested) break;
+     const bool initial_setup_window = (uint32_t)(now - ota_start_time) < timeout_window;
+     const bool recent_web_activity = wifi_client_connected &&
+       (uint32_t)(now - last_web_activity_ms) < WEB_CLIENT_IDLE_TIMEOUT_MS;
+@@ -1348,8 +1884,20 @@
+   wifi_station_connected = false;
+   wifi_ap_active = false;
+   setTrackerPhase("WiFi off");
++  stopBleDebug();
+   delay(100);
+ 
++  if (config_factory_reset_requested) {
++    prefs.clear();
++    clearTrackerConfigStorage();
++    delay(250);
++    ESP.restart();
++  }
++  if (config_reboot_requested) {
++    delay(250);
++    ESP.restart();
++  }
++
+   if (!isDebugModeActive()) {
+     // Normal mode: the display is now allowed to sleep until the button is used.
+     display_on_until_ms = 0;
+@@ -2358,6 +2906,7 @@
+     // indicates an NVS write failure. Continue with the in-memory defaults.
+     makeTrackerFactoryConfig();
+     applyTrackerConfigRuntimeState();
++    tracker_onboarding_required = true;
+     logPrintln("Warning: running with unsaved factory tracker configuration.");
+   }
+ 
+@@ -2448,7 +2997,7 @@
+   }
+ 
+   if (hard_boot) {
+-    wifi_setup_requested = postBootButtonRequestsWifiSetup();
++    wifi_setup_requested = tracker_onboarding_required || postBootButtonRequestsWifiSetup();
+   }
+ 
+   // A button-only wake opens the status UI and, when enabled, a bounded BLE
+@@ -2511,7 +3060,7 @@
+ 
+   // BLE is on-demand and bounded. A connected client may deliberately keep
+   // the device awake; no connection means BLE is shut down before tracking.
+-  if (hard_boot && ble_debug_enabled && !deviceConnected) {
++  if (hard_boot && !tracker_onboarding_required && ble_debug_enabled && !deviceConnected) {
+     startBleDebugWindow(BLE_CONNECTION_WINDOW_MS);
+     waitForBleConnectionWindow();
+   }
+@@ -2949,6 +3498,19 @@
+ 
+   serviceDisplayAndButton();
+ 
++  if (config_factory_reset_requested) {
++    stopBleDebug();
++    prefs.clear();
++    clearTrackerConfigStorage();
++    delay(250);
++    ESP.restart();
++  }
++  if (config_reboot_requested) {
++    stopBleDebug();
++    delay(250);
++    ESP.restart();
++  }
++
+   // Execute BLE lifecycle transitions only from the main loop, never from the
+   // button callback path. Disabling immediately returns to one normal tracking
+   // cycle and then deep sleep. Enabling performs a short deep-sleep reset so
+--- /mnt/data/equine_gateway_config_v3.ino	2026-07-15 08:39:44.035448654 +0000
++++ /mnt/data/equine_gateway_onboarding_v4.ino	2026-07-15 09:08:03.536053833 +0000
+@@ -12,6 +12,7 @@
+ #include "secrets.h"
+ #include "equine_protocol.h"
+ #include "equine_config.h"
++#include "equine_config_api.h"
+ 
+ // ==========================================
+ // VERSIONED PERSISTENT GATEWAY CONFIGURATION
+@@ -19,6 +20,23 @@
+ EquineConfig::GatewayConfigV1 gateway_config{};
+ Preferences configPrefs;
+ 
++#define USER_BTN_PIN 0
++#ifndef EQUINE_ONBOARDING_AP_PASSWORD
++#define EQUINE_ONBOARDING_AP_PASSWORD "EquineSetup!"
++#endif
++
++bool gateway_onboarding_required = false;
++bool gateway_config_mode = false;
++bool gateway_ap_active = false;
++bool gateway_config_reboot_requested = false;
++bool gateway_factory_reset_requested = false;
++uint32_t gateway_config_mode_deadline_ms = 0;
++String gateway_network_ip = "off";
++bool gateway_button_previous = false;
++bool gateway_button_hold_handled = false;
++uint32_t gateway_button_press_start_ms = 0;
++
++
+ #define GATEWAY_ID                  (gateway_config.gateway_id)
+ #define GATEWAY_NAME                (gateway_config.gateway_name)
+ #define GATEWAY_TRACKER_COUNT       (tracker_runtime_count)
+@@ -316,27 +334,49 @@
+   return true;
+ }
+ 
++
++bool readGatewayProvisionedFlag(bool default_value) {
++  if (!configPrefs.begin(EquineConfig::CONFIG_NAMESPACE, true)) {
++    return default_value;
++  }
++  const bool result = configPrefs.getBool(
++    EquineConfigApi::PROVISIONED_KEY, default_value);
++  configPrefs.end();
++  return result;
++}
++
++void writeGatewayProvisionedFlag(bool provisioned) {
++  if (!configPrefs.begin(EquineConfig::CONFIG_NAMESPACE, false)) return;
++  configPrefs.putBool(EquineConfigApi::PROVISIONED_KEY, provisioned);
++  configPrefs.end();
++}
++
+ bool loadGatewayConfig() {
+   const char* source = "active";
++  bool created_factory = false;
+   if (!readGatewayConfigBlob(
+         EquineConfig::ACTIVE_CONFIG_KEY, gateway_config)) {
+     source = "backup";
+     if (!readGatewayConfigBlob(
+           EquineConfig::BACKUP_CONFIG_KEY, gateway_config)) {
+       source = "factory/migrated";
++      created_factory = true;
+       makeGatewayFactoryConfig();
+       if (!saveGatewayConfig(false)) return false;
++      writeGatewayProvisionedFlag(false);
+     } else {
+       writeGatewayConfigBlob(EquineConfig::ACTIVE_CONFIG_KEY, gateway_config);
+     }
+   }
+ 
+-  logPrintf("Loaded gateway config from %s: schema=%u revision=%lu id=%s trackers=%u.\n",
++  gateway_onboarding_required = !readGatewayProvisionedFlag(!created_factory);
++  logPrintf("Loaded gateway config from %s: schema=%u revision=%lu id=%s trackers=%u onboarding=%s.\n",
+             source,
+             gateway_config.header.schema_version,
+             (unsigned long)gateway_config.header.revision,
+             gateway_config.gateway_id,
+-            gateway_config.tracker_count);
++            gateway_config.tracker_count,
++            gateway_onboarding_required ? "required" : "complete");
+   return true;
+ }
+ 
+@@ -347,6 +387,178 @@
+   }
+ }
+ 
++
++bool commitGatewayConfigCandidate(
++    EquineConfig::GatewayConfigV1 candidate,
++    bool mark_provisioned,
++    char* error,
++    size_t error_size) {
++  const uint32_t next_revision =
++    gateway_config.header.revision < UINT32_MAX
++      ? gateway_config.header.revision + 1
++      : gateway_config.header.revision;
++  EquineConfig::finalize(
++    candidate, EquineConfig::DeviceRole::GATEWAY, next_revision);
++  if (!EquineConfig::validateGatewayConfig(candidate)) {
++    snprintf(error, error_size, "candidate violates cross-field validation");
++    return false;
++  }
++  const EquineConfig::GatewayConfigV1 previous = gateway_config;
++  gateway_config = candidate;
++  if (!saveGatewayConfig(false)) {
++    gateway_config = previous;
++    snprintf(error, error_size, "failed to write active configuration");
++    return false;
++  }
++  if (mark_provisioned) {
++    writeGatewayProvisionedFlag(true);
++    gateway_onboarding_required = false;
++  }
++  return true;
++}
++
++bool rollbackGatewayConfig(char* error, size_t error_size) {
++  EquineConfig::GatewayConfigV1 backup{};
++  if (!readGatewayConfigBlob(EquineConfig::BACKUP_CONFIG_KEY, backup)) {
++    snprintf(error, error_size, "no valid rollback configuration");
++    return false;
++  }
++  return commitGatewayConfigCandidate(backup, true, error, error_size);
++}
++
++String gatewayConfigJson() {
++  using EquineConfigApi::appendJsonEscaped;
++  String out;
++  out.reserve(5200);
++  out = "{\"api_version\":" + String(EquineConfigApi::API_VERSION) +
++        ",\"role\":\"gateway\",\"config_schema\":" +
++        String(gateway_config.header.schema_version) +
++        ",\"revision\":" + String(gateway_config.header.revision) +
++        ",\"onboarding_required\":" +
++        String(gateway_onboarding_required ? "true" : "false") +
++        ",\"config_mode\":" +
++        String(gateway_config_mode ? "true" : "false") +
++        ",\"gateway_id\":\"";
++  appendJsonEscaped(out, gateway_config.gateway_id);
++  out += "\",\"gateway_name\":\"";
++  appendJsonEscaped(out, gateway_config.gateway_name);
++  out += "\",\"gateway_hash\":\"" + String(gateway_hash_text) +
++         "\",\"wifi_ssid\":\"";
++  appendJsonEscaped(out, gateway_config.wifi_ssid);
++  out += "\",\"wifi_password_set\":" +
++         String(gateway_config.wifi_password[0] ? "true" : "false") +
++         ",\"network_ip\":\"" + gateway_network_ip +
++         "\",\"ap_active\":" + String(gateway_ap_active ? "true" : "false") +
++         ",\"mqtt\":{";
++  out += "\"host\":\"";
++  appendJsonEscaped(out, gateway_config.mqtt_host);
++  out += "\",\"port\":" + String(gateway_config.mqtt_port) +
++         ",\"tls_enabled\":" +
++         String(gateway_config.mqtt_tls_enabled ? "true" : "false") +
++         ",\"username\":\"";
++  appendJsonEscaped(out, gateway_config.mqtt_username);
++  out += "\",\"password_set\":" +
++         String(gateway_config.mqtt_password[0] ? "true" : "false") +
++         ",\"base_topic\":\"";
++  appendJsonEscaped(out, gateway_config.mqtt_base_topic);
++  out += "\",\"buffer_size\":" + String(gateway_config.mqtt_buffer_size) + "}";
++  out += ",\"lora\":{";
++  out += "\"frequency_hz\":" + String(gateway_config.lora.frequency_hz) +
++         ",\"bandwidth_hz\":" + String(gateway_config.lora.bandwidth_hz) +
++         ",\"tx_power_dbm\":" + String(gateway_config.lora.tx_power_dbm) +
++         ",\"sf\":" + String(gateway_config.lora.spreading_factor) +
++         ",\"coding_rate\":" + String(gateway_config.lora.coding_rate_denominator) +
++         ",\"preamble_length\":" + String(gateway_config.lora.preamble_length) +
++         ",\"sync_word\":" + String(gateway_config.lora.sync_word) + "}";
++  out += ",\"dedup_save_interval\":" + String(gateway_config.dedup_save_interval) +
++         ",\"wifi_retry_interval_ms\":" + String(gateway_config.wifi_retry_interval_ms) +
++         ",\"mqtt_retry_interval_ms\":" + String(gateway_config.mqtt_retry_interval_ms) +
++         ",\"trackers\":[";
++  for (uint8_t i = 0; i < gateway_config.tracker_count; i++) {
++    if (i) out += ',';
++    const auto& tracker = gateway_config.trackers[i];
++    char hash[17];
++    EquineProtocol::formatDeviceHash(
++      EquineProtocol::deviceIdHash(tracker.device_id), hash, sizeof(hash));
++    out += "{\"index\":" + String(i) + ",\"id\":\"";
++    appendJsonEscaped(out, tracker.device_id);
++    out += "\",\"name\":\"";
++    appendJsonEscaped(out, tracker.device_name);
++    out += "\",\"device_hash\":\"" + String(hash) +
++           "\",\"enabled\":" + String(tracker.enabled ? "true" : "false") +
++           ",\"accepts_legacy_lora\":" +
++           String(tracker.accepts_legacy_lora ? "true" : "false") +
++           ",\"publish_legacy_mqtt_aliases\":" +
++           String(tracker.publish_legacy_mqtt_aliases ? "true" : "false") + "}";
++  }
++  out += "]}";
++  return out;
++}
++
++bool applyGatewayWebPatch(EquineConfigApi::PatchStatus& status,
++                          bool& reboot_requested) {
++  EquineConfig::GatewayConfigV1 candidate = gateway_config;
++  uint32_t expected_revision = 0;
++  bool has_revision = false;
++  const int argument_count = webServer.args();
++  for (int i = 0; i < argument_count; i++) {
++    const String key_string = webServer.argName(i);
++    const String value_string = webServer.arg(i);
++    const char* key = key_string.c_str();
++    const char* value = value_string.c_str();
++    if (strcmp(key, "expected_revision") == 0) {
++      has_revision = EquineConfigApi::parseUnsigned(
++        value, 1, UINT32_MAX, expected_revision);
++      if (!has_revision) {
++        EquineConfigApi::setError(status, key, "invalid revision");
++        return false;
++      }
++      continue;
++    }
++    if (strcmp(key, "reboot") == 0) {
++      uint8_t parsed = 0;
++      if (!EquineConfigApi::parseBool(value, parsed)) {
++        EquineConfigApi::setError(status, key, "invalid boolean");
++        return false;
++      }
++      reboot_requested = parsed != 0;
++      continue;
++    }
++    if (EquineConfigApi::isControlField(key)) continue;
++    const auto result = EquineConfigApi::applyGatewayField(
++      candidate, key, value, status);
++    if (result == EquineConfigApi::FieldResult::UNKNOWN) {
++      EquineConfigApi::setError(status, key, "unknown setting");
++      return false;
++    }
++    if (result == EquineConfigApi::FieldResult::INVALID) return false;
++  }
++  if (!has_revision) {
++    EquineConfigApi::setError(status, "expected_revision", "required");
++    return false;
++  }
++  if (expected_revision != gateway_config.header.revision) {
++    snprintf(status.error, sizeof(status.error),
++             "revision conflict: current=%lu",
++             (unsigned long)gateway_config.header.revision);
++    return false;
++  }
++  if (!status.changed) {
++    if (gateway_onboarding_required) {
++      writeGatewayProvisionedFlag(true);
++      gateway_onboarding_required = false;
++    }
++    return true;
++  }
++  return commitGatewayConfigCandidate(
++    candidate, true, status.error, sizeof(status.error));
++}
++
++bool gatewayConfigWritesAllowed() {
++  return gateway_onboarding_required || gateway_config_mode;
++}
++
++
+ void buildDedupNamespace(uint64_t hash, char* output, size_t output_size) {
+   // ESP32 Preferences namespaces are limited to 15 characters. Keep 56 bits
+   // of the public hash, prefixed with 'd'. Registry collisions are checked at
+@@ -727,53 +939,120 @@
+       html += "</td></tr>";
+     }
+     html += "</table>";
++    html += "<h2>Configuration</h2><p>Write access: <b>" +
++            String(gatewayConfigWritesAllowed() ? "enabled" : "locked") +
++            "</b>. To unlock an already provisioned gateway, reboot it, release USER, then hold USER for 1.5 seconds during the serial prompt.</p>";
++    if (gatewayConfigWritesAllowed()) {
++      html += "<form action='/api/v1/config' method='POST'>";
++      html += "<input type='hidden' name='expected_revision' value='" + String(gateway_config.header.revision) + "'>";
++      html += "Gateway ID: <input name='gateway_id' value='" + String(gateway_config.gateway_id) + "'><br>";
++      html += "Name: <input name='gateway_name' value='" + String(gateway_config.gateway_name) + "'><br>";
++      html += "Wi-Fi SSID: <input name='wifi_ssid' value='" + String(gateway_config.wifi_ssid) + "'><br>";
++      html += "Wi-Fi password: <input type='password' name='wifi_password' value='__KEEP__'><br>";
++      html += "MQTT host: <input name='mqtt_host' value='" + String(gateway_config.mqtt_host) + "'><br>";
++      html += "MQTT port: <input name='mqtt_port' value='" + String(gateway_config.mqtt_port) + "'><br>";
++      html += "MQTT user: <input name='mqtt_username' value='" + String(gateway_config.mqtt_username) + "'><br>";
++      html += "MQTT password: <input type='password' name='mqtt_password' value='__KEEP__'><br>";
++      html += "<input type='hidden' name='reboot' value='1'><button>Validate, save and reboot</button></form>";
++    }
++    html += "<p>Full registry and radio configuration uses <code>POST /api/v1/config</code>; tracker fields are named <code>tracker.0.id</code>, <code>tracker.0.name</code>, and so on.</p>";
+     html += "<h2>Live logs</h2><pre id='logs'>Loading...</pre>";
+     html += "<script>setInterval(function(){fetch('/logs').then(r=>r.text()).then(t=>{let e=document.getElementById('logs');let a=Math.abs(e.scrollHeight-e.scrollTop-e.clientHeight)<5;e.innerText=t;if(a)e.scrollTop=e.scrollHeight;});},2000);</script>";
+     html += "</body></html>";
+     webServer.send(200, "text/html", html);
+   });
+ 
++  webServer.on("/api/v1/onboarding", HTTP_GET, []() {
++    String out = "{\"api_version\":" + String(EquineConfigApi::API_VERSION) +
++      ",\"role\":\"gateway\",\"onboarding_required\":" +
++      String(gateway_onboarding_required ? "true" : "false") +
++      ",\"config_mode\":" + String(gateway_config_mode ? "true" : "false") +
++      ",\"revision\":" + String(gateway_config.header.revision) +
++      ",\"transports\":[\"wifi\"],\"config_post_content_type\":\"application/x-www-form-urlencoded\"}";
++    webServer.send(200, "application/json", out);
++  });
++
+   webServer.on("/api/v1/config", HTTP_GET, []() {
+-    String out;
+-    out.reserve(3500);
+-    out = "{\"config_schema\":" +
+-          String(gateway_config.header.schema_version) +
+-          ",\"revision\":" + String(gateway_config.header.revision) +
+-          ",\"gateway_id\":\"" + String(gateway_config.gateway_id) +
+-          "\",\"gateway_name\":\"" + String(gateway_config.gateway_name) +
+-          "\",\"gateway_hash\":\"" + String(gateway_hash_text) +
+-          "\",\"mqtt_host\":\"" + String(gateway_config.mqtt_host) +
+-          "\",\"mqtt_port\":" + String(gateway_config.mqtt_port) +
+-          ",\"mqtt_tls_enabled\":" +
+-          String(gateway_config.mqtt_tls_enabled ? "true" : "false") +
+-          ",\"mqtt_base_topic\":\"" +
+-          String(gateway_config.mqtt_base_topic) +
+-          "\",\"lora_frequency_hz\":" +
+-          String(gateway_config.lora.frequency_hz) +
+-          ",\"lora_bandwidth_hz\":" +
+-          String(gateway_config.lora.bandwidth_hz) +
+-          ",\"lora_sf\":" +
+-          String(gateway_config.lora.spreading_factor) +
+-          ",\"configured_trackers\":[";
+-    bool first = true;
+-    for (uint8_t i = 0; i < gateway_config.tracker_count; i++) {
+-      const auto& tracker = gateway_config.trackers[i];
+-      if (!first) out += ',';
+-      first = false;
+-      char hash[17];
+-      EquineProtocol::formatDeviceHash(
+-        EquineProtocol::deviceIdHash(tracker.device_id), hash, sizeof(hash));
+-      out += "{\"id\":\"" + String(tracker.device_id) +
+-             "\",\"name\":\"" + String(tracker.device_name) +
+-             "\",\"device_hash\":\"" + String(hash) +
+-             "\",\"enabled\":" + String(tracker.enabled ? "true" : "false") +
+-             ",\"accepts_legacy_lora\":" +
+-             String(tracker.accepts_legacy_lora ? "true" : "false") +
+-             ",\"publish_legacy_mqtt_aliases\":" +
+-             String(tracker.publish_legacy_mqtt_aliases ? "true" : "false") + "}";
++    webServer.send(200, "application/json", gatewayConfigJson());
++  });
++
++  webServer.on("/api/v1/config", HTTP_POST, []() {
++    if (!gatewayConfigWritesAllowed()) {
++      webServer.send(403, "application/json",
++        "{\"ok\":false,\"error\":\"physical_config_mode_required\"}");
++      return;
+     }
+-    out += "]}";
++    EquineConfigApi::PatchStatus status;
++    bool reboot = false;
++    if (!applyGatewayWebPatch(status, reboot)) {
++      const int code = strstr(status.error, "revision conflict") ? 409 : 400;
++      String out = "{\"ok\":false,\"error\":\"";
++      EquineConfigApi::appendJsonEscaped(out, status.error);
++      out += "\",\"current_revision\":" +
++             String(gateway_config.header.revision) + "}";
++      webServer.send(code, "application/json", out);
++      return;
++    }
++    const bool needs_reboot = status.reboot_required || reboot;
++    String out = "{\"ok\":true,\"revision\":" +
++      String(gateway_config.header.revision) +
++      ",\"changed\":" + String(status.changed ? "true" : "false") +
++      ",\"reboot_required\":" + String(needs_reboot ? "true" : "false") + "}";
+     webServer.send(200, "application/json", out);
++    gateway_config_reboot_requested |= needs_reboot;
++  });
++
++  webServer.on("/api/v1/config/rollback", HTTP_POST, []() {
++    if (!gatewayConfigWritesAllowed()) {
++      webServer.send(403, "application/json",
++        "{\"ok\":false,\"error\":\"physical_config_mode_required\"}");
++      return;
++    }
++    uint32_t expected = 0;
++    if (!EquineConfigApi::parseUnsigned(
++          webServer.arg("expected_revision").c_str(), 1, UINT32_MAX, expected) ||
++        expected != gateway_config.header.revision) {
++      webServer.send(409, "application/json",
++        "{\"ok\":false,\"error\":\"revision_conflict\"}");
++      return;
++    }
++    char error[EquineConfigApi::ERROR_SIZE] = {};
++    if (!rollbackGatewayConfig(error, sizeof(error))) {
++      String out = "{\"ok\":false,\"error\":\"";
++      EquineConfigApi::appendJsonEscaped(out, error);
++      out += "\"}";
++      webServer.send(400, "application/json", out);
++      return;
++    }
++    webServer.send(200, "application/json",
++      "{\"ok\":true,\"reboot_required\":true}");
++    gateway_config_reboot_requested = true;
++  });
++
++  webServer.on("/api/v1/factory-reset", HTTP_POST, []() {
++    if (!gatewayConfigWritesAllowed()) {
++      webServer.send(403, "application/json",
++        "{\"ok\":false,\"error\":\"physical_config_mode_required\"}");
++      return;
++    }
++    if (webServer.arg("confirm") != "FACTORY_RESET") {
++      webServer.send(400, "application/json",
++        "{\"ok\":false,\"error\":\"confirmation_required\"}");
++      return;
++    }
++    webServer.send(200, "application/json",
++      "{\"ok\":true,\"factory_reset\":true,\"onboarding_required_after_reboot\":true}");
++    gateway_factory_reset_requested = true;
++  });
++
++  webServer.on("/api/v1/reboot", HTTP_POST, []() {
++    if (!gatewayConfigWritesAllowed()) {
++      webServer.send(403, "application/json",
++        "{\"ok\":false,\"error\":\"physical_config_mode_required\"}");
++      return;
++    }
++    webServer.send(200, "application/json", "{\"ok\":true,\"rebooting\":true}");
++    gateway_config_reboot_requested = true;
+   });
+ 
+   webServer.on("/api/v1/trackers", HTTP_GET, []() {
+@@ -978,7 +1257,107 @@
+   logPrintln("Auto-Discovery complete.");
+ }
+ 
++
++void startGatewayFallbackAp();
++
++void serviceGatewayConfigButton() {
++  const bool pressed = digitalRead(USER_BTN_PIN) == LOW;
++  const uint32_t now = millis();
++  if (pressed && !gateway_button_previous) {
++    gateway_button_press_start_ms = now;
++    gateway_button_hold_handled = false;
++  }
++  if (pressed && !gateway_button_hold_handled &&
++      (uint32_t)(now - gateway_button_press_start_ms) >= 5000UL) {
++    gateway_button_hold_handled = true;
++    gateway_config_mode = true;
++    gateway_config_mode_deadline_ms = now + 600000UL;
++    logPrintln("USER held for 5 s: gateway configuration writes unlocked for 10 minutes.");
++    if (WiFi.status() != WL_CONNECTED && !gateway_ap_active) {
++      startGatewayFallbackAp();
++    }
++  }
++  if (!pressed) gateway_button_hold_handled = false;
++  gateway_button_previous = pressed;
++}
++
++bool postBootButtonRequestsGatewayConfig() {
++  pinMode(USER_BTN_PIN, INPUT_PULLUP);
++  // GPIO0 is a boot strap. Never require it to be held during reset. Wait for
++  // release, then accept a deliberate 1.5 s hold during a short post-boot window.
++  const uint32_t release_deadline = millis() + 2500;
++  while (digitalRead(USER_BTN_PIN) == LOW &&
++         (int32_t)(release_deadline - millis()) > 0) {
++    delay(10);
++  }
++  logPrintln("Gateway config window: hold USER for 1.5 s within 5 s.");
++  const uint32_t window_deadline = millis() + 5000;
++  uint32_t press_start = 0;
++  while ((int32_t)(window_deadline - millis()) > 0) {
++    const bool pressed = digitalRead(USER_BTN_PIN) == LOW;
++    if (pressed && press_start == 0) press_start = millis();
++    if (!pressed) press_start = 0;
++    if (pressed && (uint32_t)(millis() - press_start) >= 1500) {
++      logPrintln("Physical gateway configuration mode enabled.");
++      return true;
++    }
++    delay(10);
++  }
++  return false;
++}
++
++void startGatewayFallbackAp() {
++  WiFi.disconnect(false, false);
++  WiFi.mode(WIFI_AP);
++  String ap_name = "EquineGateway-" + String(GATEWAY_ID);
++  if (WiFi.softAP(ap_name.c_str(), EQUINE_ONBOARDING_AP_PASSWORD)) {
++    gateway_ap_active = true;
++    gateway_network_ip = WiFi.softAPIP().toString();
++    logPrintf("Gateway setup AP '%s' active at %s (password: %s).\n",
++              ap_name.c_str(), gateway_network_ip.c_str(),
++              EQUINE_ONBOARDING_AP_PASSWORD);
++  } else {
++    logPrintln("Failed to start gateway fallback AP.");
++  }
++}
++
++void setupGatewayNetwork() {
++  WiFi.persistent(false);
++  if (gateway_onboarding_required) {
++    logPrintln("Factory/unprovisioned gateway: starting onboarding AP.");
++    startGatewayFallbackAp();
++    return;
++  }
++  WiFi.mode(WIFI_STA);
++  WiFi.setSleep(false);
++  if (gateway_config.wifi_ssid[0] != '\0') {
++    logPrintf("Connecting gateway to Wi-Fi '%s'...\n",
++              gateway_config.wifi_ssid);
++    WiFi.begin(gateway_config.wifi_ssid, gateway_config.wifi_password);
++    const uint32_t deadline = millis() + 20000UL;
++    while (WiFi.status() != WL_CONNECTED &&
++           (int32_t)(deadline - millis()) > 0) {
++      delay(250);
++      Serial.print('.');
++    }
++    Serial.println();
++  }
++
++  if (WiFi.status() == WL_CONNECTED) {
++    gateway_ap_active = false;
++    gateway_network_ip = WiFi.localIP().toString();
++    lastWiFiStatus = WiFi.status();
++    logPrintf("Gateway Wi-Fi connected at %s.\n",
++              gateway_network_ip.c_str());
++    return;
++  }
++
++  logPrintln("Gateway Wi-Fi unavailable; entering local onboarding AP mode.");
++  startGatewayFallbackAp();
++}
++
+ void handleWiFiConnection() {
++  if (gateway_ap_active) return;
+   const wl_status_t currentStatus = WiFi.status();
+ 
+   if (currentStatus != lastWiFiStatus) {
+@@ -1048,6 +1427,7 @@
+ 
+   if (!loadGatewayConfig()) {
+     makeGatewayFactoryConfig();
++    gateway_onboarding_required = true;
+     logPrintln("Warning: running with unsaved factory gateway configuration.");
+   }
+ 
+@@ -1076,13 +1456,9 @@
+ 
+   loadAllDedupStates();
+ 
+-  WiFi.begin(gateway_config.wifi_ssid, gateway_config.wifi_password);
+-  while (WiFi.status() != WL_CONNECTED) {
+-    delay(500);
+-    logPrint(".");
+-  }
+-  logPrintln("\nWiFi connected!");
+-  lastWiFiStatus = WiFi.status();
++  pinMode(USER_BTN_PIN, INPUT_PULLUP);
++  gateway_config_mode = gateway_onboarding_required;
++  setupGatewayNetwork();
+ 
+   setupOTA();
+   setupRemoteLogging();
+@@ -1105,6 +1481,35 @@
+ }
+ 
+ void loop() {
++  if (gateway_factory_reset_requested) {
++    publishGatewayAvailability("offline");
++    saveAllDedupStates(true);
++    for (size_t i = 0; i < GATEWAY_TRACKER_COUNT; i++) {
++      Preferences dedup;
++      if (dedup.begin(tracker_runtime[i].dedup_namespace, false)) {
++        dedup.clear();
++        dedup.end();
++      }
++    }
++    clearGatewayConfigStorage();
++    delay(250);
++    ESP.restart();
++  }
++  if (gateway_config_reboot_requested) {
++    publishGatewayAvailability("offline");
++    saveAllDedupStates(true);
++    delay(250);
++    ESP.restart();
++  }
++  if (gateway_config_mode && !gateway_onboarding_required &&
++      gateway_config_mode_deadline_ms != 0 &&
++      (int32_t)(millis() - gateway_config_mode_deadline_ms) >= 0) {
++    gateway_config_mode = false;
++    gateway_config_mode_deadline_ms = 0;
++    logPrintln("Gateway configuration write window closed.");
++  }
++
++  serviceGatewayConfigButton();
+   ArduinoOTA.handle();
+   handleRemoteLogging();
+   webServer.handleClient();

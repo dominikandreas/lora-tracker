@@ -1,0 +1,157 @@
+--- /mnt/data/equine_tracker_optimized_v2.ino	2026-07-14 11:17:00.438153585 +0000
++++ /mnt/data/equine_tracker_optimized_v3.ino	2026-07-14 11:18:33.911319171 +0000
+@@ -148,6 +148,8 @@
+ const uint32_t DISPLAY_REFRESH_MS = 5000;
+ const uint32_t DISPLAY_PAGE_INTERVAL_MS = 10000;
+ const uint32_t DISPLAY_BATTERY_REFRESH_MS = 5000;
++const uint32_t BUTTON_DEBOUNCE_MS = 30;
++const uint32_t WIFI_SETUP_POST_BOOT_WINDOW_MS = 5000;
+ const uint8_t DISPLAY_PAGE_COUNT = 4;
+ const uint32_t BLE_CONNECTION_WINDOW_MS = 60000;
+ const uint32_t BLE_RECONNECT_WINDOW_MS = 15000;
+@@ -1648,7 +1650,7 @@
+   const bool button_pressed = digitalRead(USER_BTN_PIN) == LOW;
+ 
+   if (button_pressed) {
+-    if (!previous_button_pressed && (uint32_t)(now - last_button_event_ms) > 50) {
++    if (!previous_button_pressed && (uint32_t)(now - last_button_event_ms) > BUTTON_DEBOUNCE_MS) {
+       // Just pressed down
+       last_button_event_ms = now;
+       button_press_start_ms = now;
+@@ -1669,10 +1671,14 @@
+   } else {
+     // Button not pressed
+     if (button_is_held) {
+-      // Just released
++      // Just released. Derive the duration from timestamps rather than the
++      // periodically refreshed hold counter; otherwise a short press released
++      // before the next service pass can incorrectly look like a zero-length
++      // press and fail to advance the page.
++      const uint32_t released_hold_duration_ms = now - button_press_start_ms;
++      button_hold_duration_ms = released_hold_duration_ms;
+       button_is_held = false;
+       last_button_event_ms = now;
+-      requestDisplayWake(DISPLAY_BUTTON_TIMEOUT_MS, false);
+ 
+       if (pending_confirmation != ConfirmationState::NONE && now <= confirmation_timeout_ms) {
+         // Confirmed an action!
+@@ -1707,18 +1713,24 @@
+         if (button_hold_duration_ms >= 12000) {
+           pending_confirmation = ConfirmationState::FACTORY_RESET;
+           confirmation_timeout_ms = now + 10000;
++          requestDisplayWake(DISPLAY_BUTTON_TIMEOUT_MS, false);
+         } else if (button_hold_duration_ms >= 8000) {
+           pending_confirmation = ConfirmationState::BLE_TOGGLE;
+           confirmation_timeout_ms = now + 10000;
++          requestDisplayWake(DISPLAY_BUTTON_TIMEOUT_MS, false);
+         } else if (button_hold_duration_ms >= 4000) {
+           pending_confirmation = ConfirmationState::DISTANCE_RESET;
+           confirmation_timeout_ms = now + 10000;
+-        } else if (button_hold_duration_ms >= 50) {
+-          // Short press: advance page if there's no confirmation pending
++          requestDisplayWake(DISPLAY_BUTTON_TIMEOUT_MS, false);
++        } else {
++          // Every detected, debounced short press advances exactly one page.
++          // Rendering is done once here, after classification, so a normal
++          // refresh cannot overwrite or swallow the page transition.
+           if (pending_confirmation == ConfirmationState::NONE) {
+             requestDisplayWake(DISPLAY_BUTTON_TIMEOUT_MS, true);
+           } else {
+-            pending_confirmation = ConfirmationState::NONE; // cancel confirmation
++            pending_confirmation = ConfirmationState::NONE;
++            requestDisplayWake(DISPLAY_BUTTON_TIMEOUT_MS, false);
+           }
+         }
+       }
+@@ -1775,23 +1787,48 @@
+ #endif
+ }
+ 
+-bool bootButtonRequestsWifiSetup() {
+-  if (digitalRead(USER_BTN_PIN) != LOW) return false;
++bool postBootButtonRequestsWifiSetup() {
++  // GPIO0 is an ESP32-S3 boot-strapping pin. Holding it low during reset can
++  // enter the ROM download bootloader before this firmware runs, leaving the
++  // application display black. Therefore the setup gesture is deliberately
++  // accepted only after the application has booted and illuminated the TFT.
++  setTrackerPhase("Hold for WiFi");
++  requestDisplayWake(WIFI_SETUP_POST_BOOT_WINDOW_MS + 1000, false);
++
++  const uint32_t window_start_ms = millis();
++  uint32_t hold_start_ms = 0;
++  bool released_since_boot = digitalRead(USER_BTN_PIN) != LOW;
++
++  while ((uint32_t)(millis() - window_start_ms) <
++         WIFI_SETUP_POST_BOOT_WINDOW_MS) {
++    const bool pressed = digitalRead(USER_BTN_PIN) == LOW;
++
++    if (!pressed) {
++      released_since_boot = true;
++      hold_start_ms = 0;
++    } else if (released_since_boot) {
++      if (hold_start_ms == 0) hold_start_ms = millis();
++      if ((uint32_t)(millis() - hold_start_ms) >=
++          WIFI_SETUP_BOOT_HOLD_MS) {
++        // Consume this gesture so it is not replayed as a status-page press.
++        previous_button_pressed = true;
++        button_is_held = false;
++        button_hold_duration_ms = 0;
++        last_button_event_ms = millis();
++        setTrackerPhase("WiFi requested");
++        renderStatusPage();
++        return true;
++      }
++    }
+ 
+-  const uint32_t hold_start_ms = millis();
+-  while (digitalRead(USER_BTN_PIN) == LOW &&
+-         (uint32_t)(millis() - hold_start_ms) < WIFI_SETUP_BOOT_HOLD_MS) {
+     delay(10);
+   }
+ 
+-  const bool requested =
+-    (uint32_t)(millis() - hold_start_ms) >= WIFI_SETUP_BOOT_HOLD_MS;
+-  if (requested) {
+-    // Avoid interpreting the same boot-time hold as a normal UI press.
+-    previous_button_pressed = true;
+-    last_button_event_ms = millis();
+-  }
+-  return requested;
++  previous_button_pressed = digitalRead(USER_BTN_PIN) == LOW;
++  button_is_held = false;
++  button_hold_duration_ms = 0;
++  last_button_event_ms = millis();
++  return false;
+ }
+ 
+ double angularDifferenceDegrees(double a, double b) {
+@@ -2045,8 +2082,7 @@
+ 
+   initBoardPins();
+   pinMode(USER_BTN_PIN, INPUT_PULLUP);
+-  const bool wifi_setup_requested =
+-    hard_boot && bootButtonRequestsWifiSetup();
++  bool wifi_setup_requested = false;
+ 
+   if (BATTERY_SENSE_ENABLED) {
+     analogReadResolution(12);
+@@ -2113,6 +2149,10 @@
+     setTrackerPhase("Wake cycle");
+   }
+ 
++  if (hard_boot) {
++    wifi_setup_requested = postBootButtonRequestsWifiSetup();
++  }
++
+   // A button-only wake opens the status UI and, when enabled, a bounded BLE
+   // connection window. It otherwise resumes the original sleep deadline.
+   if (!hard_boot && wakeup_cause == ESP_SLEEP_WAKEUP_EXT0) {
+@@ -2158,7 +2198,7 @@
+   if (wifi_setup_requested) {
+     runWifiSetupMode();
+   } else if (hard_boot) {
+-    logPrintln("WiFi setup skipped. Hold the button during power-up to enable it.");
++    logPrintln("WiFi setup skipped. After power-up, hold the button when the display prompts for WiFi.");
+   }
+ 
+   // BLE is on-demand and bounded. A connected client may deliberately keep

@@ -1,0 +1,131 @@
+--- /mnt/data/equine_tracker_optimized_v3.ino	2026-07-14 15:59:25.935651931 +0000
++++ /mnt/data/equine_tracker_optimized_v4_ble_fix.ino	2026-07-14 16:01:07.008919057 +0000
+@@ -309,6 +309,11 @@
+ void requestDisplayWake(uint32_t duration_ms = DISPLAY_BUTTON_TIMEOUT_MS, bool advance_page = false);
+ void serviceDisplayAndButton(bool force_refresh = false);
+ void responsiveDelay(uint32_t duration_ms);
++void turnOnDisplay();
++void turnOffDisplay();
++void renderDisplayLines(char lines[5][18]);
++void sleepGPS();
++void sleepLoRaRadio();
+ void startBleDebugWindow(uint32_t duration_ms);
+ void stopBleDebug();
+ void serviceBleDebug();
+@@ -326,6 +331,14 @@
+ bool ble_connection_window_active = false;
+ uint32_t ble_connection_window_deadline_ms = 0;
+ 
++// BLE transitions are requested by the button UI and executed later from
++// loop(). Never initialize/deinitialize the BLE stack from inside the button
++// handler: doing so can block display state cleanup and leave the tracker in
++// an undefined operating mode.
++bool ble_disable_transition_requested = false;
++bool ble_enable_transition_requested = false;
++RTC_DATA_ATTR bool ble_open_window_on_next_wake = false;
++
+ class MyServerCallbacks: public BLEServerCallbacks {
+     void onConnect(BLEServer* server) override {
+         (void)server;
+@@ -523,6 +536,37 @@
+ }
+ 
+ 
++// Enter a short deep-sleep reset while preserving RTC tracking state. This is
++// used when enabling BLE after it was previously deinitialized. The next wake
++// starts from a clean ESP32/BLE stack and opens the requested connection window.
++[[noreturn]] void restartThroughDeepSleepForBle() {
++  setTrackerPhase("BLE restart");
++  turnOnDisplay();
++  char lines[5][18] = {"BLE ENABLED", "Restarting radio", "Reconnect soon", "", ""};
++  renderDisplayLines(lines);
++  delay(600);
++
++  stopBleDebug();
++  turnOffDisplay();
++  sleepGPS();
++  sleepLoRaRadio();
++  prefs.end();
++  Serial.flush();
++
++  ble_open_window_on_next_wake = true;
++  const uint64_t restart_delay_us = 1000000ULL;
++  struct timeval tv;
++  gettimeofday(&tv, NULL);
++  const uint64_t now_us = (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;
++  target_wakeup_time_us = now_us + restart_delay_us;
++
++  esp_sleep_enable_ext0_wakeup((gpio_num_t)USER_BTN_PIN, 0);
++  esp_sleep_enable_timer_wakeup(restart_delay_us);
++  esp_deep_sleep_start();
++  while (true) delay(1000);
++}
++
++
+ 
+ // =====================================================
+ // GNSS CONFIGURATION AND ASSISTANCE
+@@ -1698,13 +1742,17 @@
+           ESP.restart();
+         } else if (pending_confirmation == ConfirmationState::BLE_TOGGLE) {
+           logPrintln("User confirmed BLE toggle via button!");
+-          ble_debug_enabled = !ble_debug_enabled;
++          const bool enable_ble = !ble_debug_enabled;
++          ble_debug_enabled = enable_ble;
+           prefs.putBool("ble_log", ble_debug_enabled);
+-          setLastError(ble_debug_enabled ? "BLE Debug ON" : "BLE Debug OFF");
+-          if (ble_debug_enabled) {
+-            startBleDebugWindow(BLE_CONNECTION_WINDOW_MS);
++          setLastError(enable_ble ? "BLE Debug ON" : "BLE Debug OFF");
++
++          // Defer all BLE stack work until after this input handler has
++          // cleared the confirmation state and returned.
++          if (enable_ble) {
++            ble_enable_transition_requested = true;
+           } else {
+-            stopBleDebug();
++            ble_disable_transition_requested = true;
+           }
+         }
+         pending_confirmation = ConfirmationState::NONE;
+@@ -2195,6 +2243,16 @@
+     }
+   }
+ 
++  // A BLE enable request uses a one-second deep-sleep reset so the stack is
++  // recreated from a clean boot. Open the connection window on that wake.
++  if (ble_open_window_on_next_wake) {
++    ble_open_window_on_next_wake = false;
++    if (ble_debug_enabled) {
++      startBleDebugWindow(BLE_CONNECTION_WINDOW_MS);
++      waitForBleConnectionWindow();
++    }
++  }
++
+   if (wifi_setup_requested) {
+     runWifiSetupMode();
+   } else if (hard_boot) {
+@@ -2576,6 +2634,23 @@
+ 
+   serviceDisplayAndButton();
+ 
++  // Execute BLE lifecycle transitions only from the main loop, never from the
++  // button callback path. Disabling immediately returns to one normal tracking
++  // cycle and then deep sleep. Enabling performs a short deep-sleep reset so
++  // BLE is initialized from a clean stack on the next wake.
++  if (ble_disable_transition_requested) {
++    ble_disable_transition_requested = false;
++    stopBleDebug();
++    logPrintln("BLE disabled; resuming normal low-power tracking now.");
++    performTrackingCycle();
++    return;
++  }
++
++  if (ble_enable_transition_requested) {
++    ble_enable_transition_requested = false;
++    restartThroughDeepSleepForBle();
++  }
++
+   if (isDebugModeActive()) {
+     if ((uint32_t)(millis() - last_cycle_ms) >= debug_pause_ms ||
+         last_cycle_ms == 0) {

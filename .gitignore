@@ -1,0 +1,14 @@
+# Credentials and local runtime data
+**/secrets.h
+**/.env
+*.sqlite3
+
+# Build and tooling output
+.pio/
+components/.pio-build/
+**/__pycache__/
+.pytest_cache/
+node_modules/
+
+# Editor files
+.vscode/

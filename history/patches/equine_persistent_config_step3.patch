@@ -1,0 +1,2278 @@
+--- /mnt/data/_work_step3/equine_tracker_protocol_v1_project/equine_tracker_protocol_v1.ino	2026-07-14 18:56:10.000000000 +0000
++++ /mnt/data/_work_step3/tracker_v2/equine_tracker_config_v2.ino	2026-07-15 08:01:08.532423344 +0000
+@@ -28,14 +28,22 @@
+ #include <BLE2902.h>
+ #include "secrets.h"
+ #include "equine_protocol.h"
++#include "equine_config.h"
+ 
+ // ==========================================
+-// TRACKER IDENTITY
++// VERSIONED PERSISTENT CONFIGURATION
+ // ==========================================
+-// This becomes NVS-configurable during the onboarding/configuration step.
+-const char* TRACKER_ID = "wera";
+-const char* TRACKER_NAME = "Wera";
+-const uint64_t TRACKER_DEVICE_HASH = EquineProtocol::deviceIdHash(TRACKER_ID);
++// These are factory seeds only. The active identity and all tunable values are
++// loaded from the CRC-protected NVS configuration before hardware startup.
++static const char* const FACTORY_TRACKER_ID = "wera";
++static const char* const FACTORY_TRACKER_NAME = "Wera";
++
++EquineConfig::TrackerConfigV1 tracker_config{};
++uint64_t tracker_device_hash = 0;
++
++#define TRACKER_ID          (tracker_config.device_id)
++#define TRACKER_NAME        (tracker_config.device_name)
++#define TRACKER_DEVICE_HASH (tracker_device_hash)
+ 
+ #if defined(BOARD_WIRELESS_TRACKER)
+   // --- GPS UART pins (UC6580) ---
+@@ -76,88 +84,65 @@
+   #define GPS_BAUD 9600
+ #endif
+ 
+-// --- Tuning Parameters ---
+-#define LORA_FREQ 868E6
+-const int LORA_TX_POWER_DBM = 20;
+-const int LORA_SPREADING_FACTOR = 10;
+-const long LORA_SIGNAL_BANDWIDTH = 125E3;
+-const int LORA_CODING_RATE = 5;
+-const int LORA_PREAMBLE_LENGTH = 8;
+-const int LORA_SYNC_WORD = 0x12;
+-const uint16_t HISTORY_SIZE = 500; // Total logical points in chain, including origin
+-const double MIN_DISTANCE_METERS = 2.5;
+-const double MIN_SPEED_KMPH = 0.5;
+-const double MAX_HDOP = 2.0;
+-const uint32_t MIN_SATELLITES = 6;
+-
+-// --- Anti-glitch / timing ---
+-const double MAX_SPEED_MPS = 20.0;
+-const uint32_t MAX_FIX_AGE_S = 43200;
+-const double SAVE_DIST_THRESHOLD = 250.0;
+-const uint32_t NVS_SAVE_INTERVAL_S = 3600;
+-
+-// GNSS acquisition starts by listening immediately. Repeated no-fix cycles
+-// progressively shorten the active search and lengthen the following sleep.
+-const uint32_t GPS_FULL_TIMEOUT_MS = 30000;
+-const uint32_t GPS_SECOND_NO_FIX_TIMEOUT_MS = 20000;
+-const uint32_t GPS_THIRD_NO_FIX_TIMEOUT_MS = 10000;
+-const uint32_t GPS_QUICK_PROBE_TIMEOUT_MS = 8000;
+-const uint32_t GPS_FULL_RETRY_INTERVAL_S = 3600;
+-const uint32_t GPS_INITIAL_LISTEN_MS = 5000;
+-const uint32_t GPS_LIGHT_SLEEP_CHUNK_MS = 5000;
+-const uint32_t GPS_LISTEN_WINDOW_MS = 2000;
+-
+-// Movement classification is intentionally stricter than distance accumulation.
+-// A fresh speed measurement or a large displacement is accepted immediately;
+-// smaller displacements require two directionally consistent observations.
+-const double MOVEMENT_SPEED_THRESHOLD_KMPH = 1.0;
+-const double MOVEMENT_DISPLACEMENT_THRESHOLD_M = 10.0;
+-const double MOVEMENT_EVIDENCE_DISTANCE_M = 4.5;
+-const double MOVEMENT_EVIDENCE_STEP_M = 2.0;
+-const double MOVEMENT_DIRECTION_TOLERANCE_DEG = 60.0;
+-const uint8_t MOVEMENT_EVIDENCE_REQUIRED = 2;
+-
+-// Batch normal position updates and keep the expensive RX window short.
+-const uint32_t LORA_TX_INTERVAL_S = 300;
+-const uint16_t LORA_TX_MIN_POINTS = 3;
+-const uint32_t LORA_ACK_TIMEOUT_MS = 800;
+-
+-// Missing ACKs are usually caused by temporary loss of coverage. Retrying on
+-// every tracking cycle wastes energy without improving delivery. Back off from
+-// 1 minute to 10 minutes and reset immediately after a valid ACK.
+-const uint32_t LORA_RETRY_BACKOFF_1_S = 60;
+-const uint32_t LORA_RETRY_BACKOFF_2_S = 120;
+-const uint32_t LORA_RETRY_BACKOFF_3_S = 300;
+-const uint32_t LORA_RETRY_BACKOFF_MAX_S = 600;
+-
+-// --- History encoding ---
+-const double HISTORY_POINT_SPACING_M = 15.0;   // only store a history point every 15m
+-const int32_t DELTA_UNIT_MICRODEG = 10;        // 1e-5 degree steps expressed in microdegrees
++// --- Runtime tuning loaded from tracker_config ---
++const uint16_t HISTORY_SIZE = 500; // RTC layout; changing this needs a firmware migration
++const int32_t DELTA_UNIT_MICRODEG = 10;
+ const uint32_t SECONDS_PER_DAY = 86400;
+-
+-// --- Battery ---
+ const float MIN_BATTERY_VOLTAGE = 3.2f;
+ const float MAX_BATTERY_VOLTAGE = 4.2f;
+-const bool BATTERY_SENSE_ENABLED = true;
+ 
+-// --- Adaptive sleep ---
+-const uint64_t SLEEP_DURATION_US = 60000000ULL;              // moving / recently active
+-const uint64_t STATIONARY_SLEEP_DURATION_US = 300000000ULL;  // stationary for several fixes
+-const uint64_t LONG_STATIONARY_SLEEP_DURATION_US = 600000000ULL;
+-const uint64_t NO_FIX_SLEEP_1_US = 120000000ULL;
+-const uint64_t NO_FIX_SLEEP_2_US = 300000000ULL;
+-const uint64_t NO_FIX_SLEEP_3_US = 600000000ULL;
+-const uint64_t NO_FIX_SLEEP_MAX_US = 900000000ULL;
+-const uint16_t STATIONARY_FIXES_FOR_LONG_SLEEP = 3;
+-const uint16_t STATIONARY_FIXES_FOR_MAX_SLEEP = 12;
++#define LORA_FREQ                         ((double)tracker_config.lora.frequency_hz)
++#define LORA_TX_POWER_DBM                 ((int)tracker_config.lora.tx_power_dbm)
++#define LORA_SPREADING_FACTOR             ((int)tracker_config.lora.spreading_factor)
++#define LORA_SIGNAL_BANDWIDTH             ((long)tracker_config.lora.bandwidth_hz)
++#define LORA_CODING_RATE                  ((int)tracker_config.lora.coding_rate_denominator)
++#define LORA_PREAMBLE_LENGTH              ((int)tracker_config.lora.preamble_length)
++#define LORA_SYNC_WORD                    ((int)tracker_config.lora.sync_word)
++#define MIN_DISTANCE_METERS               ((double)tracker_config.min_distance_m)
++#define MIN_SPEED_KMPH                    ((double)tracker_config.min_speed_kmph)
++#define MAX_HDOP                          ((double)tracker_config.max_hdop)
++#define MIN_SATELLITES                    ((uint32_t)tracker_config.min_satellites)
++#define MAX_SPEED_MPS                     ((double)tracker_config.max_speed_mps)
++#define MAX_FIX_AGE_S                     ((uint32_t)tracker_config.max_fix_age_s)
++#define SAVE_DIST_THRESHOLD               ((double)tracker_config.save_distance_threshold_m)
++#define NVS_SAVE_INTERVAL_S               ((uint32_t)tracker_config.nvs_save_interval_s)
++#define GPS_FULL_TIMEOUT_MS               ((uint32_t)tracker_config.gps_timeout_ms[0])
++#define GPS_SECOND_NO_FIX_TIMEOUT_MS      ((uint32_t)tracker_config.gps_timeout_ms[1])
++#define GPS_THIRD_NO_FIX_TIMEOUT_MS       ((uint32_t)tracker_config.gps_timeout_ms[2])
++#define GPS_QUICK_PROBE_TIMEOUT_MS        ((uint32_t)tracker_config.gps_timeout_ms[3])
++#define GPS_FULL_RETRY_INTERVAL_S         ((uint32_t)tracker_config.gps_full_retry_interval_s)
++#define GPS_INITIAL_LISTEN_MS             ((uint32_t)tracker_config.gps_initial_listen_ms)
++#define GPS_LIGHT_SLEEP_CHUNK_MS          ((uint32_t)tracker_config.gps_light_sleep_chunk_ms)
++#define GPS_LISTEN_WINDOW_MS              ((uint32_t)tracker_config.gps_listen_window_ms)
++#define MOVEMENT_SPEED_THRESHOLD_KMPH     ((double)tracker_config.movement_speed_threshold_kmph)
++#define MOVEMENT_DISPLACEMENT_THRESHOLD_M ((double)tracker_config.movement_displacement_threshold_m)
++#define MOVEMENT_EVIDENCE_DISTANCE_M      ((double)tracker_config.movement_evidence_distance_m)
++#define MOVEMENT_EVIDENCE_STEP_M          ((double)tracker_config.movement_evidence_step_m)
++#define MOVEMENT_DIRECTION_TOLERANCE_DEG  ((double)tracker_config.movement_direction_tolerance_deg)
++#define MOVEMENT_EVIDENCE_REQUIRED        ((uint8_t)tracker_config.movement_evidence_required)
++#define LORA_TX_INTERVAL_S                ((uint32_t)tracker_config.lora_tx_interval_s)
++#define LORA_TX_MIN_POINTS                ((uint16_t)tracker_config.lora_tx_min_points)
++#define LORA_ACK_TIMEOUT_MS               ((uint32_t)tracker_config.lora_ack_timeout_ms)
++#define LORA_RETRY_BACKOFF_1_S            ((uint32_t)tracker_config.lora_retry_backoff_s[0])
++#define LORA_RETRY_BACKOFF_2_S            ((uint32_t)tracker_config.lora_retry_backoff_s[1])
++#define LORA_RETRY_BACKOFF_3_S            ((uint32_t)tracker_config.lora_retry_backoff_s[2])
++#define LORA_RETRY_BACKOFF_MAX_S          ((uint32_t)tracker_config.lora_retry_backoff_s[3])
++#define HISTORY_POINT_SPACING_M           ((double)tracker_config.history_point_spacing_m)
++#define BATTERY_SENSE_ENABLED             (tracker_config.battery_sense_enabled != 0)
++#define SLEEP_DURATION_US                 ((uint64_t)tracker_config.moving_sleep_s * 1000000ULL)
++#define STATIONARY_SLEEP_DURATION_US      ((uint64_t)tracker_config.stationary_sleep_s * 1000000ULL)
++#define LONG_STATIONARY_SLEEP_DURATION_US ((uint64_t)tracker_config.long_stationary_sleep_s * 1000000ULL)
++#define NO_FIX_SLEEP_1_US                 ((uint64_t)tracker_config.no_fix_sleep_s[0] * 1000000ULL)
++#define NO_FIX_SLEEP_2_US                 ((uint64_t)tracker_config.no_fix_sleep_s[1] * 1000000ULL)
++#define NO_FIX_SLEEP_3_US                 ((uint64_t)tracker_config.no_fix_sleep_s[2] * 1000000ULL)
++#define NO_FIX_SLEEP_MAX_US               ((uint64_t)tracker_config.no_fix_sleep_s[3] * 1000000ULL)
++#define STATIONARY_FIXES_FOR_LONG_SLEEP   ((uint16_t)tracker_config.stationary_fixes_for_long_sleep)
++#define STATIONARY_FIXES_FOR_MAX_SLEEP    ((uint16_t)tracker_config.stationary_fixes_for_max_sleep)
+ 
+-// UC6580 configuration is persisted in the GNSS module itself. Increment this
+-// after changing the saved message configuration to apply it once on hard boot.
++// Fixed implementation limits and UI timing are not part of the user config.
+ const uint8_t GNSS_CONFIG_VERSION = 1;
+ const uint32_t GNSS_COMMAND_TIMEOUT_MS = 500;
+ const uint32_t GNSS_ASSISTANCE_MAX_AGE_S = 12UL * 60UL * 60UL;
+-
+-// --- Display / setup responsiveness ---
+ const uint8_t WIFI_MAX_CONNECT_ATTEMPTS = 5;
+ const uint32_t WIFI_CONNECT_TIMEOUT_MS = 10000;
+ const uint32_t WEB_CLIENT_IDLE_TIMEOUT_MS = 15000;
+@@ -200,6 +185,7 @@
+ // =====================================================
+ TinyGPSPlus gps;
+ Preferences prefs;
++Preferences configPrefs;
+ 
+ RTC_DATA_ATTR double total_distance_meters = 0.0;
+ RTC_DATA_ATTR double last_lat = 0.0;
+@@ -220,11 +206,11 @@
+ RTC_DATA_ATTR uint64_t session_start_time_us = 0; // wall-clock uptime across deep sleep
+ RTC_DATA_ATTR uint16_t stationary_fix_streak = 0;
+ RTC_DATA_ATTR uint8_t consecutive_no_fix_cycles = 0;
+-RTC_DATA_ATTR uint32_t seconds_since_last_tx = LORA_TX_INTERVAL_S;
+-RTC_DATA_ATTR uint32_t seconds_since_last_lora_attempt = LORA_RETRY_BACKOFF_MAX_S;
++RTC_DATA_ATTR uint32_t seconds_since_last_tx = 0;
++RTC_DATA_ATTR uint32_t seconds_since_last_lora_attempt = 0;
+ RTC_DATA_ATTR uint8_t consecutive_lora_failures = 0;
+ RTC_DATA_ATTR uint32_t seconds_since_last_nvs_save = 0;
+-RTC_DATA_ATTR uint32_t seconds_since_last_full_gnss_attempt = GPS_FULL_RETRY_INTERVAL_S;
++RTC_DATA_ATTR uint32_t seconds_since_last_full_gnss_attempt = 0;
+ RTC_DATA_ATTR uint32_t seconds_since_last_accepted_position = 0;
+ RTC_DATA_ATTR double last_effective_speed_kmph = 0.0;
+ 
+@@ -464,6 +450,126 @@
+   }
+ }
+ 
++
++// =====================================================
++// CONFIGURATION STORAGE
++// =====================================================
++void applyTrackerConfigRuntimeState() {
++  tracker_device_hash = EquineProtocol::deviceIdHash(tracker_config.device_id);
++  ble_debug_enabled = tracker_config.ble_debug_enabled != 0;
++}
++
++bool readTrackerConfigBlob(const char* key,
++                           EquineConfig::TrackerConfigV1& output) {
++  if (!configPrefs.begin(EquineConfig::CONFIG_NAMESPACE, true)) return false;
++  const size_t length = configPrefs.getBytesLength(key);
++  const bool size_ok = length == sizeof(output);
++  const size_t read = size_ok
++    ? configPrefs.getBytes(key, &output, sizeof(output))
++    : 0;
++  configPrefs.end();
++  return size_ok && read == sizeof(output) &&
++         EquineConfig::validateTrackerConfig(output);
++}
++
++bool writeTrackerConfigBlob(const char* key,
++                            const EquineConfig::TrackerConfigV1& value) {
++  if (!configPrefs.begin(EquineConfig::CONFIG_NAMESPACE, false)) return false;
++  const size_t written = configPrefs.putBytes(key, &value, sizeof(value));
++  configPrefs.end();
++  return written == sizeof(value);
++}
++
++bool saveTrackerConfig(bool increment_revision = true) {
++  EquineConfig::TrackerConfigV1 previous{};
++  if (readTrackerConfigBlob(EquineConfig::ACTIVE_CONFIG_KEY, previous)) {
++    // Keep one independently validated rollback copy before replacing active.
++    if (!writeTrackerConfigBlob(EquineConfig::BACKUP_CONFIG_KEY, previous)) {
++      logPrintln("Warning: failed to update tracker configuration backup.");
++    }
++  }
++
++  uint32_t revision = tracker_config.header.revision;
++  if (revision == 0) revision = 1;
++  else if (increment_revision && revision < UINT32_MAX) revision++;
++  EquineConfig::finalize(
++    tracker_config, EquineConfig::DeviceRole::TRACKER, revision);
++
++  if (!EquineConfig::validateTrackerConfig(tracker_config)) {
++    logPrintln("Refusing to save invalid tracker configuration.");
++    return false;
++  }
++  if (!writeTrackerConfigBlob(
++        EquineConfig::ACTIVE_CONFIG_KEY, tracker_config)) {
++    logPrintln("Failed to save tracker configuration.");
++    return false;
++  }
++
++  applyTrackerConfigRuntimeState();
++  logPrintf("Saved tracker config schema=%u revision=%lu id=%s.\n",
++            tracker_config.header.schema_version,
++            (unsigned long)tracker_config.header.revision,
++            tracker_config.device_id);
++  return true;
++}
++
++void makeTrackerFactoryConfig() {
++  EquineConfig::makeDefaultTrackerConfig(
++    tracker_config,
++    FACTORY_TRACKER_ID,
++    FACTORY_TRACKER_NAME,
++    ssid,
++    password);
++
++  // One-time migration from settings used before the versioned config blob.
++  if (prefs.isKey("ssid")) {
++    const String legacy_ssid = prefs.getString("ssid");
++    strlcpy(tracker_config.wifi_ssid, legacy_ssid.c_str(),
++            sizeof(tracker_config.wifi_ssid));
++  }
++  if (prefs.isKey("pw")) {
++    const String legacy_password = prefs.getString("pw");
++    strlcpy(tracker_config.wifi_password, legacy_password.c_str(),
++            sizeof(tracker_config.wifi_password));
++  }
++  tracker_config.ble_debug_enabled = prefs.getBool("ble_log", false) ? 1 : 0;
++  EquineConfig::finalize(
++    tracker_config, EquineConfig::DeviceRole::TRACKER, 1);
++}
++
++bool loadTrackerConfig() {
++  const char* source = "active";
++  if (!readTrackerConfigBlob(
++        EquineConfig::ACTIVE_CONFIG_KEY, tracker_config)) {
++    source = "backup";
++    if (!readTrackerConfigBlob(
++          EquineConfig::BACKUP_CONFIG_KEY, tracker_config)) {
++      source = "factory/migrated";
++      makeTrackerFactoryConfig();
++      if (!saveTrackerConfig(false)) return false;
++    } else {
++      // Repair the active slot from the valid rollback copy.
++      writeTrackerConfigBlob(EquineConfig::ACTIVE_CONFIG_KEY, tracker_config);
++    }
++  }
++
++  applyTrackerConfigRuntimeState();
++  logPrintf("Loaded tracker config from %s: schema=%u revision=%lu id=%s name=%s.\n",
++            source,
++            tracker_config.header.schema_version,
++            (unsigned long)tracker_config.header.revision,
++            tracker_config.device_id,
++            tracker_config.device_name);
++  return true;
++}
++
++void clearTrackerConfigStorage() {
++  if (configPrefs.begin(EquineConfig::CONFIG_NAMESPACE, false)) {
++    configPrefs.clear();
++    configPrefs.end();
++  }
++}
++
+ void stopBleDebug() {
+   if (!ble_initialized) {
+     ble_connection_window_active = false;
+@@ -1022,9 +1128,9 @@
+   WiFi.setSleep(false);
+   WiFi.setTxPower(WIFI_POWER_8_5dBm);
+ 
+-  String savedSsid = prefs.isKey("ssid") ? prefs.getString("ssid") : String(ssid);
+-  String savedPw = prefs.isKey("pw") ? prefs.getString("pw") : String(password);
+-  ble_debug_enabled = prefs.getBool("ble_log", false);
++  String savedSsid = String(tracker_config.wifi_ssid);
++  String savedPw = String(tracker_config.wifi_password);
++  ble_debug_enabled = tracker_config.ble_debug_enabled != 0;
+ 
+   bool connected = false;
+   if (savedSsid.length() > 0) {
+@@ -1092,7 +1198,8 @@
+     }
+   }
+ 
+-  ArduinoOTA.setHostname("equine-tracker");
++  String otaHost = "equine-tracker-" + String(TRACKER_ID);
++  ArduinoOTA.setHostname(otaHost.c_str());
+   ArduinoOTA.begin();
+ 
+   webServer.on("/", HTTP_GET, []() {
+@@ -1101,10 +1208,14 @@
+     logPrintln("Web UI accessed by a client.");
+     String html = "<html><head><title>Equine Tracker</title><meta name='viewport' content='width=device-width, initial-scale=1'>";
+     html += "<style>body{font-family:sans-serif;margin:20px;} input[type=text],input[type=password]{padding:8px;width:100%;box-sizing:border-box;}</style></head><body>";
+-    html += "<h1>Equine Tracker Setup</h1>";
++    html += "<h1>" + String(TRACKER_NAME) + " Tracker Setup</h1>";
++    html += "<p>Config schema " + String(tracker_config.header.schema_version) +
++            ", revision " + String(tracker_config.header.revision) +
++            ", ID <code>" + String(TRACKER_ID) + "</code></p>";
+     html += "<form action='/save' method='POST'>";
+-    html += "SSID:<br><input type='text' name='ssid' value='" + (prefs.isKey("ssid") ? prefs.getString("ssid") : String(ssid)) + "'><br><br>";
+-    html += "Password:<br><input type='password' name='pw' value='" + (prefs.isKey("pw") ? prefs.getString("pw") : String(password)) + "'><br><br>";
++    html += "SSID:<br><input type='text' name='ssid' value='" + String(tracker_config.wifi_ssid) + "'><br><br>";
++    html += "Password:<br><input type='password' name='pw' value=''><br>";
++    html += "<small>Leave blank to keep the stored password.</small><br><br>";
+     html += "<input type='checkbox' name='ble_log' value='1' ";
+     if(ble_debug_enabled) html += "checked";
+     html += "> Enable BLE Debug Logs<br>";
+@@ -1123,15 +1234,55 @@
+     String newSsid = webServer.arg("ssid");
+     String newPw = webServer.arg("pw");
+     bool newBle = webServer.hasArg("ble_log");
+-    prefs.putString("ssid", newSsid);
+-    prefs.putString("pw", newPw);
+-    prefs.putBool("ble_log", newBle);
+-    ble_debug_enabled = newBle;
+-    logPrintf("Settings saved! SSID updated. BLE Debug is now: %s\n", newBle ? "ON" : "OFF");
++    strlcpy(tracker_config.wifi_ssid, newSsid.c_str(),
++            sizeof(tracker_config.wifi_ssid));
++    if (newPw.length() > 0) {
++      strlcpy(tracker_config.wifi_password, newPw.c_str(),
++              sizeof(tracker_config.wifi_password));
++    }
++    tracker_config.ble_debug_enabled = newBle ? 1 : 0;
++    if (!saveTrackerConfig(true)) {
++      webServer.send(500, "text/plain", "Configuration validation or save failed");
++      return;
++    }
++    logPrintf("Versioned settings saved. BLE Debug is now: %s\n",
++              newBle ? "ON" : "OFF");
+     webServer.sendHeader("Location", "/");
+     webServer.send(303);
+   });
+ 
++  webServer.on("/api/v1/config", HTTP_GET, []() {
++    char hash_text[17];
++    EquineProtocol::formatDeviceHash(
++      TRACKER_DEVICE_HASH, hash_text, sizeof(hash_text));
++    char json[768];
++    const int written = snprintf(
++      json, sizeof(json),
++      "{\"config_schema\":%u,\"revision\":%lu,"
++      "\"device_id\":\"%s\",\"device_name\":\"%s\","
++      "\"device_hash\":\"%s\",\"ble_debug_enabled\":%s,"
++      "\"moving_sleep_s\":%lu,\"stationary_sleep_s\":%lu,"
++      "\"long_stationary_sleep_s\":%lu,\"max_hdop\":%.2f,"
++      "\"min_satellites\":%u,\"lora_frequency_hz\":%lu,"
++      "\"lora_sf\":%u,\"lora_bandwidth_hz\":%lu}",
++      tracker_config.header.schema_version,
++      (unsigned long)tracker_config.header.revision,
++      tracker_config.device_id, tracker_config.device_name, hash_text,
++      ble_debug_enabled ? "true" : "false",
++      (unsigned long)tracker_config.moving_sleep_s,
++      (unsigned long)tracker_config.stationary_sleep_s,
++      (unsigned long)tracker_config.long_stationary_sleep_s,
++      tracker_config.max_hdop, tracker_config.min_satellites,
++      (unsigned long)tracker_config.lora.frequency_hz,
++      tracker_config.lora.spreading_factor,
++      (unsigned long)tracker_config.lora.bandwidth_hz);
++    if (written <= 0 || written >= (int)sizeof(json)) {
++      webServer.send(500, "text/plain", "Configuration JSON overflow");
++    } else {
++      webServer.send(200, "application/json", json);
++    }
++  });
++
+   webServer.on("/start", HTTP_POST, []() {
+     wifi_client_connected = true;
+     last_web_activity_ms = millis();
+@@ -1749,13 +1900,23 @@
+           char lines[5][18] = {"FACTORY RESET", "IN PROGRESS", "Wiping NVS...", "Rebooting...", ""};
+           renderDisplayLines(lines);
+           prefs.clear();
++          clearTrackerConfigStorage();
+           delay(2000);
+           ESP.restart();
+         } else if (pending_confirmation == ConfirmationState::BLE_TOGGLE) {
+           logPrintln("User confirmed BLE toggle via button!");
+           const bool enable_ble = !ble_debug_enabled;
+           ble_debug_enabled = enable_ble;
+-          prefs.putBool("ble_log", ble_debug_enabled);
++          tracker_config.ble_debug_enabled = enable_ble ? 1 : 0;
++          if (!saveTrackerConfig(true)) {
++            ble_debug_enabled = !enable_ble;
++            tracker_config.ble_debug_enabled = ble_debug_enabled ? 1 : 0;
++            setLastError("Config save fail");
++            logPrintln("BLE toggle cancelled because config save failed.");
++            pending_confirmation = ConfirmationState::NONE;
++            force_refresh = true;
++            return;
++          }
+           setLastError(enable_ble ? "BLE Debug ON" : "BLE Debug OFF");
+ 
+           // Defer all BLE stack work until after this input handler has
+@@ -2192,7 +2353,13 @@
+ #endif
+ 
+   prefs.begin("tracker", false);
+-  ble_debug_enabled = prefs.getBool("ble_log", false);
++  if (!loadTrackerConfig()) {
++    // The factory configuration is validated in code, so reaching this branch
++    // indicates an NVS write failure. Continue with the in-memory defaults.
++    makeTrackerFactoryConfig();
++    applyTrackerConfigRuntimeState();
++    logPrintln("Warning: running with unsaved factory tracker configuration.");
++  }
+ 
+   char device_hash_text[17];
+   EquineProtocol::formatDeviceHash(
+--- /dev/null	2026-07-15 07:50:44.837055935 +0000
++++ /mnt/data/_work_step3/tracker_v2/equine_config.h	2026-07-15 08:09:50.105387600 +0000
+@@ -0,0 +1,458 @@
++#pragma once
++
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++#include <math.h>
++
++#include "equine_protocol.h"
++
++namespace EquineConfig {
++
++constexpr uint32_t CONFIG_MAGIC = 0x45434647UL;  // "ECFG"
++constexpr uint16_t CONFIG_SCHEMA_VERSION = 1;
++constexpr uint8_t MAX_GATEWAY_TRACKERS = 12;
++constexpr size_t DEVICE_ID_SIZE = 25;       // 24 chars + NUL
++constexpr size_t DEVICE_NAME_SIZE = 33;     // 32 chars + NUL
++constexpr size_t WIFI_SSID_SIZE = 33;
++constexpr size_t WIFI_PASSWORD_SIZE = 65;
++constexpr size_t MQTT_HOST_SIZE = 65;
++constexpr size_t MQTT_USERNAME_SIZE = 33;
++constexpr size_t MQTT_PASSWORD_SIZE = 65;
++constexpr size_t MQTT_BASE_TOPIC_SIZE = 33;
++
++constexpr const char* CONFIG_NAMESPACE = "eqcfg";
++constexpr const char* ACTIVE_CONFIG_KEY = "active";
++constexpr const char* BACKUP_CONFIG_KEY = "backup";
++
++enum class DeviceRole : uint8_t {
++  TRACKER = 1,
++  GATEWAY = 2,
++};
++
++struct ConfigHeaderV1 {
++  uint32_t magic;
++  uint16_t schema_version;
++  uint16_t struct_size;
++  uint32_t revision;
++  uint8_t role;
++  uint8_t reserved[3];
++  uint32_t crc32;
++} __attribute__((packed));
++
++struct LoRaConfigV1 {
++  uint32_t frequency_hz;
++  uint32_t bandwidth_hz;
++  int8_t tx_power_dbm;
++  uint8_t spreading_factor;
++  uint8_t coding_rate_denominator;
++  uint8_t preamble_length;
++  uint8_t sync_word;
++  uint8_t reserved[3];
++} __attribute__((packed));
++
++struct TrackerConfigV1 {
++  ConfigHeaderV1 header;
++
++  char device_id[DEVICE_ID_SIZE];
++  char device_name[DEVICE_NAME_SIZE];
++  char wifi_ssid[WIFI_SSID_SIZE];
++  char wifi_password[WIFI_PASSWORD_SIZE];
++
++  uint8_t ble_debug_enabled;
++  uint8_t battery_sense_enabled;
++  uint8_t reserved_flags[2];
++
++  LoRaConfigV1 lora;
++  uint32_t lora_tx_interval_s;
++  uint16_t lora_tx_min_points;
++  uint16_t lora_ack_timeout_ms;
++  uint32_t lora_retry_backoff_s[4];
++
++  float min_distance_m;
++  float min_speed_kmph;
++  float max_hdop;
++  uint16_t min_satellites;
++  uint16_t reserved_gps0;
++  float max_speed_mps;
++  uint32_t max_fix_age_s;
++
++  uint32_t gps_timeout_ms[4];
++  uint32_t gps_full_retry_interval_s;
++  uint16_t gps_initial_listen_ms;
++  uint16_t gps_light_sleep_chunk_ms;
++  uint16_t gps_listen_window_ms;
++  uint16_t reserved_gps1;
++
++  float movement_speed_threshold_kmph;
++  float movement_displacement_threshold_m;
++  float movement_evidence_distance_m;
++  float movement_evidence_step_m;
++  float movement_direction_tolerance_deg;
++  uint8_t movement_evidence_required;
++  uint8_t reserved_movement[3];
++
++  float history_point_spacing_m;
++  float save_distance_threshold_m;
++  uint32_t nvs_save_interval_s;
++
++  uint32_t moving_sleep_s;
++  uint32_t stationary_sleep_s;
++  uint32_t long_stationary_sleep_s;
++  uint32_t no_fix_sleep_s[4];
++  uint16_t stationary_fixes_for_long_sleep;
++  uint16_t stationary_fixes_for_max_sleep;
++} __attribute__((packed));
++
++struct GatewayTrackerConfigV1 {
++  char device_id[DEVICE_ID_SIZE];
++  char device_name[DEVICE_NAME_SIZE];
++  uint8_t enabled;
++  uint8_t accepts_legacy_lora;
++  uint8_t publish_legacy_mqtt_aliases;
++  uint8_t reserved;
++} __attribute__((packed));
++
++struct GatewayConfigV1 {
++  ConfigHeaderV1 header;
++
++  char gateway_id[DEVICE_ID_SIZE];
++  char gateway_name[DEVICE_NAME_SIZE];
++  char wifi_ssid[WIFI_SSID_SIZE];
++  char wifi_password[WIFI_PASSWORD_SIZE];
++  char mqtt_host[MQTT_HOST_SIZE];
++  uint16_t mqtt_port;
++  uint8_t mqtt_tls_enabled;
++  uint8_t reserved_network;
++  char mqtt_username[MQTT_USERNAME_SIZE];
++  char mqtt_password[MQTT_PASSWORD_SIZE];
++  char mqtt_base_topic[MQTT_BASE_TOPIC_SIZE];
++
++  LoRaConfigV1 lora;
++  uint16_t mqtt_buffer_size;
++  uint16_t dedup_save_interval;
++  uint32_t wifi_retry_interval_ms;
++  uint32_t mqtt_retry_interval_ms;
++
++  uint8_t tracker_count;
++  uint8_t reserved_registry[3];
++  GatewayTrackerConfigV1 trackers[MAX_GATEWAY_TRACKERS];
++} __attribute__((packed));
++
++static_assert(sizeof(TrackerConfigV1) < 1024,
++              "Tracker config should remain a compact NVS blob");
++static_assert(sizeof(GatewayConfigV1) < 1600,
++              "Gateway config should remain below the practical NVS blob limit");
++
++inline uint32_t crc32(const uint8_t* data, size_t length) {
++  uint32_t crc = 0xFFFFFFFFUL;
++  for (size_t i = 0; i < length; i++) {
++    crc ^= data[i];
++    for (uint8_t bit = 0; bit < 8; bit++) {
++      const uint32_t mask = -(crc & 1UL);
++      crc = (crc >> 1) ^ (0xEDB88320UL & mask);
++    }
++  }
++  return ~crc;
++}
++
++inline bool isNullTerminated(const char* value, size_t capacity) {
++  return value && memchr(value, '\0', capacity) != nullptr;
++}
++
++inline bool isValidCanonicalId(const char* id, size_t capacity) {
++  if (!isNullTerminated(id, capacity)) return false;
++  const size_t length = strnlen(id, capacity);
++  if (length == 0 || length >= capacity) return false;
++  for (size_t i = 0; i < length; i++) {
++    const char c = id[i];
++    const bool valid =
++      (c >= 'a' && c <= 'z') ||
++      (c >= '0' && c <= '9') ||
++      (i > 0 && (c == '-' || c == '_'));
++    if (!valid) return false;
++  }
++  return true;
++}
++
++inline bool isValidDisplayName(const char* name, size_t capacity) {
++  if (!isNullTerminated(name, capacity)) return false;
++  const size_t length = strnlen(name, capacity);
++  if (length == 0 || length >= capacity) return false;
++  for (size_t i = 0; i < length; i++) {
++    const uint8_t c = static_cast<uint8_t>(name[i]);
++    if (c < 0x20 || c == 0x7F) return false;
++  }
++  return true;
++}
++
++inline bool isFiniteRange(float value, float minimum, float maximum) {
++  return isfinite(value) && value >= minimum && value <= maximum;
++}
++
++inline bool isSupportedBandwidth(uint32_t bandwidth_hz) {
++  return bandwidth_hz == 62500UL || bandwidth_hz == 125000UL ||
++         bandwidth_hz == 250000UL || bandwidth_hz == 500000UL;
++}
++
++inline bool validateLoRa(const LoRaConfigV1& config) {
++  return config.frequency_hz >= 863000000UL &&
++         config.frequency_hz <= 870000000UL &&
++         isSupportedBandwidth(config.bandwidth_hz) &&
++         config.tx_power_dbm >= 2 && config.tx_power_dbm <= 22 &&
++         config.spreading_factor >= 7 && config.spreading_factor <= 12 &&
++         config.coding_rate_denominator >= 5 &&
++         config.coding_rate_denominator <= 8 &&
++         config.preamble_length >= 6 && config.preamble_length <= 32;
++}
++
++template <typename T>
++inline void finalize(T& config, DeviceRole role, uint32_t revision) {
++  config.header.magic = CONFIG_MAGIC;
++  config.header.schema_version = CONFIG_SCHEMA_VERSION;
++  config.header.struct_size = sizeof(T);
++  config.header.revision = revision == 0 ? 1 : revision;
++  config.header.role = static_cast<uint8_t>(role);
++  memset(config.header.reserved, 0, sizeof(config.header.reserved));
++  config.header.crc32 = 0;
++  config.header.crc32 = crc32(
++    reinterpret_cast<const uint8_t*>(&config), sizeof(config));
++}
++
++template <typename T>
++inline bool validateEnvelope(const T& config, DeviceRole expected_role) {
++  if (config.header.magic != CONFIG_MAGIC ||
++      config.header.schema_version != CONFIG_SCHEMA_VERSION ||
++      config.header.struct_size != sizeof(T) ||
++      config.header.role != static_cast<uint8_t>(expected_role) ||
++      config.header.revision == 0) {
++    return false;
++  }
++
++  T copy;
++  memcpy(&copy, &config, sizeof(copy));
++  const uint32_t expected_crc = copy.header.crc32;
++  copy.header.crc32 = 0;
++  return expected_crc == crc32(
++    reinterpret_cast<const uint8_t*>(&copy), sizeof(copy));
++}
++
++inline bool validateTrackerConfig(const TrackerConfigV1& config) {
++  if (!validateEnvelope(config, DeviceRole::TRACKER) ||
++      !isValidCanonicalId(config.device_id, sizeof(config.device_id)) ||
++      !isValidDisplayName(config.device_name, sizeof(config.device_name)) ||
++      !isNullTerminated(config.wifi_ssid, sizeof(config.wifi_ssid)) ||
++      !isNullTerminated(config.wifi_password, sizeof(config.wifi_password)) ||
++      !validateLoRa(config.lora)) {
++    return false;
++  }
++
++  if (config.lora_tx_interval_s < 10 || config.lora_tx_interval_s > 86400 ||
++      config.lora_tx_min_points == 0 || config.lora_tx_min_points > 100 ||
++      config.lora_ack_timeout_ms < 100 || config.lora_ack_timeout_ms > 10000) {
++    return false;
++  }
++  for (uint8_t i = 0; i < 4; i++) {
++    if (config.lora_retry_backoff_s[i] < 10 ||
++        config.lora_retry_backoff_s[i] > 86400 ||
++        config.gps_timeout_ms[i] < 1000 ||
++        config.gps_timeout_ms[i] > 180000 ||
++        config.no_fix_sleep_s[i] < 10 ||
++        config.no_fix_sleep_s[i] > 86400) {
++      return false;
++    }
++    if (i > 0 &&
++        (config.lora_retry_backoff_s[i] < config.lora_retry_backoff_s[i - 1] ||
++         config.gps_timeout_ms[i] > config.gps_timeout_ms[i - 1] ||
++         config.no_fix_sleep_s[i] < config.no_fix_sleep_s[i - 1])) {
++      return false;
++    }
++  }
++
++  return isFiniteRange(config.min_distance_m, 0.5f, 100.0f) &&
++         isFiniteRange(config.min_speed_kmph, 0.0f, 30.0f) &&
++         isFiniteRange(config.max_hdop, 0.5f, 20.0f) &&
++         config.min_satellites >= 3 && config.min_satellites <= 64 &&
++         isFiniteRange(config.max_speed_mps, 1.0f, 100.0f) &&
++         config.max_fix_age_s >= 60 && config.max_fix_age_s <= 604800 &&
++         config.gps_full_retry_interval_s >= 60 &&
++         config.gps_full_retry_interval_s <= 86400 &&
++         config.gps_initial_listen_ms >= 250 &&
++         config.gps_initial_listen_ms <= 30000 &&
++         config.gps_light_sleep_chunk_ms >= 250 &&
++         config.gps_light_sleep_chunk_ms <= 30000 &&
++         config.gps_listen_window_ms >= 250 &&
++         config.gps_listen_window_ms <= 30000 &&
++         isFiniteRange(config.movement_speed_threshold_kmph, 0.1f, 30.0f) &&
++         isFiniteRange(config.movement_displacement_threshold_m, 1.0f, 200.0f) &&
++         isFiniteRange(config.movement_evidence_distance_m, 0.5f, 100.0f) &&
++         isFiniteRange(config.movement_evidence_step_m, 0.5f, 100.0f) &&
++         isFiniteRange(config.movement_direction_tolerance_deg, 1.0f, 180.0f) &&
++         config.movement_evidence_required >= 1 &&
++         config.movement_evidence_required <= 10 &&
++         isFiniteRange(config.history_point_spacing_m, 1.0f, 1000.0f) &&
++         isFiniteRange(config.save_distance_threshold_m, 10.0f, 10000.0f) &&
++         config.nvs_save_interval_s >= 60 && config.nvs_save_interval_s <= 86400 &&
++         config.moving_sleep_s >= 10 && config.moving_sleep_s <= 86400 &&
++         config.stationary_sleep_s >= config.moving_sleep_s &&
++         config.stationary_sleep_s <= 86400 &&
++         config.long_stationary_sleep_s >= config.stationary_sleep_s &&
++         config.long_stationary_sleep_s <= 86400 &&
++         config.stationary_fixes_for_long_sleep >= 1 &&
++         config.stationary_fixes_for_long_sleep <= 1000 &&
++         config.stationary_fixes_for_max_sleep >=
++           config.stationary_fixes_for_long_sleep &&
++         config.stationary_fixes_for_max_sleep <= 1000;
++}
++
++inline bool validateGatewayConfig(const GatewayConfigV1& config) {
++  if (!validateEnvelope(config, DeviceRole::GATEWAY) ||
++      !isValidCanonicalId(config.gateway_id, sizeof(config.gateway_id)) ||
++      !isValidDisplayName(config.gateway_name, sizeof(config.gateway_name)) ||
++      !isNullTerminated(config.wifi_ssid, sizeof(config.wifi_ssid)) ||
++      !isNullTerminated(config.wifi_password, sizeof(config.wifi_password)) ||
++      !isNullTerminated(config.mqtt_host, sizeof(config.mqtt_host)) ||
++      strnlen(config.mqtt_host, sizeof(config.mqtt_host)) == 0 ||
++      !isNullTerminated(config.mqtt_username, sizeof(config.mqtt_username)) ||
++      !isNullTerminated(config.mqtt_password, sizeof(config.mqtt_password)) ||
++      !isValidCanonicalId(config.mqtt_base_topic, sizeof(config.mqtt_base_topic)) ||
++      !validateLoRa(config.lora) ||
++      config.mqtt_port == 0 ||
++      config.mqtt_tls_enabled != 0 ||
++      config.mqtt_buffer_size < 512 || config.mqtt_buffer_size > 4096 ||
++      config.dedup_save_interval == 0 || config.dedup_save_interval > 1000 ||
++      config.wifi_retry_interval_ms < 1000 ||
++      config.mqtt_retry_interval_ms < 1000 ||
++      config.tracker_count > MAX_GATEWAY_TRACKERS) {
++    return false;
++  }
++
++  uint8_t legacy_count = 0;
++  for (uint8_t i = 0; i < config.tracker_count; i++) {
++    const GatewayTrackerConfigV1& tracker = config.trackers[i];
++    if (!tracker.enabled) continue;
++    if (!isValidCanonicalId(tracker.device_id, sizeof(tracker.device_id)) ||
++        !isValidDisplayName(tracker.device_name, sizeof(tracker.device_name))) {
++      return false;
++    }
++    if (tracker.accepts_legacy_lora) legacy_count++;
++    const uint64_t hash = EquineProtocol::deviceIdHash(tracker.device_id);
++    for (uint8_t previous = 0; previous < i; previous++) {
++      if (!config.trackers[previous].enabled) continue;
++      if (hash == EquineProtocol::deviceIdHash(
++                    config.trackers[previous].device_id)) {
++        return false;
++      }
++    }
++  }
++  return legacy_count <= 1;
++}
++
++inline void setDefaultLoRa(LoRaConfigV1& config) {
++  memset(&config, 0, sizeof(config));
++  config.frequency_hz = 868000000UL;
++  config.bandwidth_hz = 125000UL;
++  config.tx_power_dbm = 20;
++  config.spreading_factor = 10;
++  config.coding_rate_denominator = 5;
++  config.preamble_length = 8;
++  config.sync_word = 0x12;
++}
++
++inline void makeDefaultTrackerConfig(
++    TrackerConfigV1& config,
++    const char* device_id,
++    const char* device_name,
++    const char* default_wifi_ssid,
++    const char* default_wifi_password) {
++  memset(&config, 0, sizeof(config));
++  strlcpy(config.device_id, device_id, sizeof(config.device_id));
++  strlcpy(config.device_name, device_name, sizeof(config.device_name));
++  strlcpy(config.wifi_ssid, default_wifi_ssid ? default_wifi_ssid : "",
++          sizeof(config.wifi_ssid));
++  strlcpy(config.wifi_password,
++          default_wifi_password ? default_wifi_password : "",
++          sizeof(config.wifi_password));
++  config.ble_debug_enabled = 0;
++  config.battery_sense_enabled = 1;
++  setDefaultLoRa(config.lora);
++  config.lora_tx_interval_s = 300;
++  config.lora_tx_min_points = 3;
++  config.lora_ack_timeout_ms = 800;
++  config.lora_retry_backoff_s[0] = 60;
++  config.lora_retry_backoff_s[1] = 120;
++  config.lora_retry_backoff_s[2] = 300;
++  config.lora_retry_backoff_s[3] = 600;
++  config.min_distance_m = 2.5f;
++  config.min_speed_kmph = 0.5f;
++  config.max_hdop = 2.0f;
++  config.min_satellites = 6;
++  config.max_speed_mps = 20.0f;
++  config.max_fix_age_s = 43200;
++  config.gps_timeout_ms[0] = 30000;
++  config.gps_timeout_ms[1] = 20000;
++  config.gps_timeout_ms[2] = 10000;
++  config.gps_timeout_ms[3] = 8000;
++  config.gps_full_retry_interval_s = 3600;
++  config.gps_initial_listen_ms = 5000;
++  config.gps_light_sleep_chunk_ms = 5000;
++  config.gps_listen_window_ms = 2000;
++  config.movement_speed_threshold_kmph = 1.0f;
++  config.movement_displacement_threshold_m = 10.0f;
++  config.movement_evidence_distance_m = 4.5f;
++  config.movement_evidence_step_m = 2.0f;
++  config.movement_direction_tolerance_deg = 60.0f;
++  config.movement_evidence_required = 2;
++  config.history_point_spacing_m = 15.0f;
++  config.save_distance_threshold_m = 250.0f;
++  config.nvs_save_interval_s = 3600;
++  config.moving_sleep_s = 60;
++  config.stationary_sleep_s = 300;
++  config.long_stationary_sleep_s = 600;
++  config.no_fix_sleep_s[0] = 120;
++  config.no_fix_sleep_s[1] = 300;
++  config.no_fix_sleep_s[2] = 600;
++  config.no_fix_sleep_s[3] = 900;
++  config.stationary_fixes_for_long_sleep = 3;
++  config.stationary_fixes_for_max_sleep = 12;
++  finalize(config, DeviceRole::TRACKER, 1);
++}
++
++inline void makeDefaultGatewayConfig(
++    GatewayConfigV1& config,
++    const char* gateway_id,
++    const char* gateway_name,
++    const char* default_wifi_ssid,
++    const char* default_wifi_password,
++    const char* default_mqtt_host,
++    uint16_t default_mqtt_port,
++    const char* default_mqtt_username,
++    const char* default_mqtt_password) {
++  memset(&config, 0, sizeof(config));
++  strlcpy(config.gateway_id, gateway_id, sizeof(config.gateway_id));
++  strlcpy(config.gateway_name, gateway_name, sizeof(config.gateway_name));
++  strlcpy(config.wifi_ssid, default_wifi_ssid ? default_wifi_ssid : "",
++          sizeof(config.wifi_ssid));
++  strlcpy(config.wifi_password,
++          default_wifi_password ? default_wifi_password : "",
++          sizeof(config.wifi_password));
++  strlcpy(config.mqtt_host, default_mqtt_host ? default_mqtt_host : "",
++          sizeof(config.mqtt_host));
++  config.mqtt_port = default_mqtt_port ? default_mqtt_port : 1883;
++  config.mqtt_tls_enabled = 0;
++  strlcpy(config.mqtt_username,
++          default_mqtt_username ? default_mqtt_username : "",
++          sizeof(config.mqtt_username));
++  strlcpy(config.mqtt_password,
++          default_mqtt_password ? default_mqtt_password : "",
++          sizeof(config.mqtt_password));
++  strlcpy(config.mqtt_base_topic, "equine", sizeof(config.mqtt_base_topic));
++  setDefaultLoRa(config.lora);
++  config.mqtt_buffer_size = 1024;
++  config.dedup_save_interval = 10;
++  config.wifi_retry_interval_ms = 10000;
++  config.mqtt_retry_interval_ms = 5000;
++  finalize(config, DeviceRole::GATEWAY, 1);
++}
++
++}  // namespace EquineConfig
+--- /dev/null	2026-07-15 07:50:44.837055935 +0000
++++ /mnt/data/_work_step3/tracker_v2/EQUINE_CONFIG_V1.md	2026-07-15 08:11:19.846130708 +0000
+@@ -0,0 +1,102 @@
++# Equine persistent configuration schema v1
++
++This step adds a versioned, CRC-protected persistent configuration to the
++tracker and gateway. It is the storage foundation for BLE/Wi-Fi onboarding in
++the next implementation step.
++
++## Storage envelope
++
++Both roles store a fixed-size configuration blob in ESP32 Preferences namespace
++`eqcfg` under two keys:
++
++- `active`: the configuration used at boot
++- `backup`: the last independently validated active configuration
++
++Every blob begins with `ConfigHeaderV1`:
++
++| Field | Purpose |
++|---|---|
++| `magic` | Distinguishes Equine configuration from unrelated NVS data |
++| `schema_version` | Configuration data-model version |
++| `struct_size` | Rejects incompatible layouts before decoding |
++| `revision` | Monotonic revision for synchronization and conflict handling |
++| `role` | Tracker or gateway |
++| `crc32` | Detects corruption and incomplete writes |
++
++On load, firmware tries `active`, then `backup`, then factory defaults. A valid
++backup repairs the active slot. Saving first copies the previous valid active
++blob to backup and then writes the newly validated active blob.
++
++## TrackerConfigV1
++
++The tracker configuration contains:
++
++- canonical device ID, display name and derived public device hash
++- Wi-Fi setup credentials and bounded BLE-debug preference
++- LoRa frequency, bandwidth, spreading factor, coding rate, preamble, sync word
++  and TX power
++- normal batching, ACK timeout and retry-backoff policy
++- GPS quality and anti-teleport thresholds
++- acquisition timeout/backoff policy
++- movement classifier thresholds
++- history spacing and NVS checkpoint policy
++- moving, stationary, long-stationary and no-fix sleep durations
++
++The history buffer size and wire delta unit remain firmware-layout constants;
++changing them requires a state/protocol migration rather than a normal setting.
++
++### Tracker migration
++
++When no valid configuration blob exists, the first boot creates schema v1 from
++factory defaults and imports the old `tracker` namespace values:
++
++- `ssid`
++- `pw`
++- `ble_log`
++
++Existing distance, boot ID, daily age, history-in-RTC and dedup/transmission
++state are not part of the configuration blob and remain handled separately.
++
++Factory reset clears both the old tracker state namespace and `eqcfg`.
++
++## GatewayConfigV1
++
++The gateway configuration contains:
++
++- gateway ID and display name
++- Wi-Fi credentials
++- MQTT host, port, username, password and base topic
++- LoRa parameters
++- MQTT buffer and reconnect settings
++- deduplication checkpoint interval
++- up to 12 tracker registrations, each with identity, enabled state, legacy
++  LoRa mapping and legacy MQTT alias policy
++
++The first boot seeds the configuration from `secrets.h` and migrates the former
++compile-time Wera registry entry. Per-tracker deduplication namespaces are based
++on the device hash, so existing cursors remain compatible.
++
++`mqtt_tls_enabled` is reserved in schema v1 but validation currently requires it
++to remain false until the TLS transport step is implemented.
++
++## Validation
++
++Configuration is rejected unless, among other constraints:
++
++- canonical IDs contain lowercase letters, digits, `_` or `-`
++- device hashes are unique in the gateway registry
++- no more than one tracker accepts unversioned legacy LoRa
++- LoRa values are within the supported EU-band and modem ranges
++- timeout, sleep and retry sequences are internally consistent
++- strings are terminated and all floating-point thresholds are finite
++- CRC, role, schema and structure size match
++
++## Read-only API
++
++Both devices expose `GET /api/v1/config` while their web server is active. The
++response deliberately omits Wi-Fi and MQTT passwords. The gateway's existing
++`GET /api/v1/trackers` runtime endpoint remains available.
++
++Configuration mutation is intentionally not exposed yet. The next step adds the
++onboarding/configuration API, validation responses, transactional updates and
++restart/apply semantics using these storage functions.
+--- /mnt/data/_work_step3/gateway_v2/equine_gateway_multi_v2.ino	2026-07-15 07:50:54.985067388 +0000
++++ /mnt/data/_work_step3/gateway_v3/equine_gateway_config_v3.ino	2026-07-15 08:04:07.450647938 +0000
+@@ -11,15 +11,31 @@
+ #include <WebServer.h>
+ #include "secrets.h"
+ #include "equine_protocol.h"
+-#include "equine_gateway_registry.h"
++#include "equine_config.h"
+ 
+ // ==========================================
+-// GATEWAY / MULTI-TRACKER REGISTRY
++// VERSIONED PERSISTENT GATEWAY CONFIGURATION
+ // ==========================================
+-constexpr uint16_t MQTT_BUFFER_SIZE = 1024;
++EquineConfig::GatewayConfigV1 gateway_config{};
++Preferences configPrefs;
++
++#define GATEWAY_ID                  (gateway_config.gateway_id)
++#define GATEWAY_NAME                (gateway_config.gateway_name)
++#define GATEWAY_TRACKER_COUNT       (tracker_runtime_count)
++#define MQTT_BUFFER_SIZE            ((uint16_t)gateway_config.mqtt_buffer_size)
++#define WIFI_RETRY_INTERVAL_MS      ((uint32_t)gateway_config.wifi_retry_interval_ms)
++#define MQTT_RETRY_INTERVAL_MS      ((uint32_t)gateway_config.mqtt_retry_interval_ms)
++#define DEDUP_SAVE_INTERVAL         ((uint32_t)gateway_config.dedup_save_interval)
++#define LORA_FREQ                   ((double)gateway_config.lora.frequency_hz)
++#define LORA_TX_POWER_DBM           ((int)gateway_config.lora.tx_power_dbm)
++#define LORA_SPREADING_FACTOR       ((int)gateway_config.lora.spreading_factor)
++#define LORA_SIGNAL_BANDWIDTH       ((long)gateway_config.lora.bandwidth_hz)
++#define LORA_CODING_RATE            ((int)gateway_config.lora.coding_rate_denominator)
++#define LORA_PREAMBLE_LENGTH        ((int)gateway_config.lora.preamble_length)
++#define LORA_SYNC_WORD              ((int)gateway_config.lora.sync_word)
+ 
+ struct TrackerRuntime {
+-  const GatewayTrackerConfig* config;
++  const EquineConfig::GatewayTrackerConfigV1* config;
+   uint64_t device_id_hash;
+   char hash_text[17];
+   char state_topic[96];
+@@ -38,7 +54,8 @@
+   int16_t last_rssi;
+ };
+ 
+-TrackerRuntime tracker_runtime[GATEWAY_TRACKER_COUNT];
++TrackerRuntime tracker_runtime[EquineConfig::MAX_GATEWAY_TRACKERS];
++size_t tracker_runtime_count = 0;
+ char gateway_hash_text[17];
+ char gateway_availability_topic[96];
+ char ota_hostname[64];
+@@ -51,23 +68,10 @@
+ #define RST   14
+ #define DIO0  26
+ 
+-#define LORA_FREQ 868E6
+-const int LORA_TX_POWER_DBM = 20;
+-const int LORA_SPREADING_FACTOR = 10;
+-const long LORA_SIGNAL_BANDWIDTH = 125E3;
+-const int LORA_CODING_RATE = 5;
+-const int LORA_PREAMBLE_LENGTH = 8;
+-const int LORA_SYNC_WORD = 0x12;
+-const uint8_t HISTORY_SIZE = 25;
+-const int32_t DELTA_UNIT_MICRODEG = 10; // 1e-5 degree steps expressed in microdegrees
++const int32_t DELTA_UNIT_MICRODEG = 10;
+ const uint32_t LOG_HEARTBEAT_INTERVAL_MS = 30000;
+-const uint8_t LOG_HISTORY_LINES = 25; // Increased for web UI
++const uint8_t LOG_HISTORY_LINES = 25;
+ const size_t LOG_HISTORY_LINE_LENGTH = 160;
+-const uint32_t WIFI_RETRY_INTERVAL_MS = 10000;
+-const uint32_t MQTT_RETRY_INTERVAL_MS = 5000;
+-
+-// Persist dedup progress every N successful publishes to reduce flash wear
+-const uint32_t DEDUP_SAVE_INTERVAL = 10;
+ 
+ // ==========================================
+ // VERSIONED PAYLOAD FORMAT
+@@ -230,6 +234,119 @@
+   return published;
+ }
+ 
++
++// ==========================================
++// CONFIGURATION STORAGE
++// ==========================================
++bool readGatewayConfigBlob(const char* key,
++                           EquineConfig::GatewayConfigV1& output) {
++  if (!configPrefs.begin(EquineConfig::CONFIG_NAMESPACE, true)) return false;
++  const size_t length = configPrefs.getBytesLength(key);
++  const bool size_ok = length == sizeof(output);
++  const size_t read = size_ok
++    ? configPrefs.getBytes(key, &output, sizeof(output))
++    : 0;
++  configPrefs.end();
++  return size_ok && read == sizeof(output) &&
++         EquineConfig::validateGatewayConfig(output);
++}
++
++bool writeGatewayConfigBlob(const char* key,
++                            const EquineConfig::GatewayConfigV1& value) {
++  if (!configPrefs.begin(EquineConfig::CONFIG_NAMESPACE, false)) return false;
++  const size_t written = configPrefs.putBytes(key, &value, sizeof(value));
++  configPrefs.end();
++  return written == sizeof(value);
++}
++
++void makeGatewayFactoryConfig() {
++  EquineConfig::makeDefaultGatewayConfig(
++    gateway_config,
++    "home",
++    "Home Equine Gateway",
++    ssid,
++    password,
++    mqtt_server,
++    mqtt_port,
++    mqtt_user,
++    mqtt_pass);
++
++  // Migration seed matching the former compile-time registry. Future
++  // onboarding writes the same versioned structure without recompilation.
++  gateway_config.tracker_count = 1;
++  EquineConfig::GatewayTrackerConfigV1& tracker = gateway_config.trackers[0];
++  strlcpy(tracker.device_id, "wera", sizeof(tracker.device_id));
++  strlcpy(tracker.device_name, "Wera", sizeof(tracker.device_name));
++  tracker.enabled = 1;
++  tracker.accepts_legacy_lora = 1;
++  tracker.publish_legacy_mqtt_aliases = 1;
++  EquineConfig::finalize(
++    gateway_config, EquineConfig::DeviceRole::GATEWAY, 1);
++}
++
++bool saveGatewayConfig(bool increment_revision = true) {
++  EquineConfig::GatewayConfigV1 previous{};
++  if (readGatewayConfigBlob(EquineConfig::ACTIVE_CONFIG_KEY, previous)) {
++    if (!writeGatewayConfigBlob(EquineConfig::BACKUP_CONFIG_KEY, previous)) {
++      logPrintln("Warning: failed to update gateway configuration backup.");
++    }
++  }
++
++  uint32_t revision = gateway_config.header.revision;
++  if (revision == 0) revision = 1;
++  else if (increment_revision && revision < UINT32_MAX) revision++;
++  EquineConfig::finalize(
++    gateway_config, EquineConfig::DeviceRole::GATEWAY, revision);
++
++  if (!EquineConfig::validateGatewayConfig(gateway_config)) {
++    logPrintln("Refusing to save invalid gateway configuration.");
++    return false;
++  }
++  if (!writeGatewayConfigBlob(
++        EquineConfig::ACTIVE_CONFIG_KEY, gateway_config)) {
++    logPrintln("Failed to save gateway configuration.");
++    return false;
++  }
++
++  logPrintf("Saved gateway config schema=%u revision=%lu id=%s trackers=%u.\n",
++            gateway_config.header.schema_version,
++            (unsigned long)gateway_config.header.revision,
++            gateway_config.gateway_id,
++            gateway_config.tracker_count);
++  return true;
++}
++
++bool loadGatewayConfig() {
++  const char* source = "active";
++  if (!readGatewayConfigBlob(
++        EquineConfig::ACTIVE_CONFIG_KEY, gateway_config)) {
++    source = "backup";
++    if (!readGatewayConfigBlob(
++          EquineConfig::BACKUP_CONFIG_KEY, gateway_config)) {
++      source = "factory/migrated";
++      makeGatewayFactoryConfig();
++      if (!saveGatewayConfig(false)) return false;
++    } else {
++      writeGatewayConfigBlob(EquineConfig::ACTIVE_CONFIG_KEY, gateway_config);
++    }
++  }
++
++  logPrintf("Loaded gateway config from %s: schema=%u revision=%lu id=%s trackers=%u.\n",
++            source,
++            gateway_config.header.schema_version,
++            (unsigned long)gateway_config.header.revision,
++            gateway_config.gateway_id,
++            gateway_config.tracker_count);
++  return true;
++}
++
++void clearGatewayConfigStorage() {
++  if (configPrefs.begin(EquineConfig::CONFIG_NAMESPACE, false)) {
++    configPrefs.clear();
++    configPrefs.end();
++  }
++}
++
+ void buildDedupNamespace(uint64_t hash, char* output, size_t output_size) {
+   // ESP32 Preferences namespaces are limited to 15 characters. Keep 56 bits
+   // of the public hash, prefixed with 'd'. Registry collisions are checked at
+@@ -264,23 +381,38 @@
+ }
+ 
+ bool initializeTrackerRegistry() {
++  tracker_runtime_count = 0;
++  memset(tracker_runtime, 0, sizeof(tracker_runtime));
++
+   const uint64_t gateway_hash = EquineProtocol::deviceIdHash(GATEWAY_ID);
+   EquineProtocol::formatDeviceHash(
+     gateway_hash, gateway_hash_text, sizeof(gateway_hash_text)
+   );
+   snprintf(
+     gateway_availability_topic, sizeof(gateway_availability_topic),
+-    "equine/v%u/gateways/%s/availability",
+-    EquineProtocol::MQTT_API_VERSION, gateway_hash_text
++    "%s/v%u/gateways/%s/availability",
++    gateway_config.mqtt_base_topic,
++    EquineProtocol::MQTT_API_VERSION,
++    gateway_hash_text
+   );
+   snprintf(ota_hostname, sizeof(ota_hostname), "equine-gateway-%s", GATEWAY_ID);
+ 
+   uint8_t legacy_count = 0;
+-  for (size_t i = 0; i < GATEWAY_TRACKER_COUNT; i++) {
+-    TrackerRuntime& tracker = tracker_runtime[i];
++  for (uint8_t config_index = 0;
++       config_index < gateway_config.tracker_count;
++       config_index++) {
++    const EquineConfig::GatewayTrackerConfigV1& configured =
++      gateway_config.trackers[config_index];
++    if (!configured.enabled) continue;
++    if (tracker_runtime_count >= EquineConfig::MAX_GATEWAY_TRACKERS) {
++      logPrintln("Configuration has more enabled trackers than runtime capacity.");
++      return false;
++    }
++
++    TrackerRuntime& tracker = tracker_runtime[tracker_runtime_count];
+     memset(&tracker, 0, sizeof(tracker));
+-    tracker.config = &GATEWAY_TRACKERS[i];
+-    tracker.device_id_hash = EquineProtocol::deviceIdHash(tracker.config->id);
++    tracker.config = &configured;
++    tracker.device_id_hash = EquineProtocol::deviceIdHash(tracker.config->device_id);
+     tracker.last_rssi = 0;
+ 
+     EquineProtocol::formatDeviceHash(
+@@ -292,49 +424,52 @@
+       sizeof(tracker.dedup_namespace)
+     );
+ 
+-    char tracker_hash_copy[17];
+-    strlcpy(tracker_hash_copy, tracker.hash_text, sizeof(tracker_hash_copy));
+     snprintf(
+       tracker.state_topic, sizeof(tracker.state_topic),
+-      "equine/v%u/trackers/%s/state",
+-      EquineProtocol::MQTT_API_VERSION, tracker_hash_copy
++      "%s/v%u/trackers/%s/state",
++      gateway_config.mqtt_base_topic,
++      EquineProtocol::MQTT_API_VERSION,
++      tracker.hash_text
+     );
+     snprintf(
+       tracker.availability_topic, sizeof(tracker.availability_topic),
+-      "equine/v%u/trackers/%s/availability",
+-      EquineProtocol::MQTT_API_VERSION, tracker_hash_copy
++      "%s/v%u/trackers/%s/availability",
++      gateway_config.mqtt_base_topic,
++      EquineProtocol::MQTT_API_VERSION,
++      tracker.hash_text
+     );
+     snprintf(
+       tracker.legacy_state_topic, sizeof(tracker.legacy_state_topic),
+-      "horse/%s/state", tracker.config->id
++      "horse/%s/state", tracker.config->device_id
+     );
+     snprintf(
+       tracker.legacy_availability_topic,
+       sizeof(tracker.legacy_availability_topic),
+-      "horse/%s/availability", tracker.config->id
++      "horse/%s/availability", tracker.config->device_id
+     );
+ 
+     if (tracker.config->accepts_legacy_lora) legacy_count++;
+ 
+-    for (size_t previous = 0; previous < i; previous++) {
++    for (size_t previous = 0; previous < tracker_runtime_count; previous++) {
+       if (tracker_runtime[previous].device_id_hash == tracker.device_id_hash) {
+-        logPrintf("Registry error: duplicate device hash %s for '%s' and '%s'.\n",
++        logPrintf("Configuration error: duplicate device hash %s for '%s' and '%s'.\n",
+                   tracker.hash_text,
+-                  tracker_runtime[previous].config->id,
+-                  tracker.config->id);
++                  tracker_runtime[previous].config->device_id,
++                  tracker.config->device_id);
+         return false;
+       }
+       if (strcmp(tracker_runtime[previous].dedup_namespace,
+                  tracker.dedup_namespace) == 0) {
+-        logPrintf("Registry error: dedup namespace collision for %s.\n",
++        logPrintf("Configuration error: dedup namespace collision for %s.\n",
+                   tracker.hash_text);
+         return false;
+       }
+     }
++    tracker_runtime_count++;
+   }
+ 
+   if (legacy_count > 1) {
+-    logPrintln("Registry error: only one tracker may accept legacy LoRa.");
++    logPrintln("Configuration error: only one tracker may accept legacy LoRa.");
+     return false;
+   }
+ 
+@@ -411,7 +546,7 @@
+   Preferences dedupPrefs;
+   if (!dedupPrefs.begin(tracker.dedup_namespace, false)) {
+     logPrintf("Failed to open dedup namespace %s for %s.\n",
+-              tracker.dedup_namespace, tracker.config->id);
++              tracker.dedup_namespace, tracker.config->device_id);
+     return;
+   }
+ 
+@@ -445,14 +580,14 @@
+           migrationTarget.putULong("seq", legacy_seq);
+           migrationTarget.end();
+           logPrintf("Migrated legacy dedup cursor to %s for %s.\n",
+-                    tracker.dedup_namespace, tracker.config->id);
++                    tracker.dedup_namespace, tracker.config->device_id);
+         }
+       }
+     }
+   }
+ 
+   logPrintf("Loaded dedup [%s/%s] -> has=%s boot_id=%lu seq=%lu\n",
+-            tracker.config->id,
++            tracker.config->device_id,
+             tracker.hash_text,
+             tracker.has_processed_point ? "true" : "false",
+             (unsigned long)tracker.last_processed_boot_id,
+@@ -483,13 +618,13 @@
+   dedupPrefs.end();
+ 
+   if (!ok) {
+-    logPrintf("Failed to save dedup state for %s.\n", tracker.config->id);
++    logPrintf("Failed to save dedup state for %s.\n", tracker.config->device_id);
+     return;
+   }
+ 
+   tracker.unsaved_dedup_updates = 0;
+   logPrintf("Saved dedup [%s] -> boot_id=%lu seq=%lu\n",
+-            tracker.config->id,
++            tracker.config->device_id,
+             (unsigned long)tracker.last_processed_boot_id,
+             (unsigned long)tracker.last_processed_seq);
+ }
+@@ -560,14 +695,17 @@
+     html += "<h1>" + String(GATEWAY_NAME) + "</h1>";
+     html += "<p>Gateway ID: <code>" + String(GATEWAY_ID) +
+             "</code><br>Gateway hash: <code>" + String(gateway_hash_text) +
+-            "</code><br>Registered trackers: " + String(GATEWAY_TRACKER_COUNT) + "</p>";
++            "</code><br>Config schema/revision: " +
++            String(gateway_config.header.schema_version) + "/" +
++            String(gateway_config.header.revision) +
++            "<br>Registered trackers: " + String(GATEWAY_TRACKER_COUNT) + "</p>";
+     html += "<h2>Tracker registry</h2><table><tr><th>Name</th><th>ID</th><th>Hash</th><th>Legacy</th><th>Last seen</th><th>RSSI</th><th>Dedup cursor</th></tr>";
+ 
+     const uint32_t now = millis();
+     for (size_t i = 0; i < GATEWAY_TRACKER_COUNT; i++) {
+       const TrackerRuntime& tracker = tracker_runtime[i];
+-      html += "<tr><td>" + String(tracker.config->name) + "</td><td><code>" +
+-              String(tracker.config->id) + "</code></td><td><code>" +
++      html += "<tr><td>" + String(tracker.config->device_name) + "</td><td><code>" +
++              String(tracker.config->device_id) + "</code></td><td><code>" +
+               String(tracker.hash_text) + "</code></td><td>" +
+               String(tracker.config->accepts_legacy_lora ? "LoRa " : "") +
+               String(tracker.config->publish_legacy_mqtt_aliases ? "MQTT" : "") +
+@@ -595,6 +733,49 @@
+     webServer.send(200, "text/html", html);
+   });
+ 
++  webServer.on("/api/v1/config", HTTP_GET, []() {
++    String out;
++    out.reserve(3500);
++    out = "{\"config_schema\":" +
++          String(gateway_config.header.schema_version) +
++          ",\"revision\":" + String(gateway_config.header.revision) +
++          ",\"gateway_id\":\"" + String(gateway_config.gateway_id) +
++          "\",\"gateway_name\":\"" + String(gateway_config.gateway_name) +
++          "\",\"gateway_hash\":\"" + String(gateway_hash_text) +
++          "\",\"mqtt_host\":\"" + String(gateway_config.mqtt_host) +
++          "\",\"mqtt_port\":" + String(gateway_config.mqtt_port) +
++          ",\"mqtt_tls_enabled\":" +
++          String(gateway_config.mqtt_tls_enabled ? "true" : "false") +
++          ",\"mqtt_base_topic\":\"" +
++          String(gateway_config.mqtt_base_topic) +
++          "\",\"lora_frequency_hz\":" +
++          String(gateway_config.lora.frequency_hz) +
++          ",\"lora_bandwidth_hz\":" +
++          String(gateway_config.lora.bandwidth_hz) +
++          ",\"lora_sf\":" +
++          String(gateway_config.lora.spreading_factor) +
++          ",\"configured_trackers\":[";
++    bool first = true;
++    for (uint8_t i = 0; i < gateway_config.tracker_count; i++) {
++      const auto& tracker = gateway_config.trackers[i];
++      if (!first) out += ',';
++      first = false;
++      char hash[17];
++      EquineProtocol::formatDeviceHash(
++        EquineProtocol::deviceIdHash(tracker.device_id), hash, sizeof(hash));
++      out += "{\"id\":\"" + String(tracker.device_id) +
++             "\",\"name\":\"" + String(tracker.device_name) +
++             "\",\"device_hash\":\"" + String(hash) +
++             "\",\"enabled\":" + String(tracker.enabled ? "true" : "false") +
++             ",\"accepts_legacy_lora\":" +
++             String(tracker.accepts_legacy_lora ? "true" : "false") +
++             ",\"publish_legacy_mqtt_aliases\":" +
++             String(tracker.publish_legacy_mqtt_aliases ? "true" : "false") + "}";
++    }
++    out += "]}";
++    webServer.send(200, "application/json", out);
++  });
++
+   webServer.on("/api/v1/trackers", HTTP_GET, []() {
+     String out;
+     out.reserve(2500);
+@@ -605,8 +786,8 @@
+     for (size_t i = 0; i < GATEWAY_TRACKER_COUNT; i++) {
+       const TrackerRuntime& tracker = tracker_runtime[i];
+       if (i > 0) out += ',';
+-      out += "{\"id\":\"" + String(tracker.config->id) +
+-             "\",\"name\":\"" + String(tracker.config->name) +
++      out += "{\"id\":\"" + String(tracker.config->device_id) +
++             "\",\"name\":\"" + String(tracker.config->device_name) +
+              "\",\"device_hash\":\"" + String(tracker.hash_text) +
+              "\",\"state_topic\":\"" + String(tracker.state_topic) +
+              "\",\"seen\":" + String(tracker.has_been_seen ? "true" : "false") +
+@@ -723,32 +904,32 @@
+   // Keep the discovery path human-readable while using the hash in unique IDs.
+   snprintf(topic, sizeof(topic),
+            "homeassistant/device_tracker/%s/location/config",
+-           tracker.config->id);
++           tracker.config->device_id);
+   snprintf(payload, sizeof(payload),
+     "{\"name\":\"%s Location\",\"stat_t\":\"%s\","
+     "\"json_attr_t\":\"%s\",\"source_type\":\"gps\","
+     "\"uniq_id\":\"%s_loc\",\"avty_t\":\"%s\","
+     "\"dev\":{\"ids\":[\"%s\"],\"name\":\"%s Tracker\","
+     "\"mdl\":\"Equine Telemetry v1\"}}",
+-    tracker.config->name,
++    tracker.config->device_name,
+     tracker.state_topic,
+     tracker.state_topic,
+     tracker.hash_text,
+     gateway_availability_topic,
+     device_registry_id,
+-    tracker.config->name);
++    tracker.config->device_name);
+   publishRetainedMessage(topic, payload);
+ 
+   snprintf(topic, sizeof(topic),
+            "homeassistant/sensor/%s/distance/config",
+-           tracker.config->id);
++           tracker.config->device_id);
+   snprintf(payload, sizeof(payload),
+     "{\"name\":\"%s Total Distance\",\"stat_t\":\"%s\","
+     "\"val_tpl\":\"{{(value_json.dist_m/1000)|round(2)}}\","
+     "\"unit_of_meas\":\"km\",\"ic\":\"mdi:horse\","
+     "\"stat_cla\":\"measurement\",\"uniq_id\":\"%s_dist\","
+     "\"avty_t\":\"%s\",\"dev\":{\"ids\":[\"%s\"]}}",
+-    tracker.config->name,
++    tracker.config->device_name,
+     tracker.state_topic,
+     tracker.hash_text,
+     gateway_availability_topic,
+@@ -757,14 +938,14 @@
+ 
+   snprintf(topic, sizeof(topic),
+            "homeassistant/sensor/%s/battery/config",
+-           tracker.config->id);
++           tracker.config->device_id);
+   snprintf(payload, sizeof(payload),
+     "{\"name\":\"%s Battery\",\"stat_t\":\"%s\","
+     "\"val_tpl\":\"{{value_json.battery_level}}\","
+     "\"unit_of_meas\":\"%%\",\"dev_cla\":\"battery\","
+     "\"stat_cla\":\"measurement\",\"uniq_id\":\"%s_batt\","
+     "\"avty_t\":\"%s\",\"dev\":{\"ids\":[\"%s\"]}}",
+-    tracker.config->name,
++    tracker.config->device_name,
+     tracker.state_topic,
+     tracker.hash_text,
+     gateway_availability_topic,
+@@ -773,14 +954,14 @@
+ 
+   snprintf(topic, sizeof(topic),
+            "homeassistant/sensor/%s/rssi/config",
+-           tracker.config->id);
++           tracker.config->device_id);
+   snprintf(payload, sizeof(payload),
+     "{\"name\":\"%s LoRa Signal\",\"stat_t\":\"%s\","
+     "\"val_tpl\":\"{{value_json.rssi}}\",\"unit_of_meas\":\"dBm\","
+     "\"dev_cla\":\"signal_strength\",\"stat_cla\":\"measurement\","
+     "\"uniq_id\":\"%s_rssi\",\"avty_t\":\"%s\","
+     "\"dev\":{\"ids\":[\"%s\"]}}",
+-    tracker.config->name,
++    tracker.config->device_name,
+     tracker.state_topic,
+     tracker.hash_text,
+     gateway_availability_topic,
+@@ -845,8 +1026,8 @@
+ 
+   if (client.connect(
+         clientId,
+-        mqtt_user,
+-        mqtt_pass,
++        gateway_config.mqtt_username,
++        gateway_config.mqtt_password,
+         gateway_availability_topic,
+         1,
+         true,
+@@ -865,8 +1046,13 @@
+   Serial.begin(115200);
+   delay(1000);
+ 
++  if (!loadGatewayConfig()) {
++    makeGatewayFactoryConfig();
++    logPrintln("Warning: running with unsaved factory gateway configuration.");
++  }
++
+   if (!initializeTrackerRegistry()) {
+-    logPrintln("Fatal tracker registry error; gateway halted.");
++    logPrintln("Fatal tracker configuration error; gateway halted.");
+     while (true) delay(1000);
+   }
+ 
+@@ -881,8 +1067,8 @@
+     const TrackerRuntime& tracker = tracker_runtime[i];
+     logPrintf("  registry[%u] id=%s name=%s hash=%s legacy_lora=%s legacy_mqtt=%s\n",
+               (unsigned)i,
+-              tracker.config->id,
+-              tracker.config->name,
++              tracker.config->device_id,
++              tracker.config->device_name,
+               tracker.hash_text,
+               tracker.config->accepts_legacy_lora ? "yes" : "no",
+               tracker.config->publish_legacy_mqtt_aliases ? "yes" : "no");
+@@ -890,7 +1076,7 @@
+ 
+   loadAllDedupStates();
+ 
+-  WiFi.begin(ssid, password);
++  WiFi.begin(gateway_config.wifi_ssid, gateway_config.wifi_password);
+   while (WiFi.status() != WL_CONNECTED) {
+     delay(500);
+     logPrint(".");
+@@ -902,7 +1088,7 @@
+   setupRemoteLogging();
+   setupWebInterface();
+ 
+-  client.setServer(mqtt_server, mqtt_port);
++  client.setServer(gateway_config.mqtt_host, gateway_config.mqtt_port);
+   client.setBufferSize(MQTT_BUFFER_SIZE);
+ 
+   SPI.begin(SCK, MISO, MOSI, SS);
+@@ -1023,7 +1209,7 @@
+       header.batt_pct = legacy_header.batt_pct;
+       offset = sizeof(legacy_header);
+       logPrintf("Mapped legacy packet to registered tracker %s.\n",
+-                tracker->config->id);
++                tracker->config->device_id);
+     }
+ 
+     tracker->has_been_seen = true;
+@@ -1066,7 +1252,7 @@
+       "Received %s packet [%s/%s]: transport=%u schema=%u boot=%lu "
+       "first_seq=%lu root=%.6f,%.6f anchors=%u batches=%u RSSI=%d\n",
+       header.legacy ? "legacy" : "v1",
+-      tracker->config->id,
++      tracker->config->device_id,
+       tracker->hash_text,
+       header.transport_version,
+       header.schema_version,
+@@ -1089,7 +1275,7 @@
+ 
+       if (!isValidCoordinateMicrodeg(p_lat, p_lon)) {
+         logPrintf("Invalid coordinate: tracker=%s seq=%lu lat=%ld lon=%ld\n",
+-                  tracker->config->id,
++                  tracker->config->device_id,
+                   (unsigned long)p_seq,
+                   (long)p_lat,
+                   (long)p_lon);
+@@ -1109,7 +1295,7 @@
+                  (unsigned long)p_seq);
+ 
+         logPrintf("  -> New point [%s]: seq=%lu lat=%.6f lon=%.6f dist=%u m\n",
+-                  tracker->config->id,
++                  tracker->config->device_id,
+                   (unsigned long)p_seq,
+                   real_lat,
+                   real_lon,
+@@ -1130,8 +1316,8 @@
+           EquineProtocol::MQTT_API_VERSION,
+           header.transport_version,
+           header.schema_version,
+-          tracker->config->id,
+-          tracker->config->name,
++          tracker->config->device_id,
++          tracker->config->device_name,
+           tracker->hash_text,
+           GATEWAY_ID,
+           gateway_hash_text,
+@@ -1159,7 +1345,7 @@
+         updateDedupState(*tracker, header.boot_id, p_seq);
+       } else {
+         logPrintf("  -> Duplicate already published [%s] boot=%lu seq=%lu\n",
+-                  tracker->config->id,
++                  tracker->config->device_id,
+                   (unsigned long)header.boot_id,
+                   (unsigned long)p_seq);
+       }
+@@ -1219,7 +1405,7 @@
+ 
+     if (!packet_valid || !publish_success || !processed_any_point) {
+       logPrintf("ACK withheld for tracker %s (valid=%s publish=%s points=%s).\n",
+-                tracker->config->id,
++                tracker->config->device_id,
+                 packet_valid ? "yes" : "no",
+                 publish_success ? "yes" : "no",
+                 processed_any_point ? "yes" : "no");
+@@ -1249,12 +1435,12 @@
+     if (txResult) {
+       logPrintf("Sent %s ACK [%s] boot=%lu seq=%lu\n",
+                 header.legacy ? "legacy" : "v1",
+-                tracker->config->id,
++                tracker->config->device_id,
+                 (unsigned long)header.boot_id,
+                 (unsigned long)highest_ackable_seq);
+     } else {
+       logPrintf("Failed to transmit ACK for tracker %s.\n",
+-                tracker->config->id);
++                tracker->config->device_id);
+     }
+   } while (false);
+ 
+--- /mnt/data/_work_step3/gateway_v2/equine_gateway_registry.h	2026-07-15 07:50:54.938644552 +0000
++++ /dev/null	2026-07-15 07:50:44.837055935 +0000
+@@ -1,44 +0,0 @@
+-#pragma once
+-
+-#include <stddef.h>
+-#include <stdint.h>
+-
+-// Compile-time gateway and tracker registry.
+-//
+-// This is intentionally static for protocol step 2. A later configuration
+-// step will move these values into a versioned, persistent configuration that
+-// can be edited through onboarding without recompiling the firmware.
+-
+-struct GatewayTrackerConfig {
+-  // Stable canonical ID used to derive the public 64-bit routing hash.
+-  // Keep this lowercase and do not reuse an ID for a different physical unit.
+-  const char* id;
+-
+-  // Human-readable name used by logs and Home Assistant discovery.
+-  const char* name;
+-
+-  // Map old unversioned LoRa packets to this tracker. At most one registry
+-  // entry should set this to true because legacy packets contain no identity.
+-  bool accepts_legacy_lora;
+-
+-  // Also publish the old horse/<id>/... MQTT aliases during migration.
+-  bool publish_legacy_mqtt_aliases;
+-};
+-
+-static const char* const GATEWAY_ID = "home";
+-static const char* const GATEWAY_NAME = "Home Equine Gateway";
+-
+-static const GatewayTrackerConfig GATEWAY_TRACKERS[] = {
+-  {"wera", "Wera", true, true},
+-
+-  // Add more protocol-v1 trackers here. Example:
+-  // {"hugo", "Hugo", false, false},
+-};
+-
+-static constexpr size_t GATEWAY_TRACKER_COUNT =
+-  sizeof(GATEWAY_TRACKERS) / sizeof(GATEWAY_TRACKERS[0]);
+-
+-static constexpr size_t MAX_GATEWAY_TRACKERS = 12;
+-static_assert(GATEWAY_TRACKER_COUNT > 0, "Register at least one tracker");
+-static_assert(GATEWAY_TRACKER_COUNT <= MAX_GATEWAY_TRACKERS,
+-              "Increase MAX_GATEWAY_TRACKERS or reduce registry size");
+--- /dev/null	2026-07-15 07:50:44.837055935 +0000
++++ /mnt/data/_work_step3/gateway_v3/equine_config.h	2026-07-15 08:09:50.105668443 +0000
+@@ -0,0 +1,458 @@
++#pragma once
++
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++#include <math.h>
++
++#include "equine_protocol.h"
++
++namespace EquineConfig {
++
++constexpr uint32_t CONFIG_MAGIC = 0x45434647UL;  // "ECFG"
++constexpr uint16_t CONFIG_SCHEMA_VERSION = 1;
++constexpr uint8_t MAX_GATEWAY_TRACKERS = 12;
++constexpr size_t DEVICE_ID_SIZE = 25;       // 24 chars + NUL
++constexpr size_t DEVICE_NAME_SIZE = 33;     // 32 chars + NUL
++constexpr size_t WIFI_SSID_SIZE = 33;
++constexpr size_t WIFI_PASSWORD_SIZE = 65;
++constexpr size_t MQTT_HOST_SIZE = 65;
++constexpr size_t MQTT_USERNAME_SIZE = 33;
++constexpr size_t MQTT_PASSWORD_SIZE = 65;
++constexpr size_t MQTT_BASE_TOPIC_SIZE = 33;
++
++constexpr const char* CONFIG_NAMESPACE = "eqcfg";
++constexpr const char* ACTIVE_CONFIG_KEY = "active";
++constexpr const char* BACKUP_CONFIG_KEY = "backup";
++
++enum class DeviceRole : uint8_t {
++  TRACKER = 1,
++  GATEWAY = 2,
++};
++
++struct ConfigHeaderV1 {
++  uint32_t magic;
++  uint16_t schema_version;
++  uint16_t struct_size;
++  uint32_t revision;
++  uint8_t role;
++  uint8_t reserved[3];
++  uint32_t crc32;
++} __attribute__((packed));
++
++struct LoRaConfigV1 {
++  uint32_t frequency_hz;
++  uint32_t bandwidth_hz;
++  int8_t tx_power_dbm;
++  uint8_t spreading_factor;
++  uint8_t coding_rate_denominator;
++  uint8_t preamble_length;
++  uint8_t sync_word;
++  uint8_t reserved[3];
++} __attribute__((packed));
++
++struct TrackerConfigV1 {
++  ConfigHeaderV1 header;
++
++  char device_id[DEVICE_ID_SIZE];
++  char device_name[DEVICE_NAME_SIZE];
++  char wifi_ssid[WIFI_SSID_SIZE];
++  char wifi_password[WIFI_PASSWORD_SIZE];
++
++  uint8_t ble_debug_enabled;
++  uint8_t battery_sense_enabled;
++  uint8_t reserved_flags[2];
++
++  LoRaConfigV1 lora;
++  uint32_t lora_tx_interval_s;
++  uint16_t lora_tx_min_points;
++  uint16_t lora_ack_timeout_ms;
++  uint32_t lora_retry_backoff_s[4];
++
++  float min_distance_m;
++  float min_speed_kmph;
++  float max_hdop;
++  uint16_t min_satellites;
++  uint16_t reserved_gps0;
++  float max_speed_mps;
++  uint32_t max_fix_age_s;
++
++  uint32_t gps_timeout_ms[4];
++  uint32_t gps_full_retry_interval_s;
++  uint16_t gps_initial_listen_ms;
++  uint16_t gps_light_sleep_chunk_ms;
++  uint16_t gps_listen_window_ms;
++  uint16_t reserved_gps1;
++
++  float movement_speed_threshold_kmph;
++  float movement_displacement_threshold_m;
++  float movement_evidence_distance_m;
++  float movement_evidence_step_m;
++  float movement_direction_tolerance_deg;
++  uint8_t movement_evidence_required;
++  uint8_t reserved_movement[3];
++
++  float history_point_spacing_m;
++  float save_distance_threshold_m;
++  uint32_t nvs_save_interval_s;
++
++  uint32_t moving_sleep_s;
++  uint32_t stationary_sleep_s;
++  uint32_t long_stationary_sleep_s;
++  uint32_t no_fix_sleep_s[4];
++  uint16_t stationary_fixes_for_long_sleep;
++  uint16_t stationary_fixes_for_max_sleep;
++} __attribute__((packed));
++
++struct GatewayTrackerConfigV1 {
++  char device_id[DEVICE_ID_SIZE];
++  char device_name[DEVICE_NAME_SIZE];
++  uint8_t enabled;
++  uint8_t accepts_legacy_lora;
++  uint8_t publish_legacy_mqtt_aliases;
++  uint8_t reserved;
++} __attribute__((packed));
++
++struct GatewayConfigV1 {
++  ConfigHeaderV1 header;
++
++  char gateway_id[DEVICE_ID_SIZE];
++  char gateway_name[DEVICE_NAME_SIZE];
++  char wifi_ssid[WIFI_SSID_SIZE];
++  char wifi_password[WIFI_PASSWORD_SIZE];
++  char mqtt_host[MQTT_HOST_SIZE];
++  uint16_t mqtt_port;
++  uint8_t mqtt_tls_enabled;
++  uint8_t reserved_network;
++  char mqtt_username[MQTT_USERNAME_SIZE];
++  char mqtt_password[MQTT_PASSWORD_SIZE];
++  char mqtt_base_topic[MQTT_BASE_TOPIC_SIZE];
++
++  LoRaConfigV1 lora;
++  uint16_t mqtt_buffer_size;
++  uint16_t dedup_save_interval;
++  uint32_t wifi_retry_interval_ms;
++  uint32_t mqtt_retry_interval_ms;
++
++  uint8_t tracker_count;
++  uint8_t reserved_registry[3];
++  GatewayTrackerConfigV1 trackers[MAX_GATEWAY_TRACKERS];
++} __attribute__((packed));
++
++static_assert(sizeof(TrackerConfigV1) < 1024,
++              "Tracker config should remain a compact NVS blob");
++static_assert(sizeof(GatewayConfigV1) < 1600,
++              "Gateway config should remain below the practical NVS blob limit");
++
++inline uint32_t crc32(const uint8_t* data, size_t length) {
++  uint32_t crc = 0xFFFFFFFFUL;
++  for (size_t i = 0; i < length; i++) {
++    crc ^= data[i];
++    for (uint8_t bit = 0; bit < 8; bit++) {
++      const uint32_t mask = -(crc & 1UL);
++      crc = (crc >> 1) ^ (0xEDB88320UL & mask);
++    }
++  }
++  return ~crc;
++}
++
++inline bool isNullTerminated(const char* value, size_t capacity) {
++  return value && memchr(value, '\0', capacity) != nullptr;
++}
++
++inline bool isValidCanonicalId(const char* id, size_t capacity) {
++  if (!isNullTerminated(id, capacity)) return false;
++  const size_t length = strnlen(id, capacity);
++  if (length == 0 || length >= capacity) return false;
++  for (size_t i = 0; i < length; i++) {
++    const char c = id[i];
++    const bool valid =
++      (c >= 'a' && c <= 'z') ||
++      (c >= '0' && c <= '9') ||
++      (i > 0 && (c == '-' || c == '_'));
++    if (!valid) return false;
++  }
++  return true;
++}
++
++inline bool isValidDisplayName(const char* name, size_t capacity) {
++  if (!isNullTerminated(name, capacity)) return false;
++  const size_t length = strnlen(name, capacity);
++  if (length == 0 || length >= capacity) return false;
++  for (size_t i = 0; i < length; i++) {
++    const uint8_t c = static_cast<uint8_t>(name[i]);
++    if (c < 0x20 || c == 0x7F) return false;
++  }
++  return true;
++}
++
++inline bool isFiniteRange(float value, float minimum, float maximum) {
++  return isfinite(value) && value >= minimum && value <= maximum;
++}
++
++inline bool isSupportedBandwidth(uint32_t bandwidth_hz) {
++  return bandwidth_hz == 62500UL || bandwidth_hz == 125000UL ||
++         bandwidth_hz == 250000UL || bandwidth_hz == 500000UL;
++}
++
++inline bool validateLoRa(const LoRaConfigV1& config) {
++  return config.frequency_hz >= 863000000UL &&
++         config.frequency_hz <= 870000000UL &&
++         isSupportedBandwidth(config.bandwidth_hz) &&
++         config.tx_power_dbm >= 2 && config.tx_power_dbm <= 22 &&
++         config.spreading_factor >= 7 && config.spreading_factor <= 12 &&
++         config.coding_rate_denominator >= 5 &&
++         config.coding_rate_denominator <= 8 &&
++         config.preamble_length >= 6 && config.preamble_length <= 32;
++}
++
++template <typename T>
++inline void finalize(T& config, DeviceRole role, uint32_t revision) {
++  config.header.magic = CONFIG_MAGIC;
++  config.header.schema_version = CONFIG_SCHEMA_VERSION;
++  config.header.struct_size = sizeof(T);
++  config.header.revision = revision == 0 ? 1 : revision;
++  config.header.role = static_cast<uint8_t>(role);
++  memset(config.header.reserved, 0, sizeof(config.header.reserved));
++  config.header.crc32 = 0;
++  config.header.crc32 = crc32(
++    reinterpret_cast<const uint8_t*>(&config), sizeof(config));
++}
++
++template <typename T>
++inline bool validateEnvelope(const T& config, DeviceRole expected_role) {
++  if (config.header.magic != CONFIG_MAGIC ||
++      config.header.schema_version != CONFIG_SCHEMA_VERSION ||
++      config.header.struct_size != sizeof(T) ||
++      config.header.role != static_cast<uint8_t>(expected_role) ||
++      config.header.revision == 0) {
++    return false;
++  }
++
++  T copy;
++  memcpy(&copy, &config, sizeof(copy));
++  const uint32_t expected_crc = copy.header.crc32;
++  copy.header.crc32 = 0;
++  return expected_crc == crc32(
++    reinterpret_cast<const uint8_t*>(&copy), sizeof(copy));
++}
++
++inline bool validateTrackerConfig(const TrackerConfigV1& config) {
++  if (!validateEnvelope(config, DeviceRole::TRACKER) ||
++      !isValidCanonicalId(config.device_id, sizeof(config.device_id)) ||
++      !isValidDisplayName(config.device_name, sizeof(config.device_name)) ||
++      !isNullTerminated(config.wifi_ssid, sizeof(config.wifi_ssid)) ||
++      !isNullTerminated(config.wifi_password, sizeof(config.wifi_password)) ||
++      !validateLoRa(config.lora)) {
++    return false;
++  }
++
++  if (config.lora_tx_interval_s < 10 || config.lora_tx_interval_s > 86400 ||
++      config.lora_tx_min_points == 0 || config.lora_tx_min_points > 100 ||
++      config.lora_ack_timeout_ms < 100 || config.lora_ack_timeout_ms > 10000) {
++    return false;
++  }
++  for (uint8_t i = 0; i < 4; i++) {
++    if (config.lora_retry_backoff_s[i] < 10 ||
++        config.lora_retry_backoff_s[i] > 86400 ||
++        config.gps_timeout_ms[i] < 1000 ||
++        config.gps_timeout_ms[i] > 180000 ||
++        config.no_fix_sleep_s[i] < 10 ||
++        config.no_fix_sleep_s[i] > 86400) {
++      return false;
++    }
++    if (i > 0 &&
++        (config.lora_retry_backoff_s[i] < config.lora_retry_backoff_s[i - 1] ||
++         config.gps_timeout_ms[i] > config.gps_timeout_ms[i - 1] ||
++         config.no_fix_sleep_s[i] < config.no_fix_sleep_s[i - 1])) {
++      return false;
++    }
++  }
++
++  return isFiniteRange(config.min_distance_m, 0.5f, 100.0f) &&
++         isFiniteRange(config.min_speed_kmph, 0.0f, 30.0f) &&
++         isFiniteRange(config.max_hdop, 0.5f, 20.0f) &&
++         config.min_satellites >= 3 && config.min_satellites <= 64 &&
++         isFiniteRange(config.max_speed_mps, 1.0f, 100.0f) &&
++         config.max_fix_age_s >= 60 && config.max_fix_age_s <= 604800 &&
++         config.gps_full_retry_interval_s >= 60 &&
++         config.gps_full_retry_interval_s <= 86400 &&
++         config.gps_initial_listen_ms >= 250 &&
++         config.gps_initial_listen_ms <= 30000 &&
++         config.gps_light_sleep_chunk_ms >= 250 &&
++         config.gps_light_sleep_chunk_ms <= 30000 &&
++         config.gps_listen_window_ms >= 250 &&
++         config.gps_listen_window_ms <= 30000 &&
++         isFiniteRange(config.movement_speed_threshold_kmph, 0.1f, 30.0f) &&
++         isFiniteRange(config.movement_displacement_threshold_m, 1.0f, 200.0f) &&
++         isFiniteRange(config.movement_evidence_distance_m, 0.5f, 100.0f) &&
++         isFiniteRange(config.movement_evidence_step_m, 0.5f, 100.0f) &&
++         isFiniteRange(config.movement_direction_tolerance_deg, 1.0f, 180.0f) &&
++         config.movement_evidence_required >= 1 &&
++         config.movement_evidence_required <= 10 &&
++         isFiniteRange(config.history_point_spacing_m, 1.0f, 1000.0f) &&
++         isFiniteRange(config.save_distance_threshold_m, 10.0f, 10000.0f) &&
++         config.nvs_save_interval_s >= 60 && config.nvs_save_interval_s <= 86400 &&
++         config.moving_sleep_s >= 10 && config.moving_sleep_s <= 86400 &&
++         config.stationary_sleep_s >= config.moving_sleep_s &&
++         config.stationary_sleep_s <= 86400 &&
++         config.long_stationary_sleep_s >= config.stationary_sleep_s &&
++         config.long_stationary_sleep_s <= 86400 &&
++         config.stationary_fixes_for_long_sleep >= 1 &&
++         config.stationary_fixes_for_long_sleep <= 1000 &&
++         config.stationary_fixes_for_max_sleep >=
++           config.stationary_fixes_for_long_sleep &&
++         config.stationary_fixes_for_max_sleep <= 1000;
++}
++
++inline bool validateGatewayConfig(const GatewayConfigV1& config) {
++  if (!validateEnvelope(config, DeviceRole::GATEWAY) ||
++      !isValidCanonicalId(config.gateway_id, sizeof(config.gateway_id)) ||
++      !isValidDisplayName(config.gateway_name, sizeof(config.gateway_name)) ||
++      !isNullTerminated(config.wifi_ssid, sizeof(config.wifi_ssid)) ||
++      !isNullTerminated(config.wifi_password, sizeof(config.wifi_password)) ||
++      !isNullTerminated(config.mqtt_host, sizeof(config.mqtt_host)) ||
++      strnlen(config.mqtt_host, sizeof(config.mqtt_host)) == 0 ||
++      !isNullTerminated(config.mqtt_username, sizeof(config.mqtt_username)) ||
++      !isNullTerminated(config.mqtt_password, sizeof(config.mqtt_password)) ||
++      !isValidCanonicalId(config.mqtt_base_topic, sizeof(config.mqtt_base_topic)) ||
++      !validateLoRa(config.lora) ||
++      config.mqtt_port == 0 ||
++      config.mqtt_tls_enabled != 0 ||
++      config.mqtt_buffer_size < 512 || config.mqtt_buffer_size > 4096 ||
++      config.dedup_save_interval == 0 || config.dedup_save_interval > 1000 ||
++      config.wifi_retry_interval_ms < 1000 ||
++      config.mqtt_retry_interval_ms < 1000 ||
++      config.tracker_count > MAX_GATEWAY_TRACKERS) {
++    return false;
++  }
++
++  uint8_t legacy_count = 0;
++  for (uint8_t i = 0; i < config.tracker_count; i++) {
++    const GatewayTrackerConfigV1& tracker = config.trackers[i];
++    if (!tracker.enabled) continue;
++    if (!isValidCanonicalId(tracker.device_id, sizeof(tracker.device_id)) ||
++        !isValidDisplayName(tracker.device_name, sizeof(tracker.device_name))) {
++      return false;
++    }
++    if (tracker.accepts_legacy_lora) legacy_count++;
++    const uint64_t hash = EquineProtocol::deviceIdHash(tracker.device_id);
++    for (uint8_t previous = 0; previous < i; previous++) {
++      if (!config.trackers[previous].enabled) continue;
++      if (hash == EquineProtocol::deviceIdHash(
++                    config.trackers[previous].device_id)) {
++        return false;
++      }
++    }
++  }
++  return legacy_count <= 1;
++}
++
++inline void setDefaultLoRa(LoRaConfigV1& config) {
++  memset(&config, 0, sizeof(config));
++  config.frequency_hz = 868000000UL;
++  config.bandwidth_hz = 125000UL;
++  config.tx_power_dbm = 20;
++  config.spreading_factor = 10;
++  config.coding_rate_denominator = 5;
++  config.preamble_length = 8;
++  config.sync_word = 0x12;
++}
++
++inline void makeDefaultTrackerConfig(
++    TrackerConfigV1& config,
++    const char* device_id,
++    const char* device_name,
++    const char* default_wifi_ssid,
++    const char* default_wifi_password) {
++  memset(&config, 0, sizeof(config));
++  strlcpy(config.device_id, device_id, sizeof(config.device_id));
++  strlcpy(config.device_name, device_name, sizeof(config.device_name));
++  strlcpy(config.wifi_ssid, default_wifi_ssid ? default_wifi_ssid : "",
++          sizeof(config.wifi_ssid));
++  strlcpy(config.wifi_password,
++          default_wifi_password ? default_wifi_password : "",
++          sizeof(config.wifi_password));
++  config.ble_debug_enabled = 0;
++  config.battery_sense_enabled = 1;
++  setDefaultLoRa(config.lora);
++  config.lora_tx_interval_s = 300;
++  config.lora_tx_min_points = 3;
++  config.lora_ack_timeout_ms = 800;
++  config.lora_retry_backoff_s[0] = 60;
++  config.lora_retry_backoff_s[1] = 120;
++  config.lora_retry_backoff_s[2] = 300;
++  config.lora_retry_backoff_s[3] = 600;
++  config.min_distance_m = 2.5f;
++  config.min_speed_kmph = 0.5f;
++  config.max_hdop = 2.0f;
++  config.min_satellites = 6;
++  config.max_speed_mps = 20.0f;
++  config.max_fix_age_s = 43200;
++  config.gps_timeout_ms[0] = 30000;
++  config.gps_timeout_ms[1] = 20000;
++  config.gps_timeout_ms[2] = 10000;
++  config.gps_timeout_ms[3] = 8000;
++  config.gps_full_retry_interval_s = 3600;
++  config.gps_initial_listen_ms = 5000;
++  config.gps_light_sleep_chunk_ms = 5000;
++  config.gps_listen_window_ms = 2000;
++  config.movement_speed_threshold_kmph = 1.0f;
++  config.movement_displacement_threshold_m = 10.0f;
++  config.movement_evidence_distance_m = 4.5f;
++  config.movement_evidence_step_m = 2.0f;
++  config.movement_direction_tolerance_deg = 60.0f;
++  config.movement_evidence_required = 2;
++  config.history_point_spacing_m = 15.0f;
++  config.save_distance_threshold_m = 250.0f;
++  config.nvs_save_interval_s = 3600;
++  config.moving_sleep_s = 60;
++  config.stationary_sleep_s = 300;
++  config.long_stationary_sleep_s = 600;
++  config.no_fix_sleep_s[0] = 120;
++  config.no_fix_sleep_s[1] = 300;
++  config.no_fix_sleep_s[2] = 600;
++  config.no_fix_sleep_s[3] = 900;
++  config.stationary_fixes_for_long_sleep = 3;
++  config.stationary_fixes_for_max_sleep = 12;
++  finalize(config, DeviceRole::TRACKER, 1);
++}
++
++inline void makeDefaultGatewayConfig(
++    GatewayConfigV1& config,
++    const char* gateway_id,
++    const char* gateway_name,
++    const char* default_wifi_ssid,
++    const char* default_wifi_password,
++    const char* default_mqtt_host,
++    uint16_t default_mqtt_port,
++    const char* default_mqtt_username,
++    const char* default_mqtt_password) {
++  memset(&config, 0, sizeof(config));
++  strlcpy(config.gateway_id, gateway_id, sizeof(config.gateway_id));
++  strlcpy(config.gateway_name, gateway_name, sizeof(config.gateway_name));
++  strlcpy(config.wifi_ssid, default_wifi_ssid ? default_wifi_ssid : "",
++          sizeof(config.wifi_ssid));
++  strlcpy(config.wifi_password,
++          default_wifi_password ? default_wifi_password : "",
++          sizeof(config.wifi_password));
++  strlcpy(config.mqtt_host, default_mqtt_host ? default_mqtt_host : "",
++          sizeof(config.mqtt_host));
++  config.mqtt_port = default_mqtt_port ? default_mqtt_port : 1883;
++  config.mqtt_tls_enabled = 0;
++  strlcpy(config.mqtt_username,
++          default_mqtt_username ? default_mqtt_username : "",
++          sizeof(config.mqtt_username));
++  strlcpy(config.mqtt_password,
++          default_mqtt_password ? default_mqtt_password : "",
++          sizeof(config.mqtt_password));
++  strlcpy(config.mqtt_base_topic, "equine", sizeof(config.mqtt_base_topic));
++  setDefaultLoRa(config.lora);
++  config.mqtt_buffer_size = 1024;
++  config.dedup_save_interval = 10;
++  config.wifi_retry_interval_ms = 10000;
++  config.mqtt_retry_interval_ms = 5000;
++  finalize(config, DeviceRole::GATEWAY, 1);
++}
++
++}  // namespace EquineConfig
+--- /dev/null	2026-07-15 07:50:44.837055935 +0000
++++ /mnt/data/_work_step3/gateway_v3/EQUINE_CONFIG_V1.md	2026-07-15 08:11:19.856994071 +0000
+@@ -0,0 +1,102 @@
++# Equine persistent configuration schema v1
++
++This step adds a versioned, CRC-protected persistent configuration to the
++tracker and gateway. It is the storage foundation for BLE/Wi-Fi onboarding in
++the next implementation step.
++
++## Storage envelope
++
++Both roles store a fixed-size configuration blob in ESP32 Preferences namespace
++`eqcfg` under two keys:
++
++- `active`: the configuration used at boot
++- `backup`: the last independently validated active configuration
++
++Every blob begins with `ConfigHeaderV1`:
++
++| Field | Purpose |
++|---|---|
++| `magic` | Distinguishes Equine configuration from unrelated NVS data |
++| `schema_version` | Configuration data-model version |
++| `struct_size` | Rejects incompatible layouts before decoding |
++| `revision` | Monotonic revision for synchronization and conflict handling |
++| `role` | Tracker or gateway |
++| `crc32` | Detects corruption and incomplete writes |
++
++On load, firmware tries `active`, then `backup`, then factory defaults. A valid
++backup repairs the active slot. Saving first copies the previous valid active
++blob to backup and then writes the newly validated active blob.
++
++## TrackerConfigV1
++
++The tracker configuration contains:
++
++- canonical device ID, display name and derived public device hash
++- Wi-Fi setup credentials and bounded BLE-debug preference
++- LoRa frequency, bandwidth, spreading factor, coding rate, preamble, sync word
++  and TX power
++- normal batching, ACK timeout and retry-backoff policy
++- GPS quality and anti-teleport thresholds
++- acquisition timeout/backoff policy
++- movement classifier thresholds
++- history spacing and NVS checkpoint policy
++- moving, stationary, long-stationary and no-fix sleep durations
++
++The history buffer size and wire delta unit remain firmware-layout constants;
++changing them requires a state/protocol migration rather than a normal setting.
++
++### Tracker migration
++
++When no valid configuration blob exists, the first boot creates schema v1 from
++factory defaults and imports the old `tracker` namespace values:
++
++- `ssid`
++- `pw`
++- `ble_log`
++
++Existing distance, boot ID, daily age, history-in-RTC and dedup/transmission
++state are not part of the configuration blob and remain handled separately.
++
++Factory reset clears both the old tracker state namespace and `eqcfg`.
++
++## GatewayConfigV1
++
++The gateway configuration contains:
++
++- gateway ID and display name
++- Wi-Fi credentials
++- MQTT host, port, username, password and base topic
++- LoRa parameters
++- MQTT buffer and reconnect settings
++- deduplication checkpoint interval
++- up to 12 tracker registrations, each with identity, enabled state, legacy
++  LoRa mapping and legacy MQTT alias policy
++
++The first boot seeds the configuration from `secrets.h` and migrates the former
++compile-time Wera registry entry. Per-tracker deduplication namespaces are based
++on the device hash, so existing cursors remain compatible.
++
++`mqtt_tls_enabled` is reserved in schema v1 but validation currently requires it
++to remain false until the TLS transport step is implemented.
++
++## Validation
++
++Configuration is rejected unless, among other constraints:
++
++- canonical IDs contain lowercase letters, digits, `_` or `-`
++- device hashes are unique in the gateway registry
++- no more than one tracker accepts unversioned legacy LoRa
++- LoRa values are within the supported EU-band and modem ranges
++- timeout, sleep and retry sequences are internally consistent
++- strings are terminated and all floating-point thresholds are finite
++- CRC, role, schema and structure size match
++
++## Read-only API
++
++Both devices expose `GET /api/v1/config` while their web server is active. The
++response deliberately omits Wi-Fi and MQTT passwords. The gateway's existing
++`GET /api/v1/trackers` runtime endpoint remains available.
++
++Configuration mutation is intentionally not exposed yet. The next step adds the
++onboarding/configuration API, validation responses, transactional updates and
++restart/apply semantics using these storage functions.

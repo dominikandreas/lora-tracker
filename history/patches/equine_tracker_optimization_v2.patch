@@ -1,0 +1,843 @@
+--- /mnt/data/equine_tracker_optimized_before_second_pass.ino	2026-07-14 10:40:03.396237807 +0000
++++ /mnt/data/equine_tracker_optimized.ino	2026-07-14 10:46:32.873662509 +0000
+@@ -85,15 +85,29 @@
+ const double MAX_SPEED_MPS = 20.0;
+ const uint32_t MAX_FIX_AGE_S = 43200;
+ const double SAVE_DIST_THRESHOLD = 250.0;
+-const uint32_t SAVE_CYCLE_THRESHOLD = 60;
++const uint32_t NVS_SAVE_INTERVAL_S = 3600;
+ 
+-// GNSS acquisition starts by listening immediately. If no fix is available,
+-// short light-sleep/listen cycles continue until this absolute deadline.
+-const uint32_t GPS_TIMEOUT_MS = 30000;
++// GNSS acquisition starts by listening immediately. Repeated no-fix cycles
++// progressively shorten the active search and lengthen the following sleep.
++const uint32_t GPS_FULL_TIMEOUT_MS = 30000;
++const uint32_t GPS_SECOND_NO_FIX_TIMEOUT_MS = 20000;
++const uint32_t GPS_THIRD_NO_FIX_TIMEOUT_MS = 10000;
++const uint32_t GPS_QUICK_PROBE_TIMEOUT_MS = 8000;
++const uint32_t GPS_FULL_RETRY_INTERVAL_S = 3600;
+ const uint32_t GPS_INITIAL_LISTEN_MS = 5000;
+ const uint32_t GPS_LIGHT_SLEEP_CHUNK_MS = 5000;
+ const uint32_t GPS_LISTEN_WINDOW_MS = 2000;
+ 
++// Movement classification is intentionally stricter than distance accumulation.
++// A fresh speed measurement or a large displacement is accepted immediately;
++// smaller displacements require two directionally consistent observations.
++const double MOVEMENT_SPEED_THRESHOLD_KMPH = 1.0;
++const double MOVEMENT_DISPLACEMENT_THRESHOLD_M = 10.0;
++const double MOVEMENT_EVIDENCE_DISTANCE_M = 4.5;
++const double MOVEMENT_EVIDENCE_STEP_M = 2.0;
++const double MOVEMENT_DIRECTION_TOLERANCE_DEG = 60.0;
++const uint8_t MOVEMENT_EVIDENCE_REQUIRED = 2;
++
+ // Batch normal position updates and keep the expensive RX window short.
+ const uint32_t LORA_TX_INTERVAL_S = 300;
+ const uint16_t LORA_TX_MIN_POINTS = 3;
+@@ -113,10 +127,19 @@
+ const uint64_t SLEEP_DURATION_US = 60000000ULL;              // moving / recently active
+ const uint64_t STATIONARY_SLEEP_DURATION_US = 300000000ULL;  // stationary for several fixes
+ const uint64_t LONG_STATIONARY_SLEEP_DURATION_US = 600000000ULL;
+-const uint64_t NO_FIX_SLEEP_DURATION_US = 120000000ULL;
++const uint64_t NO_FIX_SLEEP_1_US = 120000000ULL;
++const uint64_t NO_FIX_SLEEP_2_US = 300000000ULL;
++const uint64_t NO_FIX_SLEEP_3_US = 600000000ULL;
++const uint64_t NO_FIX_SLEEP_MAX_US = 900000000ULL;
+ const uint16_t STATIONARY_FIXES_FOR_LONG_SLEEP = 3;
+ const uint16_t STATIONARY_FIXES_FOR_MAX_SLEEP = 12;
+ 
++// UC6580 configuration is persisted in the GNSS module itself. Increment this
++// after changing the saved message configuration to apply it once on hard boot.
++const uint8_t GNSS_CONFIG_VERSION = 1;
++const uint32_t GNSS_COMMAND_TIMEOUT_MS = 500;
++const uint32_t GNSS_ASSISTANCE_MAX_AGE_S = 12UL * 60UL * 60UL;
++
+ // --- Display / setup responsiveness ---
+ const uint8_t WIFI_MAX_CONNECT_ATTEMPTS = 5;
+ const uint32_t WIFI_CONNECT_TIMEOUT_MS = 10000;
+@@ -196,6 +219,21 @@
+ RTC_DATA_ATTR uint16_t stationary_fix_streak = 0;
+ RTC_DATA_ATTR uint8_t consecutive_no_fix_cycles = 0;
+ RTC_DATA_ATTR uint32_t seconds_since_last_tx = LORA_TX_INTERVAL_S;
++RTC_DATA_ATTR uint32_t seconds_since_last_nvs_save = 0;
++RTC_DATA_ATTR uint32_t seconds_since_last_full_gnss_attempt = GPS_FULL_RETRY_INTERVAL_S;
++
++// Raw-fix history for movement hysteresis. These are deliberately separate
++// from last_lat/last_lng, which represent the last accepted tracking position.
++RTC_DATA_ATTR bool has_previous_raw_fix = false;
++RTC_DATA_ATTR double previous_raw_lat = 0.0;
++RTC_DATA_ATTR double previous_raw_lng = 0.0;
++RTC_DATA_ATTR uint8_t movement_evidence_streak = 0;
++
++// GNSS assistance state. Time is stored as Unix UTC seconds from the most
++// recent trustworthy RMC date/time and advanced using seconds_since_last_fix.
++RTC_DATA_ATTR uint64_t last_gnss_utc_epoch_s = 0;
++RTC_DATA_ATTR double last_gnss_altitude_m = 0.0;
++RTC_DATA_ATTR bool has_gnss_utc_time = false;
+ 
+ uint32_t boot_id = 0; // loaded/incremented from NVS on hard boot
+ 
+@@ -229,6 +267,7 @@
+ 
+ bool ble_advertising = false;
+ bool lora_initialized = false;
++bool gps_powered = false;
+ int8_t last_tx_status = -1;   // -1 unknown, 0 failed, 1 successful
+ int8_t last_ack_status = -1;  // -1 unknown, 0 missing/invalid, 1 successful
+ uint16_t last_tx_bytes = 0;
+@@ -237,6 +276,7 @@
+ float last_ack_rssi = NAN;
+ float last_ack_snr = NAN;
+ uint32_t last_cycle_duration_ms = 0;
++uint32_t last_fix_acquired_ms = 0;
+ 
+ bool display_initialized = false;
+ bool display_awake = false;
+@@ -482,6 +522,191 @@
+ 
+ 
+ 
++// =====================================================
++// GNSS CONFIGURATION AND ASSISTANCE
++// =====================================================
++int64_t daysFromCivil(int year, unsigned month, unsigned day) {
++  year -= month <= 2;
++  const int era = (year >= 0 ? year : year - 399) / 400;
++  const unsigned year_of_era = (unsigned)(year - era * 400);
++  const unsigned adjusted_month =
++    (unsigned)((int)month + (month > 2 ? -3 : 9));
++  const unsigned day_of_year =
++    (153U * adjusted_month + 2U) / 5U + day - 1U;
++  const unsigned day_of_era =
++    year_of_era * 365U + year_of_era / 4U - year_of_era / 100U + day_of_year;
++  return (int64_t)era * 146097LL + (int64_t)day_of_era - 719468LL;
++}
++
++uint64_t utcToUnixSeconds(int year, unsigned month, unsigned day,
++                          unsigned hour, unsigned minute, unsigned second) {
++  if (year < 1980 || month < 1 || month > 12 || day < 1 || day > 31 ||
++      hour > 23 || minute > 59 || second > 59) {
++    return 0;
++  }
++  const int64_t days = daysFromCivil(year, month, day);
++  if (days < 0) return 0;
++  return (uint64_t)days * 86400ULL +
++         (uint64_t)hour * 3600ULL +
++         (uint64_t)minute * 60ULL + second;
++}
++
++void civilFromDays(int64_t days_since_epoch, int& year,
++                   unsigned& month, unsigned& day) {
++  int64_t z = days_since_epoch + 719468LL;
++  const int64_t era = (z >= 0 ? z : z - 146096LL) / 146097LL;
++  const unsigned day_of_era = (unsigned)(z - era * 146097LL);
++  const unsigned year_of_era =
++    (day_of_era - day_of_era / 1460U + day_of_era / 36524U -
++     day_of_era / 146096U) / 365U;
++  year = (int)year_of_era + (int)era * 400;
++  const unsigned day_of_year =
++    day_of_era - (365U * year_of_era + year_of_era / 4U - year_of_era / 100U);
++  const unsigned month_prime = (5U * day_of_year + 2U) / 153U;
++  day = day_of_year - (153U * month_prime + 2U) / 5U + 1U;
++  month = (unsigned)((int)month_prime + (month_prime < 10U ? 3 : -9));
++  year += month <= 2U;
++}
++
++void unixSecondsToUtc(uint64_t epoch_s, int& year, unsigned& month,
++                      unsigned& day, unsigned& hour, unsigned& minute,
++                      unsigned& second) {
++  const uint64_t days = epoch_s / 86400ULL;
++  const uint32_t seconds_of_day = (uint32_t)(epoch_s % 86400ULL);
++  civilFromDays((int64_t)days, year, month, day);
++  hour = seconds_of_day / 3600U;
++  minute = (seconds_of_day % 3600U) / 60U;
++  second = seconds_of_day % 60U;
++}
++
++void drainGnssInput() {
++  while (Serial2.available() > 0) (void)Serial2.read();
++}
++
++#if defined(BOARD_WIRELESS_TRACKER)
++bool waitForUc6580Result(uint32_t timeout_ms) {
++  char line[128] = {};
++  size_t line_length = 0;
++  const uint32_t start_ms = millis();
++
++  while ((uint32_t)(millis() - start_ms) < timeout_ms) {
++    while (Serial2.available() > 0) {
++      const char c = (char)Serial2.read();
++      if (c == '\r' || c == '\n') {
++        if (line_length > 0) {
++          line[line_length] = '\0';
++          if (strstr(line, "$OK") != NULL) return true;
++          if (strstr(line, "$FAIL") != NULL) return false;
++          line_length = 0;
++        }
++      } else if (line_length + 1 < sizeof(line)) {
++        line[line_length++] = c;
++      } else {
++        line_length = 0;
++      }
++    }
++    serviceDisplayAndButton();
++    delay(5);
++  }
++  return false;
++}
++
++bool sendUc6580Command(const char* command,
++                       uint32_t timeout_ms = GNSS_COMMAND_TIMEOUT_MS) {
++  if (!command || !command[0]) return false;
++  drainGnssInput();
++  Serial2.print(command);
++  Serial2.print("\r\n");
++  Serial2.flush();
++  const bool ok = waitForUc6580Result(timeout_ms);
++  logPrintf("UC6580 command %s -> %s\n", command, ok ? "OK" : "no ACK/FAIL");
++  return ok;
++}
++
++void configureUc6580OutputIfNeeded() {
++  const uint8_t configured_version = prefs.getUChar("gnss_cfg_v", 0);
++  if (configured_version == GNSS_CONFIG_VERSION) return;
++
++  setTrackerPhase("GNSS configure");
++  logPrintln("Configuring UC6580 for GGA/RMC-only output...");
++
++  bool ok = true;
++  ok = sendUc6580Command("$CFGMSG,0,0,1") && ok; // GGA on
++  ok = sendUc6580Command("$CFGMSG,0,1,0") && ok; // GLL off
++  ok = sendUc6580Command("$CFGMSG,0,2,0") && ok; // GSA off
++  ok = sendUc6580Command("$CFGMSG,0,3,0") && ok; // GSV off
++  ok = sendUc6580Command("$CFGMSG,0,4,1") && ok; // RMC on
++  ok = sendUc6580Command("$CFGMSG,0,5,0") && ok; // VTG off
++  ok = sendUc6580Command("$CFGMSG,0,6,0") && ok; // ZDA off
++  ok = sendUc6580Command("$CFGMSG,0,7,0") && ok; // GST off
++
++  if (ok && sendUc6580Command("$CFGSAVE", 1000)) {
++    // The UC6580 manual requires at least one second of uninterrupted power
++    // after CFGSAVE. Use a little margin before recording success in NVS.
++    responsiveDelay(1200);
++    prefs.putUChar("gnss_cfg_v", GNSS_CONFIG_VERSION);
++    logPrintln("UC6580 message configuration saved.");
++  } else {
++    setLastError("GNSS config failed");
++    logPrintln("UC6580 configuration was not persisted; it will retry on next hard boot.");
++  }
++  drainGnssInput();
++}
++
++void sendUc6580Assistance() {
++  if (!has_initial_fix || !has_gnss_utc_time ||
++      seconds_since_last_fix > GNSS_ASSISTANCE_MAX_AGE_S) {
++    return;
++  }
++
++  const uint64_t estimated_epoch_s =
++    last_gnss_utc_epoch_s + seconds_since_last_fix;
++  int year = 0;
++  unsigned month = 0, day = 0, hour = 0, minute = 0, second = 0;
++  unixSecondsToUtc(estimated_epoch_s, year, month, day, hour, minute, second);
++
++  char command[128];
++  snprintf(command, sizeof(command), "$AIDTIME,%d,%u,%u,%u,%u,%u,0",
++           year, month, day, hour, minute, second);
++  (void)sendUc6580Command(command);
++
++  const double abs_lat = fabs(last_lat);
++  const double abs_lng = fabs(last_lng);
++  const int lat_degrees = (int)abs_lat;
++  const int lng_degrees = (int)abs_lng;
++  const double nmea_lat = lat_degrees * 100.0 + (abs_lat - lat_degrees) * 60.0;
++  const double nmea_lng = lng_degrees * 100.0 + (abs_lng - lng_degrees) * 60.0;
++
++  snprintf(command, sizeof(command), "$AIDPOS,%.6f,%c,%.6f,%c,%.1f",
++           nmea_lat, last_lat >= 0.0 ? 'N' : 'S',
++           nmea_lng, last_lng >= 0.0 ? 'E' : 'W',
++           last_gnss_altitude_m);
++  (void)sendUc6580Command(command);
++  drainGnssInput();
++}
++#else
++void configureUc6580OutputIfNeeded() {}
++void sendUc6580Assistance() {}
++#endif
++
++void updateGnssAssistanceState() {
++  if (gps.date.isValid() && gps.time.isValid() &&
++      gps.date.age() < 2000 && gps.time.age() < 2000) {
++    const uint64_t epoch_s = utcToUnixSeconds(
++      gps.date.year(), gps.date.month(), gps.date.day(),
++      gps.time.hour(), gps.time.minute(), gps.time.second()
++    );
++    if (epoch_s > 0) {
++      last_gnss_utc_epoch_s = epoch_s;
++      has_gnss_utc_time = true;
++    }
++  }
++
++  if (gps.altitude.isValid() && gps.altitude.age() < 2000) {
++    last_gnss_altitude_m = gps.altitude.meters();
++  }
++}
++
+ float getBatteryVoltage();
+ uint8_t getBatteryPercentage();
+ void refreshBatteryCache(bool force);
+@@ -523,7 +748,8 @@
+   refreshBatteryCache(false);
+   logPrintf("RTC state -> has_fix: %s, dist: %.2f m, age: %u s, daily_reset_age: %u s, "
+             "strikes: %u, hist_count: %u, next_seq: %lu, stationary: %u, "
+-            "since_tx: %u s, batt: %.2fV (%u%%)\n",
++            "since_tx: %u s, since_nvs: %u s, full_gnss_age: %u s, "
++            "batt: %.2fV (%u%%)\n",
+             has_initial_fix ? "true" : "false",
+             total_distance_meters,
+             seconds_since_last_fix,
+@@ -533,6 +759,8 @@
+             (unsigned long)next_point_seq,
+             stationary_fix_streak,
+             seconds_since_last_tx,
++            seconds_since_last_nvs_save,
++            seconds_since_last_full_gnss_attempt,
+             cached_battery_voltage,
+             cached_battery_percentage);
+ }
+@@ -548,6 +776,7 @@
+ }
+ 
+ void wakeupGPS() {
++  if (gps_powered) return;
+ #if defined(BOARD_WIRELESS_TRACKER)
+   logPrintln("Powering up GNSS (Wireless Tracker)...");
+   pinMode(VEXT_CTRL_PIN, OUTPUT);
+@@ -560,11 +789,13 @@
+   logPrintln("Waking up GNSS (sending wakeup byte)...");
+   Serial2.write(0xFF);
+ #endif
++  gps_powered = true;
+   // Start consuming UART data quickly instead of waiting through a fixed 500 ms delay.
+   responsiveDelay(100);
+ }
+ 
+ void sleepGPS() {
++  if (!gps_powered) return;
+ #if defined(BOARD_WIRELESS_TRACKER)
+   logPrintln("Powering down GNSS (Wireless Tracker)...");
+   digitalWrite(GNSS_PWR_PIN, LOW);
+@@ -583,6 +814,7 @@
+   }
+   Serial2.flush();
+ #endif
++  gps_powered = false;
+   delay(50);
+ }
+ 
+@@ -594,6 +826,7 @@
+ #endif
+ 
+ bool initLoRaRadio() {
++  if (lora_initialized) return true;
+ #if defined(BOARD_WIRELESS_TRACKER)
+   loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
+   
+@@ -606,6 +839,7 @@
+   int state = radio.begin(freq, bw, LORA_SPREADING_FACTOR, LORA_CODING_RATE, LORA_SYNC_WORD, LORA_TX_POWER_DBM, LORA_PREAMBLE_LENGTH, 1.6, false);
+   if (state == RADIOLIB_ERR_NONE) {
+     radio.setCRC(true);
++    lora_initialized = true;
+     return true;
+   }
+   logPrintf("RadioLib SX1262 init failed, code: %d\n", state);
+@@ -633,16 +867,19 @@
+                 LORA_CODING_RATE,
+                 LORA_SYNC_WORD,
+                 LORA_PREAMBLE_LENGTH);
++  lora_initialized = true;
+   return true;
+ #endif
+ }
+ 
+ void sleepLoRaRadio() {
++  if (!lora_initialized) return;
+ #if defined(BOARD_WIRELESS_TRACKER)
+   radio.sleep();
+ #else
+   LoRa.sleep();
+ #endif
++  lora_initialized = false;
+ }
+ 
+ bool transmitLoRaPacket(uint8_t* buffer, size_t len) {
+@@ -941,6 +1178,7 @@
+   seconds_since_daily_reset = 0;
+   prefs.putDouble("dist", 0.0);
+   prefs.putUInt("daily_age", 0);
++  seconds_since_last_nvs_save = 0;
+ }
+ 
+ void appendHistoryPointAbsolute(int32_t lat_micro, int32_t lon_micro) {
+@@ -1556,6 +1794,12 @@
+   return requested;
+ }
+ 
++double angularDifferenceDegrees(double a, double b) {
++  double difference = fabs(a - b);
++  while (difference >= 360.0) difference -= 360.0;
++  return difference > 180.0 ? 360.0 - difference : difference;
++}
++
+ bool listenForGpsFix(uint32_t listen_duration_ms,
+                      uint32_t current_elapsed_s,
+                      bool& movement_accepted) {
+@@ -1584,58 +1828,127 @@
+ 
+         const double candidate_lat = gps.location.lat();
+         const double candidate_lng = gps.location.lng();
++        updateGnssAssistanceState();
+ 
+         if (has_initial_fix) {
+-          const double distance_moved = TinyGPSPlus::distanceBetween(
++          const double distance_from_accepted = TinyGPSPlus::distanceBetween(
+             last_lat, last_lng, candidate_lat, candidate_lng
+           );
+ 
+           double allowed_distance = current_elapsed_s * MAX_SPEED_MPS;
+           if (allowed_distance < 50.0) allowed_distance = 50.0;
+ 
+-          if (distance_moved > allowed_distance) {
++          if (distance_from_accepted > allowed_distance) {
+             teleport_strikes++;
++            movement_evidence_streak = 0;
+             logPrintf("TELEPORT! Moved: %.0f m. Allowed: %.0f m. (Strike %u/3)\n",
+-                      distance_moved, allowed_distance, teleport_strikes);
++                      distance_from_accepted, allowed_distance, teleport_strikes);
+ 
+             if (teleport_strikes >= 3) {
+               logPrintln("3 Strikes! Resetting position.");
+               has_initial_fix = false;
++              has_previous_raw_fix = false;
+               teleport_strikes = 0;
+             }
+             return false;
+           }
+ 
+           teleport_strikes = 0;
++          const bool speed_fresh =
++            gps.speed.isValid() && gps.speed.age() < 1500;
+           const double current_speed =
+-            gps.speed.isValid() ? gps.speed.kmph() : 0.0;
++            speed_fresh ? gps.speed.kmph() : 0.0;
++          const bool movement_by_speed =
++            speed_fresh && current_speed >= MOVEMENT_SPEED_THRESHOLD_KMPH;
++          const bool movement_by_large_displacement =
++            distance_from_accepted >= MOVEMENT_DISPLACEMENT_THRESHOLD_M;
++
++          bool directionally_consistent = false;
++          double raw_step_m = 0.0;
++          double direction_difference_deg = 180.0;
++          if (has_previous_raw_fix &&
++              distance_from_accepted >= MOVEMENT_EVIDENCE_DISTANCE_M) {
++            raw_step_m = TinyGPSPlus::distanceBetween(
++              previous_raw_lat, previous_raw_lng,
++              candidate_lat, candidate_lng
++            );
++            if (raw_step_m >= MOVEMENT_EVIDENCE_STEP_M) {
++              const double previous_offset_m = TinyGPSPlus::distanceBetween(
++                last_lat, last_lng, previous_raw_lat, previous_raw_lng
++              );
++              if (previous_offset_m >= MOVEMENT_EVIDENCE_STEP_M) {
++                const double outward_course = TinyGPSPlus::courseTo(
++                  last_lat, last_lng, previous_raw_lat, previous_raw_lng
++                );
++                const double step_course = TinyGPSPlus::courseTo(
++                  previous_raw_lat, previous_raw_lng,
++                  candidate_lat, candidate_lng
++                );
++                direction_difference_deg =
++                  angularDifferenceDegrees(outward_course, step_course);
++                directionally_consistent =
++                  direction_difference_deg <= MOVEMENT_DIRECTION_TOLERANCE_DEG;
++              }
++            }
++          }
+ 
+-          const bool position_changed =
+-            distance_moved > MIN_DISTANCE_METERS;
+-          if (position_changed) {
+-            // Be conservative for the power policy even if the GNSS speed
+-            // field is temporarily stale or invalid.
++          if (movement_by_speed || movement_by_large_displacement) {
++            movement_evidence_streak = MOVEMENT_EVIDENCE_REQUIRED;
++          } else if (directionally_consistent) {
++            if (movement_evidence_streak < MOVEMENT_EVIDENCE_REQUIRED) {
++              movement_evidence_streak++;
++            }
++          } else {
++            movement_evidence_streak = 0;
++          }
++
++          const bool movement_detected =
++            movement_by_speed || movement_by_large_displacement ||
++            movement_evidence_streak >= MOVEMENT_EVIDENCE_REQUIRED;
++
++          previous_raw_lat = candidate_lat;
++          previous_raw_lng = candidate_lng;
++          has_previous_raw_fix = true;
++
++          if (movement_detected) {
++            // Movement state controls the power policy independently of whether
++            // this individual position delta is large enough to accumulate.
+             movement_accepted = true;
+           }
+ 
+-          if (position_changed && current_speed > MIN_SPEED_KMPH) {
+-            total_distance_meters += distance_moved;
++          if (movement_detected &&
++              distance_from_accepted > MIN_DISTANCE_METERS) {
++            total_distance_meters += distance_from_accepted;
+             last_lat = candidate_lat;
+             last_lng = candidate_lng;
+-            logPrintf("Accepted movement -> total distance now %.2f m\n",
++            movement_evidence_streak = 0;
++            logPrintf("Accepted movement -> %.2f m, speed %.2f km/h, total %.2f m\n",
++                      distance_from_accepted, current_speed,
+                       total_distance_meters);
+             maybeAppendSignificantHistoryPoint(candidate_lat, candidate_lng);
++          } else if (movement_detected) {
++            logPrintf("Movement detected by speed/hysteresis; %.2f m delta not accumulated.\n",
++                      distance_from_accepted);
+           } else {
+-            logPrintln("Jitter/Stationary detected. Freezing map marker.");
++            logPrintf("Stationary evidence -> offset %.2f m, raw step %.2f m, "
++                      "speed %.2f km/h, direction diff %.0f deg, streak %u/%u\n",
++                      distance_from_accepted, raw_step_m, current_speed,
++                      direction_difference_deg, movement_evidence_streak,
++                      MOVEMENT_EVIDENCE_REQUIRED);
+           }
+         } else {
+           last_lat = candidate_lat;
+           last_lng = candidate_lng;
++          previous_raw_lat = candidate_lat;
++          previous_raw_lng = candidate_lng;
++          has_previous_raw_fix = true;
++          movement_evidence_streak = 0;
+           has_initial_fix = true;
+           maybeAppendSignificantHistoryPoint(candidate_lat, candidate_lng);
+         }
+ 
+         seconds_since_last_fix = 0;
++        last_fix_acquired_ms = millis();
+         return true;
+       }
+ 
+@@ -1652,11 +1965,36 @@
+   return false;
+ }
+ 
++uint32_t chooseGpsAcquisitionTimeoutMs() {
++  const bool full_attempt_due =
++    consecutive_no_fix_cycles == 0 ||
++    seconds_since_last_full_gnss_attempt >= GPS_FULL_RETRY_INTERVAL_S;
++
++  if (full_attempt_due) {
++    seconds_since_last_full_gnss_attempt = 0;
++    return GPS_FULL_TIMEOUT_MS;
++  }
++  if (consecutive_no_fix_cycles == 1) {
++    return GPS_SECOND_NO_FIX_TIMEOUT_MS;
++  }
++  if (consecutive_no_fix_cycles == 2) {
++    return GPS_THIRD_NO_FIX_TIMEOUT_MS;
++  }
++  return GPS_QUICK_PROBE_TIMEOUT_MS;
++}
++
+ uint64_t chooseNextSleepDurationUs(bool fix_found, bool movement_accepted) {
+   if (!fix_found) {
+-    consecutive_no_fix_cycles++;
++    if (consecutive_no_fix_cycles < UINT8_MAX) {
++      consecutive_no_fix_cycles++;
++    }
+     stationary_fix_streak = 0;
+-    return NO_FIX_SLEEP_DURATION_US;
++    movement_evidence_streak = 0;
++
++    if (consecutive_no_fix_cycles == 1) return NO_FIX_SLEEP_1_US;
++    if (consecutive_no_fix_cycles == 2) return NO_FIX_SLEEP_2_US;
++    if (consecutive_no_fix_cycles == 3) return NO_FIX_SLEEP_3_US;
++    return NO_FIX_SLEEP_MAX_US;
+   }
+ 
+   consecutive_no_fix_cycles = 0;
+@@ -1675,6 +2013,15 @@
+   return SLEEP_DURATION_US;
+ }
+ 
++
++void saturatingAddSeconds(uint32_t& value, uint32_t increment) {
++  if (UINT32_MAX - value < increment) {
++    value = UINT32_MAX;
++  } else {
++    value += increment;
++  }
++}
++
+ void setup() {
+   // Determine wake type before any optional USB wait.
+   last_reset_reason = esp_reset_reason();
+@@ -1724,6 +2071,13 @@
+     stationary_fix_streak = 0;
+     consecutive_no_fix_cycles = 0;
+     seconds_since_last_tx = LORA_TX_INTERVAL_S;
++    seconds_since_last_nvs_save = 0;
++    seconds_since_last_full_gnss_attempt = GPS_FULL_RETRY_INTERVAL_S;
++    has_previous_raw_fix = false;
++    movement_evidence_streak = 0;
++    last_gnss_utc_epoch_s = 0;
++    last_gnss_altitude_m = 0.0;
++    has_gnss_utc_time = false;
+     clearHistory();
+ 
+     struct timeval tv;
+@@ -1742,7 +2096,12 @@
+   Serial2.begin(GPS_BAUD, SERIAL_8N1, RXD2, TXD2);
+ 
+ #if !defined(BOARD_WIRELESS_TRACKER)
+-  if (hard_boot) sleepGPS();
++  // The BN-220 is powered independently and is physically awake after a hard
++  // boot. Mark that state so the initial sleep command is actually sent.
++  if (hard_boot) {
++    gps_powered = true;
++    sleepGPS();
++  }
+ #endif
+ 
+   if (hard_boot || wakeup_cause == ESP_SLEEP_WAKEUP_EXT0) {
+@@ -1811,38 +2170,16 @@
+ 
+   setTrackerPhase("GNSS power-up");
+   wakeupGPS();
++#if defined(BOARD_WIRELESS_TRACKER)
++  if (hard_boot) configureUc6580OutputIfNeeded();
++  sendUc6580Assistance();
++#endif
+ 
+   logPrintln("\n--- Equine Tracker Waking Up ---");
+   logRTCState();
+ 
+-  setTrackerPhase("LoRa init");
+-  lora_initialized = initLoRaRadio();
+-  if (!lora_initialized) {
+-    setLastError("LoRa initialization failed");
+-    setTrackerPhase("LoRa error");
+-    logPrintln("LoRa failed!");
+-    serviceDisplayAndButton(true);
+-
+-    if (!isDebugModeActive()) {
+-      logPrintln("Sleeping.");
+-      turnOffDisplay();
+-      sleepGPS();
+-
+-      struct timeval tv;
+-      gettimeofday(&tv, NULL);
+-      const uint64_t now_us =
+-        (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;
+-      target_wakeup_time_us = now_us + SLEEP_DURATION_US;
+-
+-      prefs.end();
+-      esp_sleep_enable_ext0_wakeup((gpio_num_t)USER_BTN_PIN, 0);
+-      esp_sleep_enable_timer_wakeup(SLEEP_DURATION_US);
+-      esp_deep_sleep_start();
+-    } else {
+-      logPrintln("Connected BLE debug client keeps the device awake.");
+-    }
+-  }
+-
++  // LoRa is initialized only inside performTrackingCycle() when a batch is due.
++  lora_initialized = false;
+   setTrackerPhase("Ready");
+   serviceDisplayAndButton(true);
+ 
+@@ -1857,6 +2194,13 @@
+ 
+ void performTrackingCycle() {
+   const uint32_t cycle_start_ms = millis();
++  if (!gps_powered) {
++    setTrackerPhase("GNSS power-up");
++    wakeupGPS();
++#if defined(BOARD_WIRELESS_TRACKER)
++    sendUc6580Assistance();
++#endif
++  }
+   setTrackerPhase("GPS acquisition");
+   serviceDisplayAndButton(true);
+ 
+@@ -1874,10 +2218,13 @@
+     has_initial_fix = false;
+   }
+ 
+-  logPrintf("Listening immediately for GNSS for up to %u ms...\n",
+-            GPS_INITIAL_LISTEN_MS);
++  const uint32_t gps_timeout_ms = chooseGpsAcquisitionTimeoutMs();
++  logPrintf("GNSS acquisition policy -> no_fix=%u, full_retry_age=%u s, deadline=%u ms.\n",
++            consecutive_no_fix_cycles,
++            seconds_since_last_full_gnss_attempt,
++            gps_timeout_ms);
+   uint32_t first_window_ms = GPS_INITIAL_LISTEN_MS;
+-  if (first_window_ms > GPS_TIMEOUT_MS) first_window_ms = GPS_TIMEOUT_MS;
++  if (first_window_ms > gps_timeout_ms) first_window_ms = gps_timeout_ms;
+   cycle_fix_found = listenForGpsFix(
+     first_window_ms,
+     fix_age_at_cycle_start,
+@@ -1886,9 +2233,9 @@
+ 
+   while (!cycle_fix_found) {
+     const uint32_t elapsed_ms = millis() - acquisition_start_ms;
+-    if (elapsed_ms >= GPS_TIMEOUT_MS) break;
++    if (elapsed_ms >= gps_timeout_ms) break;
+ 
+-    uint32_t remaining_ms = GPS_TIMEOUT_MS - elapsed_ms;
++    uint32_t remaining_ms = gps_timeout_ms - elapsed_ms;
+     uint32_t sleep_chunk_ms = GPS_LIGHT_SLEEP_CHUNK_MS;
+     if (sleep_chunk_ms > remaining_ms) sleep_chunk_ms = remaining_ms;
+ 
+@@ -1911,9 +2258,9 @@
+     }
+ 
+     const uint32_t elapsed_after_sleep_ms = millis() - acquisition_start_ms;
+-    if (elapsed_after_sleep_ms >= GPS_TIMEOUT_MS) break;
++    if (elapsed_after_sleep_ms >= gps_timeout_ms) break;
+ 
+-    remaining_ms = GPS_TIMEOUT_MS - elapsed_after_sleep_ms;
++    remaining_ms = gps_timeout_ms - elapsed_after_sleep_ms;
+     uint32_t listen_ms = GPS_LISTEN_WINDOW_MS;
+     if (listen_ms > remaining_ms) listen_ms = remaining_ms;
+ 
+@@ -1933,7 +2280,7 @@
+     current_elapsed_s =
+       fix_age_at_cycle_start + acquisition_elapsed_ms / 1000U;
+     logPrintf("No confident GNSS fix before the %u ms deadline.\n",
+-              GPS_TIMEOUT_MS);
++              gps_timeout_ms);
+   }
+ 
+   const uint64_t next_sleep_duration_us =
+@@ -1947,6 +2294,13 @@
+             consecutive_no_fix_cycles,
+             next_sleep_s);
+ 
++  // On ordinary timer wakes the display is off, so the shared VEXT rail can
++  // be cut immediately. A user-requested display remains available until the
++  // final sleep transition, and BLE debug deliberately keeps GNSS powered.
++  if (!isDebugModeActive() && !display_awake) {
++    sleepGPS();
++  }
++
+   // =====================================================
+   // FLASH SAVE
+   // =====================================================
+@@ -1954,8 +2308,7 @@
+   if ((total_distance_meters - last_saved_dist) >= SAVE_DIST_THRESHOLD) {
+     should_save_to_flash = true;
+   }
+-  if (wakeup_counter > 0 &&
+-      (wakeup_counter % SAVE_CYCLE_THRESHOLD == 0)) {
++  if (seconds_since_last_nvs_save >= NVS_SAVE_INTERVAL_S) {
+     should_save_to_flash = true;
+   }
+ 
+@@ -1970,6 +2323,7 @@
+       next_sleep_s;
+     prefs.putUInt("daily_age", projected_daily_age);
+     last_saved_dist = total_distance_meters;
++    seconds_since_last_nvs_save = 0;
+   }
+ 
+   // =====================================================
+@@ -1987,7 +2341,15 @@
+     logPrintf("LoRa batch due: %u queued points, %u s since last ACK.\n",
+               history_count, seconds_since_last_tx);
+ 
+-    for (int tx_loop = 0; tx_loop < 5; tx_loop++) {
++    setTrackerPhase("LoRa init");
++    lora_initialized = initLoRaRadio();
++    if (!lora_initialized) {
++      setLastError("LoRa initialization failed");
++      last_tx_status = 0;
++      logPrintln("LoRa initialization failed; retaining queued data for retry.");
++    }
++
++    for (int tx_loop = 0; lora_initialized && tx_loop < 5; tx_loop++) {
+       if (history_count == 0) break;
+ 
+       uint8_t payload_buffer[240];
+@@ -2047,6 +2409,7 @@
+             history_count -= points_to_clear;
+             ack_received = true;
+             last_ack_status = 1;
++            seconds_since_last_tx = 0;
+             setLastError(nullptr);
+             logPrintf("ACK cleared %u points; %u remain.\n",
+                       points_to_clear, history_count);
+@@ -2113,19 +2476,21 @@
+     const uint32_t time_awake_s =
+       (millis() - cycle_start_ms) / 1000U;
+ 
++    const uint32_t elapsed_to_next_wake_s = time_awake_s + next_sleep_s;
+     if (cycle_fix_found) {
+-      seconds_since_last_fix = next_sleep_s;
++      const uint32_t post_fix_awake_s =
++        last_fix_acquired_ms > 0 ?
++        (millis() - last_fix_acquired_ms) / 1000U : 0;
++      seconds_since_last_fix = post_fix_awake_s + next_sleep_s;
+     } else {
+       seconds_since_last_fix = current_elapsed_s + next_sleep_s;
+     }
+ 
+-    seconds_since_daily_reset += time_awake_s + next_sleep_s;
+-    if (UINT32_MAX - seconds_since_last_tx <
+-        time_awake_s + next_sleep_s) {
+-      seconds_since_last_tx = UINT32_MAX;
+-    } else {
+-      seconds_since_last_tx += time_awake_s + next_sleep_s;
+-    }
++    saturatingAddSeconds(seconds_since_daily_reset, elapsed_to_next_wake_s);
++    saturatingAddSeconds(seconds_since_last_tx, elapsed_to_next_wake_s);
++    saturatingAddSeconds(seconds_since_last_nvs_save, elapsed_to_next_wake_s);
++    saturatingAddSeconds(seconds_since_last_full_gnss_attempt,
++                         elapsed_to_next_wake_s);
+ 
+     struct timeval tv;
+     gettimeofday(&tv, NULL);
+@@ -2146,19 +2511,20 @@
+     const uint32_t debug_pause_s =
+       (uint32_t)((SLEEP_DURATION_US / 1000ULL) * 2ULL / 3ULL / 1000ULL);
+ 
++    const uint32_t debug_elapsed_s = time_awake_s + debug_pause_s;
+     if (cycle_fix_found) {
+-      seconds_since_last_fix = debug_pause_s;
++      const uint32_t post_fix_awake_s =
++        last_fix_acquired_ms > 0 ?
++        (millis() - last_fix_acquired_ms) / 1000U : 0;
++      seconds_since_last_fix = post_fix_awake_s + debug_pause_s;
+     } else {
+       seconds_since_last_fix = current_elapsed_s + debug_pause_s;
+     }
+-    seconds_since_daily_reset += time_awake_s + debug_pause_s;
+-
+-    if (UINT32_MAX - seconds_since_last_tx <
+-        time_awake_s + debug_pause_s) {
+-      seconds_since_last_tx = UINT32_MAX;
+-    } else {
+-      seconds_since_last_tx += time_awake_s + debug_pause_s;
+-    }
++    saturatingAddSeconds(seconds_since_daily_reset, debug_elapsed_s);
++    saturatingAddSeconds(seconds_since_last_tx, debug_elapsed_s);
++    saturatingAddSeconds(seconds_since_last_nvs_save, debug_elapsed_s);
++    saturatingAddSeconds(seconds_since_last_full_gnss_attempt,
++                         debug_elapsed_s);
+   }
+ }
+ 

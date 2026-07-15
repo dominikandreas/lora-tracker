@@ -1,0 +1,588 @@
+--- equine_gateway_onboarding_v4.ino
++++ equine_gateway_mqtt_v5.ino
+@@ -13,6 +13,7 @@
+ #include "equine_protocol.h"
+ #include "equine_config.h"
+ #include "equine_config_api.h"
++#include "equine_mqtt_api.h"
+ 
+ // ==========================================
+ // VERSIONED PERSISTENT GATEWAY CONFIGURATION
+@@ -57,6 +58,7 @@
+   uint64_t device_id_hash;
+   char hash_text[17];
+   char state_topic[96];
++  char point_event_topic[112];
+   char availability_topic[96];
+   char legacy_state_topic[64];
+   char legacy_availability_topic[64];
+@@ -76,6 +78,9 @@
+ size_t tracker_runtime_count = 0;
+ char gateway_hash_text[17];
+ char gateway_availability_topic[96];
++char gateway_status_topic[112];
++char gateway_command_topic[112];
++char gateway_response_prefix[112];
+ char ota_hostname[64];
+ 
+ // --- Heltec V2 Internal LoRa Pins ---
+@@ -135,11 +140,22 @@
+ unsigned long lastLoRaPacketMs = 0;
+ unsigned long lastWiFiReconnectAttemptMs = 0;
+ unsigned long lastMqttReconnectAttemptMs = 0;
++unsigned long lastGatewayStatusPublishMs = 0;
+ wl_status_t lastWiFiStatus = WL_IDLE_STATUS;
+ 
++constexpr uint32_t GATEWAY_STATUS_INTERVAL_MS = 60000;
++constexpr size_t MQTT_COMMAND_PAYLOAD_SIZE = 512;
++
+ // ==========================================
+ // HELPERS
+ // ==========================================
++void escapeJsonText(const char* input, char* output, size_t output_size) {
++  if (!output || output_size == 0) return;
++  size_t used = 0;
++  output[0] = '\0';
++  EquineMqttApi::appendJsonEscaped(output, output_size, used, input);
++}
++
+ void rememberLogLine(const char* message) {
+   if (!message || !message[0]) {
+     return;
+@@ -600,13 +616,18 @@
+   EquineProtocol::formatDeviceHash(
+     gateway_hash, gateway_hash_text, sizeof(gateway_hash_text)
+   );
+-  snprintf(
++  EquineMqttApi::formatGatewayTopic(
+     gateway_availability_topic, sizeof(gateway_availability_topic),
+-    "%s/v%u/gateways/%s/availability",
+-    gateway_config.mqtt_base_topic,
+-    EquineProtocol::MQTT_API_VERSION,
+-    gateway_hash_text
+-  );
++    gateway_config.mqtt_base_topic, gateway_hash_text, "availability");
++  EquineMqttApi::formatGatewayTopic(
++    gateway_status_topic, sizeof(gateway_status_topic),
++    gateway_config.mqtt_base_topic, gateway_hash_text, "status");
++  EquineMqttApi::formatGatewayTopic(
++    gateway_command_topic, sizeof(gateway_command_topic),
++    gateway_config.mqtt_base_topic, gateway_hash_text, "commands/request");
++  EquineMqttApi::formatGatewayTopic(
++    gateway_response_prefix, sizeof(gateway_response_prefix),
++    gateway_config.mqtt_base_topic, gateway_hash_text, "commands/response");
+   snprintf(ota_hostname, sizeof(ota_hostname), "equine-gateway-%s", GATEWAY_ID);
+ 
+   uint8_t legacy_count = 0;
+@@ -636,20 +657,15 @@
+       sizeof(tracker.dedup_namespace)
+     );
+ 
+-    snprintf(
++    EquineMqttApi::formatTrackerTopic(
+       tracker.state_topic, sizeof(tracker.state_topic),
+-      "%s/v%u/trackers/%s/state",
+-      gateway_config.mqtt_base_topic,
+-      EquineProtocol::MQTT_API_VERSION,
+-      tracker.hash_text
+-    );
+-    snprintf(
++      gateway_config.mqtt_base_topic, tracker.hash_text, "state");
++    EquineMqttApi::formatTrackerTopic(
++      tracker.point_event_topic, sizeof(tracker.point_event_topic),
++      gateway_config.mqtt_base_topic, tracker.hash_text, "events/point");
++    EquineMqttApi::formatTrackerTopic(
+       tracker.availability_topic, sizeof(tracker.availability_topic),
+-      "%s/v%u/trackers/%s/availability",
+-      gateway_config.mqtt_base_topic,
+-      EquineProtocol::MQTT_API_VERSION,
+-      tracker.hash_text
+-    );
++      gateway_config.mqtt_base_topic, tracker.hash_text, "availability");
+     snprintf(
+       tracker.legacy_state_topic, sizeof(tracker.legacy_state_topic),
+       "horse/%s/state", tracker.config->device_id
+@@ -703,18 +719,223 @@
+   }
+ }
+ 
+-bool publishTrackerState(TrackerRuntime& tracker, const char* payload) {
+-  if (!client.publish(tracker.state_topic, payload)) {
+-    logPrintf("Failed to publish canonical state topic %s.\n",
+-              tracker.state_topic);
++bool publishTrackerPoint(TrackerRuntime& tracker, const char* payload) {
++  // The non-retained point event is the canonical stream consumed by
++  // archivers and apps. It determines whether a LoRa frame may be ACKed.
++  // PubSubClient publishes at MQTT QoS 0; point_id makes retries idempotent,
++  // while a future transport upgrade can add broker-confirmed QoS 1.
++  if (!client.publish(tracker.point_event_topic, payload, false)) {
++    logPrintf("Failed to publish point event topic %s.\n",
++              tracker.point_event_topic);
+     return false;
+   }
+ 
+-  // Legacy aliases are migration-only and never determine whether the tracker
+-  // receives an ACK. The canonical publish is the source of truth.
++  // Retained state is a latest-value convenience for dashboards. A failure is
++  // logged but does not cause a duplicate point event on the next LoRa retry.
++  if (!client.publish(tracker.state_topic, payload, true)) {
++    logPrintf("Warning: failed to update retained state topic %s.\n",
++              tracker.state_topic);
++  }
++
+   if (tracker.config->publish_legacy_mqtt_aliases) {
+-    client.publish(tracker.legacy_state_topic, payload);
++    client.publish(tracker.legacy_state_topic, payload, false);
++  }
++  return true;
++}
++
++bool publishGatewayStatus(bool retained = true) {
++  if (!client.connected()) return false;
++
++  size_t seen_count = 0;
++  for (size_t i = 0; i < GATEWAY_TRACKER_COUNT; i++) {
++    if (tracker_runtime[i].has_been_seen) seen_count++;
++  }
++
++  char escaped_gateway_id[EquineConfig::DEVICE_ID_SIZE * 2]{};
++  char escaped_gateway_name[EquineConfig::DEVICE_NAME_SIZE * 2]{};
++  escapeJsonText(GATEWAY_ID, escaped_gateway_id, sizeof(escaped_gateway_id));
++  escapeJsonText(GATEWAY_NAME, escaped_gateway_name, sizeof(escaped_gateway_name));
++
++  char payload[512];
++  const int written = snprintf(
++    payload, sizeof(payload),
++    "{\"api_version\":%u,\"schema_version\":1,"
++    "\"gateway_id\":\"%s\",\"gateway_name\":\"%s\","
++    "\"gateway_hash\":\"%s\",\"uptime_ms\":%lu,"
++    "\"wifi_connected\":%s,\"mqtt_connected\":%s,"
++    "\"free_heap\":%u,\"tracker_count\":%u,"
++    "\"trackers_seen\":%u}",
++    EquineMqttApi::API_VERSION,
++    escaped_gateway_id,
++    escaped_gateway_name,
++    gateway_hash_text,
++    (unsigned long)millis(),
++    WiFi.status() == WL_CONNECTED ? "true" : "false",
++    client.connected() ? "true" : "false",
++    (unsigned)ESP.getFreeHeap(),
++    (unsigned)GATEWAY_TRACKER_COUNT,
++    (unsigned)seen_count);
++  if (written <= 0 || written >= (int)sizeof(payload)) return false;
++  const bool ok = client.publish(gateway_status_topic, payload, retained);
++  if (ok) lastGatewayStatusPublishMs = millis();
++  return ok;
++}
++
++bool publishCommandResponse(const char* request_id, const char* body) {
++  if (!EquineMqttApi::isSafeRequestId(request_id) || !body) return false;
++  char topic[176];
++  snprintf(topic, sizeof(topic), "%s/%s", gateway_response_prefix, request_id);
++  return client.publish(topic, body, false);
++}
++
++void publishCommandError(const char* request_id, const char* command,
++                         const char* error_code, const char* message) {
++  char payload[512];
++  const int written = snprintf(
++    payload, sizeof(payload),
++    "{\"api_version\":%u,\"schema_version\":%u,"
++    "\"request_id\":\"%s\",\"command\":\"%s\","
++    "\"ok\":false,\"error\":\"%s\","
++    "\"message\":\"%s\"}",
++    EquineMqttApi::API_VERSION,
++    EquineMqttApi::COMMAND_SCHEMA_VERSION,
++    request_id ? request_id : "invalid",
++    command ? command : "unknown",
++    error_code ? error_code : "invalid_request",
++    message ? message : "Invalid request");
++  if (written > 0 && written < (int)sizeof(payload) && request_id &&
++      EquineMqttApi::isSafeRequestId(request_id)) {
++    publishCommandResponse(request_id, payload);
++  }
++}
++
++void publishRegistryResponses(const char* request_id) {
++  if (GATEWAY_TRACKER_COUNT == 0) {
++    char payload[320];
++    snprintf(payload, sizeof(payload),
++      "{\"api_version\":%u,\"schema_version\":%u,"
++      "\"request_id\":\"%s\",\"command\":\"registry.get\","
++      "\"ok\":true,\"chunk_index\":0,\"final\":true,"
++      "\"trackers\":[]}",
++      EquineMqttApi::API_VERSION, EquineMqttApi::COMMAND_SCHEMA_VERSION,
++      request_id);
++    publishCommandResponse(request_id, payload);
++    return;
++  }
++
++  for (size_t i = 0; i < GATEWAY_TRACKER_COUNT; i++) {
++    const TrackerRuntime& tracker = tracker_runtime[i];
++    const uint32_t last_seen_age_s =
++      (!tracker.has_been_seen || millis() < tracker.last_seen_ms)
++        ? 0
++        : (millis() - tracker.last_seen_ms) / 1000UL;
++    char escaped_device_id[EquineConfig::DEVICE_ID_SIZE * 2]{};
++    char escaped_device_name[EquineConfig::DEVICE_NAME_SIZE * 2]{};
++    escapeJsonText(tracker.config->device_id, escaped_device_id, sizeof(escaped_device_id));
++    escapeJsonText(tracker.config->device_name, escaped_device_name, sizeof(escaped_device_name));
++    char payload[512];
++    const int written = snprintf(
++      payload, sizeof(payload),
++      "{\"api_version\":%u,\"schema_version\":%u,"
++      "\"request_id\":\"%s\",\"command\":\"registry.get\","
++      "\"ok\":true,\"chunk_index\":%u,\"final\":%s,"
++      "\"tracker\":{\"device_id\":\"%s\","
++      "\"device_name\":\"%s\",\"device_hash\":\"%s\","
++      "\"seen\":%s,\"last_seen_age_s\":%lu,\"rssi\":%d,"
++      "\"last_boot_id\":%lu,\"last_seq\":%lu}}",
++      EquineMqttApi::API_VERSION,
++      EquineMqttApi::COMMAND_SCHEMA_VERSION,
++      request_id,
++      (unsigned)i,
++      i + 1 == GATEWAY_TRACKER_COUNT ? "true" : "false",
++      escaped_device_id,
++      escaped_device_name,
++      tracker.hash_text,
++      tracker.has_been_seen ? "true" : "false",
++      (unsigned long)last_seen_age_s,
++      tracker.last_rssi,
++      (unsigned long)tracker.last_processed_boot_id,
++      (unsigned long)tracker.last_processed_seq);
++    if (written > 0 && written < (int)sizeof(payload)) {
++      publishCommandResponse(request_id, payload);
++    }
++  }
++}
++
++void mqttMessageCallback(char* topic, byte* payload_bytes, unsigned int length) {
++  if (!topic || strcmp(topic, gateway_command_topic) != 0) return;
++  if (!payload_bytes || length == 0 || length >= MQTT_COMMAND_PAYLOAD_SIZE) {
++    logPrintln("Rejected oversized or empty MQTT command.");
++    return;
+   }
++
++  char payload[MQTT_COMMAND_PAYLOAD_SIZE];
++  memcpy(payload, payload_bytes, length);
++  payload[length] = '\0';
++
++  char request_id[EquineMqttApi::MAX_REQUEST_ID_LENGTH + 1]{};
++  char command[EquineMqttApi::MAX_COMMAND_LENGTH + 1]{};
++  uint32_t api_version = 0;
++  uint32_t schema_version = 0;
++  if (!EquineMqttApi::jsonGetString(payload, "request_id", request_id,
++                                    sizeof(request_id)) ||
++      !EquineMqttApi::isSafeRequestId(request_id)) {
++    logPrintln("Rejected MQTT command with missing/invalid request_id.");
++    return;
++  }
++  if (!EquineMqttApi::jsonGetString(payload, "command", command,
++                                    sizeof(command))) {
++    publishCommandError(request_id, "unknown", "invalid_request",
++                        "Missing command");
++    return;
++  }
++  if (!EquineMqttApi::jsonGetUnsigned(payload, "api_version", api_version) ||
++      api_version != EquineMqttApi::API_VERSION ||
++      !EquineMqttApi::jsonGetUnsigned(payload, "schema_version", schema_version) ||
++      schema_version != EquineMqttApi::COMMAND_SCHEMA_VERSION) {
++    publishCommandError(request_id, command, "unsupported_version",
++                        "Unsupported API or command schema version");
++    return;
++  }
++
++  logPrintf("MQTT command received: request=%s command=%s\n",
++            request_id, command);
++
++  if (strcmp(command, "ping") == 0) {
++    char response[320];
++    snprintf(response, sizeof(response),
++      "{\"api_version\":%u,\"schema_version\":%u,"
++      "\"request_id\":\"%s\",\"command\":\"ping\","
++      "\"ok\":true,\"gateway_hash\":\"%s\","
++      "\"uptime_ms\":%lu}",
++      EquineMqttApi::API_VERSION, EquineMqttApi::COMMAND_SCHEMA_VERSION,
++      request_id, gateway_hash_text, (unsigned long)millis());
++    publishCommandResponse(request_id, response);
++  } else if (strcmp(command, "status.get") == 0) {
++    publishGatewayStatus(true);
++    char response[384];
++    snprintf(response, sizeof(response),
++      "{\"api_version\":%u,\"schema_version\":%u,"
++      "\"request_id\":\"%s\",\"command\":\"status.get\","
++      "\"ok\":true,\"status_topic\":\"%s\"}",
++      EquineMqttApi::API_VERSION, EquineMqttApi::COMMAND_SCHEMA_VERSION,
++      request_id, gateway_status_topic);
++    publishCommandResponse(request_id, response);
++  } else if (strcmp(command, "registry.get") == 0) {
++    publishRegistryResponses(request_id);
++  } else {
++    publishCommandError(request_id, command, "unsupported_command",
++                        "Gateway command is not supported");
++  }
++}
++
++bool subscribeMqttTopics() {
++  if (!client.subscribe(gateway_command_topic, 1)) {
++    logPrintf("Failed to subscribe to gateway command topic %s.\n",
++              gateway_command_topic);
++    return false;
++  }
++  logPrintf("Subscribed to MQTT commands: %s\n", gateway_command_topic);
+   return true;
+ }
+ 
+@@ -1149,6 +1370,12 @@
+             (unsigned)seen_count,
+             (unsigned)GATEWAY_TRACKER_COUNT,
+             secondsSincePacket);
++
++  if (client.connected() &&
++      (lastGatewayStatusPublishMs == 0 ||
++       now - lastGatewayStatusPublishMs >= GATEWAY_STATUS_INTERVAL_MS)) {
++    publishGatewayStatus(true);
++  }
+ }
+ 
+ void configureLoRaRadio() {
+@@ -1413,6 +1640,8 @@
+         "offline")) {
+     logPrintln("CONNECTED!");
+     publishGatewayAvailability("online");
++    subscribeMqttTopics();
++    publishGatewayStatus(true);
+     publishAutoDiscovery();
+   } else {
+     logPrint("failed, rc=");
+@@ -1466,6 +1695,7 @@
+ 
+   client.setServer(gateway_config.mqtt_host, gateway_config.mqtt_port);
+   client.setBufferSize(MQTT_BUFFER_SIZE);
++  client.setCallback(mqttMessageCallback);
+ 
+   SPI.begin(SCK, MISO, MOSI, SS);
+   LoRa.setPins(SS, RST, DIO0);
+@@ -1706,25 +1936,34 @@
+                   real_lon,
+                   dist_m);
+ 
++        char escaped_device_id[EquineConfig::DEVICE_ID_SIZE * 2]{};
++        char escaped_device_name[EquineConfig::DEVICE_NAME_SIZE * 2]{};
++        char escaped_gateway_id[EquineConfig::DEVICE_ID_SIZE * 2]{};
++        escapeJsonText(tracker->config->device_id, escaped_device_id, sizeof(escaped_device_id));
++        escapeJsonText(tracker->config->device_name, escaped_device_name, sizeof(escaped_device_name));
++        escapeJsonText(GATEWAY_ID, escaped_gateway_id, sizeof(escaped_gateway_id));
++
+         char jsonBuffer[512];
+         const int written = snprintf(
+           jsonBuffer,
+           sizeof(jsonBuffer),
+-          "{\"api_version\":%u,\"transport_version\":%u,"
+-          "\"schema_version\":%u,\"device_id\":\"%s\","
++          "{\"api_version\":%u,\"point_schema_version\":%u,"
++          "\"transport_version\":%u,\"schema_version\":%u,"
++          "\"device_id\":\"%s\","
+           "\"device_name\":\"%s\",\"device_hash\":\"%s\","
+           "\"gateway_id\":\"%s\",\"gateway_hash\":\"%s\","
+           "\"point_id\":\"%s\",\"latitude\":%.6f,"
+           "\"longitude\":%.6f,\"dist_m\":%u,"
+           "\"battery_level\":%u,\"rssi\":%d,\"seq\":%lu,"
+-          "\"boot_id\":%lu}",
+-          EquineProtocol::MQTT_API_VERSION,
++          "\"boot_id\":%lu,\"gateway_uptime_ms\":%lu}",
++          EquineMqttApi::API_VERSION,
++          EquineMqttApi::POINT_SCHEMA_VERSION,
+           header.transport_version,
+           header.schema_version,
+-          tracker->config->device_id,
+-          tracker->config->device_name,
++          escaped_device_id,
++          escaped_device_name,
+           tracker->hash_text,
+-          GATEWAY_ID,
++          escaped_gateway_id,
+           gateway_hash_text,
+           point_id,
+           real_lat,
+@@ -1733,7 +1972,8 @@
+           header.batt_pct,
+           packet_rssi,
+           (unsigned long)p_seq,
+-          (unsigned long)header.boot_id);
++          (unsigned long)header.boot_id,
++          (unsigned long)millis());
+ 
+         if (written <= 0 || written >= (int)sizeof(jsonBuffer)) {
+           logPrintln("MQTT JSON overflow; packet retained for retry.");
+@@ -1741,7 +1981,7 @@
+           return;
+         }
+ 
+-        if (!publishTrackerState(*tracker, jsonBuffer)) {
++        if (!publishTrackerPoint(*tracker, jsonBuffer)) {
+           logPrintln("MQTT publish failed; packet retained for retry.");
+           publish_success = false;
+           return;
+--- /dev/null
++++ equine_mqtt_api.h
+@@ -0,0 +1,159 @@
++#pragma once
++
++#include <Arduino.h>
++#include <ctype.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++namespace EquineMqttApi {
++
++constexpr uint8_t API_VERSION = 1;
++constexpr uint8_t POINT_SCHEMA_VERSION = 1;
++constexpr uint8_t COMMAND_SCHEMA_VERSION = 1;
++constexpr uint8_t HISTORY_SCHEMA_VERSION = 1;
++constexpr size_t MAX_REQUEST_ID_LENGTH = 48;
++constexpr size_t MAX_COMMAND_LENGTH = 40;
++constexpr size_t MAX_COMMAND_PAYLOAD = 512;
++
++inline void formatTrackerTopic(char* output, size_t output_size,
++                               const char* base_topic, const char* device_hash,
++                               const char* suffix) {
++  if (!output || output_size == 0) return;
++  snprintf(output, output_size, "%s/v%u/trackers/%s/%s",
++           base_topic ? base_topic : "equine", API_VERSION,
++           device_hash ? device_hash : "unknown",
++           suffix ? suffix : "");
++}
++
++inline void formatGatewayTopic(char* output, size_t output_size,
++                               const char* base_topic, const char* gateway_hash,
++                               const char* suffix) {
++  if (!output || output_size == 0) return;
++  snprintf(output, output_size, "%s/v%u/gateways/%s/%s",
++           base_topic ? base_topic : "equine", API_VERSION,
++           gateway_hash ? gateway_hash : "unknown",
++           suffix ? suffix : "");
++}
++
++inline bool isSafeRequestId(const char* value) {
++  if (!value) return false;
++  const size_t length = strlen(value);
++  if (length == 0 || length > MAX_REQUEST_ID_LENGTH) return false;
++  for (size_t i = 0; i < length; i++) {
++    const char c = value[i];
++    if (!(isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' ||
++          c == '.')) {
++      return false;
++    }
++  }
++  return true;
++}
++
++inline const char* skipWhitespace(const char* cursor) {
++  while (cursor && *cursor && isspace(static_cast<unsigned char>(*cursor))) {
++    cursor++;
++  }
++  return cursor;
++}
++
++inline const char* findJsonValue(const char* json, const char* key) {
++  if (!json || !key || !key[0]) return nullptr;
++  char needle[80];
++  const int written = snprintf(needle, sizeof(needle), "\"%s\"", key);
++  if (written <= 0 || written >= static_cast<int>(sizeof(needle))) return nullptr;
++
++  const char* cursor = json;
++  while ((cursor = strstr(cursor, needle)) != nullptr) {
++    cursor += strlen(needle);
++    cursor = skipWhitespace(cursor);
++    if (*cursor != ':') continue;
++    cursor++;
++    return skipWhitespace(cursor);
++  }
++  return nullptr;
++}
++
++inline bool jsonGetString(const char* json, const char* key,
++                          char* output, size_t output_size) {
++  if (!output || output_size == 0) return false;
++  output[0] = '\0';
++  const char* cursor = findJsonValue(json, key);
++  if (!cursor || *cursor != '"') return false;
++  cursor++;
++
++  size_t used = 0;
++  while (*cursor && *cursor != '"') {
++    char value = *cursor++;
++    if (value == '\\') {
++      const char escaped = *cursor++;
++      switch (escaped) {
++        case '"': value = '"'; break;
++        case '\\': value = '\\'; break;
++        case '/': value = '/'; break;
++        case 'n': value = '\n'; break;
++        case 'r': value = '\r'; break;
++        case 't': value = '\t'; break;
++        default: return false;
++      }
++    }
++    if (used + 1 >= output_size) return false;
++    output[used++] = value;
++  }
++  if (*cursor != '"') return false;
++  output[used] = '\0';
++  return true;
++}
++
++inline bool jsonGetUnsigned(const char* json, const char* key,
++                            uint32_t& output) {
++  const char* cursor = findJsonValue(json, key);
++  if (!cursor || !isdigit(static_cast<unsigned char>(*cursor))) return false;
++  char* end = nullptr;
++  const unsigned long parsed = strtoul(cursor, &end, 10);
++  if (end == cursor || parsed > 0xFFFFFFFFUL) return false;
++  output = static_cast<uint32_t>(parsed);
++  return true;
++}
++
++inline bool jsonGetBool(const char* json, const char* key, bool& output) {
++  const char* cursor = findJsonValue(json, key);
++  if (!cursor) return false;
++  if (strncmp(cursor, "true", 4) == 0) {
++    output = true;
++    return true;
++  }
++  if (strncmp(cursor, "false", 5) == 0) {
++    output = false;
++    return true;
++  }
++  return false;
++}
++
++inline void appendJsonEscaped(char* output, size_t output_size,
++                              size_t& used, const char* value) {
++  if (!output || output_size == 0 || used >= output_size) return;
++  const char* cursor = value ? value : "";
++  while (*cursor && used + 1 < output_size) {
++    const char c = *cursor++;
++    const char* escape = nullptr;
++    switch (c) {
++      case '"': escape = "\\\""; break;
++      case '\\': escape = "\\\\"; break;
++      case '\n': escape = "\\n"; break;
++      case '\r': escape = "\\r"; break;
++      case '\t': escape = "\\t"; break;
++      default: break;
++    }
++    if (escape) {
++      while (*escape && used + 1 < output_size) output[used++] = *escape++;
++    } else if (static_cast<unsigned char>(c) >= 0x20) {
++      output[used++] = c;
++    }
++  }
++  output[used] = '\0';
++}
++
++}  // namespace EquineMqttApi

@@ -1,0 +1,9 @@
+{
+  "name": "Equine Tracker Console",
+  "short_name": "Equine",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#0d120e",
+  "theme_color": "#172018",
+  "icons": []
+}

@@ -1,0 +1,473 @@
+--- /mnt/data/tracker_original_lf.ino	2026-07-14 18:55:33.424811452 +0000
++++ /mnt/data/equine_tracker_protocol_v1.ino	2026-07-14 18:53:37.039107381 +0000
+@@ -27,6 +27,15 @@
+ #include <BLEUtils.h>
+ #include <BLE2902.h>
+ #include "secrets.h"
++#include "equine_protocol.h"
++
++// ==========================================
++// TRACKER IDENTITY
++// ==========================================
++// This becomes NVS-configurable during the onboarding/configuration step.
++const char* TRACKER_ID = "wera";
++const char* TRACKER_NAME = "Wera";
++const uint64_t TRACKER_DEVICE_HASH = EquineProtocol::deviceIdHash(TRACKER_ID);
+ 
+ #if defined(BOARD_WIRELESS_TRACKER)
+   // --- GPS UART pins (UC6580) ---
+@@ -170,29 +179,12 @@
+ };
+ 
+ // =====================================================
+-// PAYLOAD FORMAT
++// VERSIONED PAYLOAD FORMAT
+ // =====================================================
+-struct AckPayload {
+-  uint32_t boot_id;
+-  uint32_t acked_seq;
+-} __attribute__((packed));
+-
+-struct LoRaHeader {
+-  uint32_t boot_id;
+-  uint32_t first_seq;
+-  uint16_t total_dist_dam;
+-  uint8_t batt_pct;
+-} __attribute__((packed));
+-
+-struct AnchorPoint {
+-  int16_t dlat;
+-  int16_t dlon;
+-} __attribute__((packed));
+-
+-struct DeltaPoint {
+-  int8_t dlat;
+-  int8_t dlon;
+-} __attribute__((packed));
++using AckPayload = EquineProtocol::AckPayloadV1;
++using LoRaHeader = EquineProtocol::HistoryHeaderV1;
++using AnchorPoint = EquineProtocol::AnchorPointV1;
++using DeltaPoint = EquineProtocol::DeltaPointV1;
+ 
+ // =====================================================
+ // INTERNAL RTC HISTORY
+@@ -1304,7 +1296,12 @@
+   points_packed = 0;
+   const StoredHistoryPoint& root = history_points[historyIndexToRing(0)];
+ 
+-  LoRaHeader header;
++  LoRaHeader header{};
++  header.frame = EquineProtocol::makeFrameHeader(
++    EquineProtocol::MessageType::HISTORY,
++    EquineProtocol::HISTORY_SCHEMA_VERSION,
++    TRACKER_DEVICE_HASH
++  );
+   header.boot_id = boot_id;
+   header.first_seq = root.seq;
+   header.total_dist_dam = (uint16_t)(total_distance_meters / 10.0);
+@@ -2197,6 +2194,19 @@
+   prefs.begin("tracker", false);
+   ble_debug_enabled = prefs.getBool("ble_log", false);
+ 
++  char device_hash_text[17];
++  EquineProtocol::formatDeviceHash(
++    TRACKER_DEVICE_HASH, device_hash_text, sizeof(device_hash_text)
++  );
++  logPrintf(
++    "Protocol v%u tracker_id=%s device_hash=%s history_schema=%u ack_schema=%u\n",
++    EquineProtocol::TRANSPORT_VERSION,
++    TRACKER_ID,
++    device_hash_text,
++    EquineProtocol::HISTORY_SCHEMA_VERSION,
++    EquineProtocol::ACK_SCHEMA_VERSION
++  );
++
+   initBoardPins();
+   pinMode(USER_BTN_PIN, INPUT_PULLUP);
+   bool wifi_setup_requested = false;
+@@ -2571,10 +2581,32 @@
+       bool ack_received = false;
+ 
+       if (rx_result == sizeof(AckPayload)) {
+-        AckPayload ack;
++        AckPayload ack{};
+         memcpy(&ack, rx_buffer, sizeof(AckPayload));
+ 
+-        if (ack.boot_id == boot_id) {
++        const bool supported_ack = EquineProtocol::isSupportedFrame(
++          ack.frame,
++          EquineProtocol::MessageType::ACK,
++          EquineProtocol::ACK_SCHEMA_VERSION
++        );
++
++        if (!supported_ack) {
++          last_ack_status = 0;
++          logPrintf(
++            "Ignored unsupported ACK: magic=0x%04X transport=%u type=%u schema=%u.\n",
++            ack.frame.magic,
++            ack.frame.transport_version,
++            ack.frame.message_type,
++            ack.frame.schema_version
++          );
++        } else if (ack.frame.device_id_hash != TRACKER_DEVICE_HASH) {
++          last_ack_status = 0;
++          char received_hash[17];
++          EquineProtocol::formatDeviceHash(
++            ack.frame.device_id_hash, received_hash, sizeof(received_hash)
++          );
++          logPrintf("Ignored ACK for device hash %s.\n", received_hash);
++        } else if (ack.boot_id == boot_id) {
+           last_acked_seq = ack.acked_seq;
+           uint16_t points_to_clear = 0;
+           const uint16_t original_count = history_count;
+--- /mnt/data/gateway_original_lf.cpp	2026-07-14 18:55:33.423636968 +0000
++++ /mnt/data/equine_gateway_protocol_v1.cpp	2026-07-14 18:54:48.049638870 +0000
+@@ -10,6 +10,7 @@
+ #include <stdarg.h>
+ #include <WebServer.h>
+ #include "secrets.h"
++#include "equine_protocol.h"
+ 
+ // ==========================================
+ // TRACKER IDENTITY
+@@ -19,9 +20,16 @@
+ 
+ constexpr uint16_t MQTT_BUFFER_SIZE = 768;
+ 
+-// Dynamic topics based on the ID
+-char state_topic[64];
+-char availability_topic[64];
++// The v1 routing hash is public and identifies the configured tracker on the
++// wire and in MQTT topics. It is not an encryption key.
++const uint64_t EXPECTED_DEVICE_HASH = EquineProtocol::deviceIdHash(TRACKER_ID);
++char device_hash_text[17];
++
++// Canonical versioned topics plus the old topics during migration.
++char state_topic[96];
++char availability_topic[96];
++char legacy_state_topic[64];
++char legacy_availability_topic[64];
+ char ota_hostname[64];
+ 
+ // --- Heltec V2 Internal LoRa Pins ---
+@@ -51,24 +59,36 @@
+ const uint32_t DEDUP_SAVE_INTERVAL = 10;
+ 
+ // ==========================================
+-// PAYLOAD FORMAT
++// VERSIONED PAYLOAD FORMAT
+ // ==========================================
+-struct AckPayload {
++using AckPayload = EquineProtocol::AckPayloadV1;
++using LoRaHeader = EquineProtocol::HistoryHeaderV1;
++using AnchorPoint = EquineProtocol::AnchorPointV1;
++
++// The gateway accepts legacy packets during the rolling upgrade. Update the
++// gateway first, then the tracker. New trackers always require versioned ACKs.
++struct LegacyAckPayload {
+   uint32_t boot_id;
+   uint32_t acked_seq;
+ } __attribute__((packed));
+ 
+-struct LoRaHeader {
++struct LegacyLoRaHeader {
+   uint32_t boot_id;
+   uint32_t first_seq;
+   uint16_t total_dist_dam;
+   uint8_t batt_pct;
+ } __attribute__((packed));
+ 
+-struct AnchorPoint {
+-  int16_t dlat;
+-  int16_t dlon;
+-} __attribute__((packed));
++struct DecodedHistoryHeader {
++  bool legacy;
++  uint8_t transport_version;
++  uint8_t schema_version;
++  uint64_t device_id_hash;
++  uint32_t boot_id;
++  uint32_t first_seq;
++  uint16_t total_dist_dam;
++  uint8_t batt_pct;
++};
+ 
+ WiFiClient espClient;
+ PubSubClient client(espClient);
+@@ -206,6 +226,23 @@
+   return published;
+ }
+ 
++void publishAvailability(const char* payload) {
++  publishRetainedMessage(availability_topic, payload);
++  // Migration topic is best-effort and does not affect protocol ACKs.
++  client.publish(legacy_availability_topic, payload, true);
++}
++
++bool publishTrackerState(const char* payload) {
++  if (!client.publish(state_topic, payload)) {
++    logPrintf("Failed to publish canonical state topic %s.\n", state_topic);
++    return false;
++  }
++
++  // Keep existing Home Assistant/users working while clients migrate.
++  client.publish(legacy_state_topic, payload);
++  return true;
++}
++
+ bool isValidCoordinateMicrodeg(int32_t lat, int32_t lon) {
+   return lat >= -90000000 && lat <= 90000000 &&
+          lon >= -180000000 && lon <= 180000000;
+@@ -296,7 +333,7 @@
+       saveDedupState(true);
+ 
+       // Let HA know we are going away during update
+-      publishRetainedMessage(availability_topic, "offline");
++      publishAvailability("offline");
+     })
+     .onEnd([]() {
+       logPrintln("\nOTA End");
+@@ -514,12 +551,12 @@
+ 
+   logPrint("Attempting MQTT connection...");
+ 
+-  char clientId[32];
+-  snprintf(clientId, sizeof(clientId), "Gateway-%s", TRACKER_ID);
++  char clientId[48];
++  snprintf(clientId, sizeof(clientId), "Gateway-%s", device_hash_text);
+ 
+   if (client.connect(clientId, mqtt_user, mqtt_pass, availability_topic, 1, true, "offline")) {
+     logPrintln("CONNECTED!");
+-    publishRetainedMessage(availability_topic, "online");
++    publishAvailability("online");
+     publishAutoDiscovery();
+   } else {
+     logPrint("failed, rc=");
+@@ -532,10 +569,30 @@
+   Serial.begin(115200);
+   delay(1000);
+ 
+-  snprintf(state_topic, sizeof(state_topic), "horse/%s/state", TRACKER_ID);
+-  snprintf(availability_topic, sizeof(availability_topic), "horse/%s/availability", TRACKER_ID);
++  EquineProtocol::formatDeviceHash(
++    EXPECTED_DEVICE_HASH, device_hash_text, sizeof(device_hash_text)
++  );
++  snprintf(
++    state_topic, sizeof(state_topic),
++    "equine/v%u/trackers/%s/state",
++    EquineProtocol::MQTT_API_VERSION, device_hash_text
++  );
++  snprintf(
++    availability_topic, sizeof(availability_topic),
++    "equine/v%u/trackers/%s/availability",
++    EquineProtocol::MQTT_API_VERSION, device_hash_text
++  );
++  snprintf(legacy_state_topic, sizeof(legacy_state_topic),
++           "horse/%s/state", TRACKER_ID);
++  snprintf(legacy_availability_topic, sizeof(legacy_availability_topic),
++           "horse/%s/availability", TRACKER_ID);
+ 
+   logPrintf("\n--- Equine Gateway Booting for: %s ---\n", TRACKER_NAME);
++  logPrintf(
++    "Protocol v%u expected_tracker_id=%s device_hash=%s mqtt_api=v%u\n",
++    EquineProtocol::TRANSPORT_VERSION, TRACKER_ID, device_hash_text,
++    EquineProtocol::MQTT_API_VERSION
++  );
+ 
+   loadDedupState();
+ 
+@@ -590,8 +647,10 @@
+   }
+ 
+   do {
+-    // Accept variable length payloads
+-    if (packetSize < sizeof(LoRaHeader) + 8 + 2) {
++    // Accept variable length payloads. The smallest valid packet is the legacy
++    // history header plus root coordinates and the two batch-count bytes.
++    if (packetSize < (int)(sizeof(LegacyLoRaHeader) + 8 + 2) ||
++        packetSize > 255) {
+       logPrintf("Ignored invalid packet size. Got: %d\n", packetSize);
+       break;
+     }
+@@ -608,9 +667,73 @@
+     lastLoRaPacketMs = millis();
+ 
+     size_t offset = 0;
+-    LoRaHeader header;
+-    memcpy(&header, payload_buffer + offset, sizeof(LoRaHeader));
+-    offset += sizeof(LoRaHeader);
++    DecodedHistoryHeader header{};
++
++    bool has_v1_magic = false;
++    if (packetSize >= (int)sizeof(EquineProtocol::FrameHeaderV1)) {
++      EquineProtocol::FrameHeaderV1 frame{};
++      memcpy(&frame, payload_buffer, sizeof(frame));
++      has_v1_magic = EquineProtocol::hasValidMagic(frame);
++    }
++
++    if (has_v1_magic) {
++      if (packetSize < (int)(sizeof(LoRaHeader) + 8 + 2)) {
++        logPrintf("Protocol-v1 packet is too short: %d bytes.\n", packetSize);
++        break;
++      }
++
++      LoRaHeader wire_header{};
++      memcpy(&wire_header, payload_buffer, sizeof(wire_header));
++
++      if (!EquineProtocol::isSupportedFrame(
++            wire_header.frame,
++            EquineProtocol::MessageType::HISTORY,
++            EquineProtocol::HISTORY_SCHEMA_VERSION)) {
++        logPrintf(
++          "Unsupported frame: transport=%u type=%u schema=%u flags=0x%02X.\n",
++          wire_header.frame.transport_version,
++          wire_header.frame.message_type,
++          wire_header.frame.schema_version,
++          wire_header.frame.flags
++        );
++        break;
++      }
++
++      if (wire_header.frame.device_id_hash != EXPECTED_DEVICE_HASH) {
++        char unknown_hash[17];
++        EquineProtocol::formatDeviceHash(
++          wire_header.frame.device_id_hash, unknown_hash, sizeof(unknown_hash)
++        );
++        logPrintf(
++          "Ignored packet from unregistered device hash %s; expected %s.\n",
++          unknown_hash, device_hash_text
++        );
++        break;
++      }
++
++      header.legacy = false;
++      header.transport_version = wire_header.frame.transport_version;
++      header.schema_version = wire_header.frame.schema_version;
++      header.device_id_hash = wire_header.frame.device_id_hash;
++      header.boot_id = wire_header.boot_id;
++      header.first_seq = wire_header.first_seq;
++      header.total_dist_dam = wire_header.total_dist_dam;
++      header.batt_pct = wire_header.batt_pct;
++      offset = sizeof(wire_header);
++    } else {
++      LegacyLoRaHeader legacy_header{};
++      memcpy(&legacy_header, payload_buffer, sizeof(legacy_header));
++      header.legacy = true;
++      header.transport_version = 0;
++      header.schema_version = 0;
++      header.device_id_hash = EXPECTED_DEVICE_HASH;
++      header.boot_id = legacy_header.boot_id;
++      header.first_seq = legacy_header.first_seq;
++      header.total_dist_dam = legacy_header.total_dist_dam;
++      header.batt_pct = legacy_header.batt_pct;
++      offset = sizeof(legacy_header);
++      logPrintln("Accepted legacy unversioned packet during migration.");
++    }
+ 
+     int32_t root_lat, root_lon;
+     memcpy(&root_lat, payload_buffer + offset, 4); offset += 4;
+@@ -640,10 +763,18 @@
+ 
+     uint32_t current_seq = header.first_seq;
+ 
+-    logPrintf("Received compressed packet: boot_id=%lu first_seq=%lu root_lat=%.6f root_lon=%.6f anchors=%u batches=%u RSSI=%d\n",
+-              (unsigned long)header.boot_id, (unsigned long)header.first_seq,
+-              root_lat / 1000000.0f, root_lon / 1000000.0f,
+-              num_anchors, num_batches, LoRa.packetRssi());
++    logPrintf(
++      "Received %s packet: transport=%u schema=%u hash=%s boot_id=%lu "
++      "first_seq=%lu root_lat=%.6f root_lon=%.6f anchors=%u batches=%u RSSI=%d\n",
++      header.legacy ? "legacy" : "v1",
++      header.transport_version,
++      header.schema_version,
++      device_hash_text,
++      (unsigned long)header.boot_id,
++      (unsigned long)header.first_seq,
++      root_lat / 1000000.0f, root_lon / 1000000.0f,
++      num_anchors, num_batches, LoRa.packetRssi()
++    );
+ 
+     bool publish_success = true;
+ 
+@@ -672,11 +803,19 @@
+                   real_lon,
+                   dist_m);
+ 
+-        char jsonBuffer[256];
++        char jsonBuffer[384];
+         int written = snprintf(
+           jsonBuffer,
+           sizeof(jsonBuffer),
+-          "{\"latitude\":%.6f,\"longitude\":%.6f,\"dist_m\":%u,\"battery_level\":%u,\"rssi\":%d,\"seq\":%lu,\"boot_id\":%lu}",
++          "{\"api_version\":%u,\"transport_version\":%u,"
++          "\"schema_version\":%u,\"device_hash\":\"%s\","
++          "\"latitude\":%.6f,\"longitude\":%.6f,\"dist_m\":%u,"
++          "\"battery_level\":%u,\"rssi\":%d,\"seq\":%lu,"
++          "\"boot_id\":%lu}",
++          EquineProtocol::MQTT_API_VERSION,
++          header.transport_version,
++          header.schema_version,
++          device_hash_text,
+           real_lat,
+           real_lon,
+           dist_m,
+@@ -687,12 +826,15 @@
+         );
+ 
+         if (written > 0 && written < (int)sizeof(jsonBuffer)) {
+-          if (client.publish(state_topic, jsonBuffer)) {
++          if (publishTrackerState(jsonBuffer)) {
+             updateDedupState(header.boot_id, p_seq);
+           } else {
+             logPrintln("MQTT publish failed. Halting parsing for this packet.");
+             publish_success = false;
+           }
++        } else {
++          logPrintln("MQTT JSON buffer overflow; retaining packet for retry.");
++          publish_success = false;
+         }
+       }
+     };
+@@ -736,18 +878,34 @@
+     if (publish_success) {
+       saveDedupState(false);
+ 
+-      AckPayload ack;
+-      ack.boot_id = header.boot_id;
+-      ack.acked_seq = current_seq - 1;
+-
+       LoRa.beginPacket();
+-      LoRa.write((uint8_t*)&ack, sizeof(AckPayload));
++
++      uint32_t ack_boot_id = header.boot_id;
++      uint32_t acked_seq = current_seq - 1;
++      if (header.legacy) {
++        LegacyAckPayload ack{};
++        ack.boot_id = ack_boot_id;
++        ack.acked_seq = acked_seq;
++        LoRa.write((uint8_t*)&ack, sizeof(ack));
++      } else {
++        AckPayload ack{};
++        ack.frame = EquineProtocol::makeFrameHeader(
++          EquineProtocol::MessageType::ACK,
++          EquineProtocol::ACK_SCHEMA_VERSION,
++          header.device_id_hash
++        );
++        ack.boot_id = ack_boot_id;
++        ack.acked_seq = acked_seq;
++        LoRa.write((uint8_t*)&ack, sizeof(ack));
++      }
++
+       int txResult = LoRa.endPacket();
+ 
+       if (txResult) {
+-        logPrintf("Sent ACK for boot_id=%lu seq=%lu\n",
+-                  (unsigned long)ack.boot_id,
+-                  (unsigned long)ack.acked_seq);
++        logPrintf("Sent %s ACK for boot_id=%lu seq=%lu\n",
++                  header.legacy ? "legacy" : "v1",
++                  (unsigned long)ack_boot_id,
++                  (unsigned long)acked_seq);
+       } else {
+         logPrintln("Failed to transmit ACK payload.");
+       }

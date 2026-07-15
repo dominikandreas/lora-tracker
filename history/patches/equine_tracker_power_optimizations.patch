@@ -1,0 +1,1345 @@
+--- Pasted text(3).txt
++++ equine_tracker_optimized.ino
+@@ -86,8 +86,18 @@
+ const uint32_t MAX_FIX_AGE_S = 43200;
+ const double SAVE_DIST_THRESHOLD = 250.0;
+ const uint32_t SAVE_CYCLE_THRESHOLD = 60;
+-const uint32_t GPS_TIMEOUT_MS = 60000;
+-const uint32_t GPS_LISTEN_WINDOW_MS = 2500;
++
++// GNSS acquisition starts by listening immediately. If no fix is available,
++// short light-sleep/listen cycles continue until this absolute deadline.
++const uint32_t GPS_TIMEOUT_MS = 30000;
++const uint32_t GPS_INITIAL_LISTEN_MS = 5000;
++const uint32_t GPS_LIGHT_SLEEP_CHUNK_MS = 5000;
++const uint32_t GPS_LISTEN_WINDOW_MS = 2000;
++
++// Batch normal position updates and keep the expensive RX window short.
++const uint32_t LORA_TX_INTERVAL_S = 300;
++const uint16_t LORA_TX_MIN_POINTS = 3;
++const uint32_t LORA_ACK_TIMEOUT_MS = 800;
+ 
+ // --- History encoding ---
+ const double HISTORY_POINT_SPACING_M = 15.0;   // only store a history point every 15m
+@@ -99,8 +109,13 @@
+ const float MAX_BATTERY_VOLTAGE = 4.2f;
+ const bool BATTERY_SENSE_ENABLED = true;
+ 
+-// --- Sleep ---
+-const uint64_t SLEEP_DURATION_US = 60000000;
++// --- Adaptive sleep ---
++const uint64_t SLEEP_DURATION_US = 60000000ULL;              // moving / recently active
++const uint64_t STATIONARY_SLEEP_DURATION_US = 300000000ULL;  // stationary for several fixes
++const uint64_t LONG_STATIONARY_SLEEP_DURATION_US = 600000000ULL;
++const uint64_t NO_FIX_SLEEP_DURATION_US = 120000000ULL;
++const uint16_t STATIONARY_FIXES_FOR_LONG_SLEEP = 3;
++const uint16_t STATIONARY_FIXES_FOR_MAX_SLEEP = 12;
+ 
+ // --- Display / setup responsiveness ---
+ const uint8_t WIFI_MAX_CONNECT_ATTEMPTS = 5;
+@@ -111,6 +126,9 @@
+ const uint32_t DISPLAY_PAGE_INTERVAL_MS = 10000;
+ const uint32_t DISPLAY_BATTERY_REFRESH_MS = 5000;
+ const uint8_t DISPLAY_PAGE_COUNT = 4;
++const uint32_t BLE_CONNECTION_WINDOW_MS = 60000;
++const uint32_t BLE_RECONNECT_WINDOW_MS = 15000;
++const uint32_t WIFI_SETUP_BOOT_HOLD_MS = 1500;
+ 
+ // --- UBX Command to put BN-220 to Sleep ---
+ const byte UBX_SLEEP_CMD[] = {
+@@ -175,6 +193,9 @@
+ RTC_DATA_ATTR uint32_t next_point_seq = 0; // survives deep sleep
+ RTC_DATA_ATTR uint64_t target_wakeup_time_us = 0;
+ RTC_DATA_ATTR uint64_t session_start_time_us = 0; // wall-clock uptime across deep sleep
++RTC_DATA_ATTR uint16_t stationary_fix_streak = 0;
++RTC_DATA_ATTR uint8_t consecutive_no_fix_cycles = 0;
++RTC_DATA_ATTR uint32_t seconds_since_last_tx = LORA_TX_INTERVAL_S;
+ 
+ uint32_t boot_id = 0; // loaded/incremented from NVS on hard boot
+ 
+@@ -246,6 +267,10 @@
+ void requestDisplayWake(uint32_t duration_ms = DISPLAY_BUTTON_TIMEOUT_MS, bool advance_page = false);
+ void serviceDisplayAndButton(bool force_refresh = false);
+ void responsiveDelay(uint32_t duration_ms);
++void startBleDebugWindow(uint32_t duration_ms);
++void stopBleDebug();
++void serviceBleDebug();
++bool isBleConnectionWindowActive();
+ 
+ // --- BLE Globals ---
+ #define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E" // UART service UUID
+@@ -253,20 +278,28 @@
+ #define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+ 
+ BLEServer *pServer = NULL;
+-BLECharacteristic *pTxCharacteristic;
++BLECharacteristic *pTxCharacteristic = NULL;
+ bool deviceConnected = false;
++bool ble_initialized = false;
++bool ble_connection_window_active = false;
++uint32_t ble_connection_window_deadline_ms = 0;
+ 
+ class MyServerCallbacks: public BLEServerCallbacks {
+-    void onConnect(BLEServer* pServer) {
++    void onConnect(BLEServer* server) override {
++        (void)server;
+         deviceConnected = true;
+         ble_advertising = false;
+-        debug_mode = true; // Keep the device awake while a BLE debug client is attached.
+-    };
+-    void onDisconnect(BLEServer* pServer) {
++        ble_connection_window_active = false;
++        debug_mode = true; // A connected client deliberately keeps the tracker awake.
++    }
++
++    void onDisconnect(BLEServer* server) override {
+         deviceConnected = false;
+         debug_mode = false;
++        ble_connection_window_active = true;
++        ble_connection_window_deadline_ms = millis() + BLE_RECONNECT_WINDOW_MS;
+         ble_advertising = true;
+-        pServer->startAdvertising(); // Restart advertising so clients can reconnect later
++        server->startAdvertising();
+     }
+ };
+ 
+@@ -274,7 +307,12 @@
+ // HELPERS
+ // =====================================================
+ bool isDebugModeActive() {
+-  return debug_mode || ble_debug_enabled;
++  return debug_mode || deviceConnected;
++}
++
++bool isBleConnectionWindowActive() {
++  return ble_connection_window_active &&
++         (int32_t)(ble_connection_window_deadline_ms - millis()) > 0;
+ }
+ 
+ void setTrackerPhase(const char* phase) {
+@@ -367,47 +405,146 @@
+   }
+ }
+ 
++void stopBleDebug() {
++  if (!ble_initialized) {
++    ble_connection_window_active = false;
++    ble_advertising = false;
++    return;
++  }
++
++  if (ble_advertising) {
++    BLEAdvertising* advertising = BLEDevice::getAdvertising();
++    if (advertising) advertising->stop();
++  }
++
++  BLEDevice::deinit(true);
++  pServer = NULL;
++  pTxCharacteristic = NULL;
++  deviceConnected = false;
++  debug_mode = false;
++  ble_initialized = false;
++  ble_advertising = false;
++  ble_connection_window_active = false;
++}
++
++void startBleDebugWindow(uint32_t duration_ms) {
++  if (!ble_debug_enabled) return;
++
++  if (!ble_initialized) {
++    logPrintln("Starting bounded BLE debug window...");
++    BLEDevice::init("EquineTracker");
++    pServer = BLEDevice::createServer();
++    pServer->setCallbacks(new MyServerCallbacks());
++
++    BLEService *pService = pServer->createService(SERVICE_UUID);
++    pTxCharacteristic = pService->createCharacteristic(
++      CHARACTERISTIC_UUID_TX,
++      BLECharacteristic::PROPERTY_NOTIFY
++    );
++    pTxCharacteristic->addDescriptor(new BLE2902());
++
++    BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(
++      CHARACTERISTIC_UUID_RX,
++      BLECharacteristic::PROPERTY_WRITE
++    );
++    (void)pRxCharacteristic;
++
++    pService->start();
++    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
++    pAdvertising->addServiceUUID(SERVICE_UUID);
++    pAdvertising->setScanResponse(true);
++    pAdvertising->setMinPreferred(0x06);
++    pAdvertising->setMinPreferred(0x12);
++    ble_initialized = true;
++  }
++
++  BLEDevice::startAdvertising();
++  ble_advertising = true;
++  ble_connection_window_active = true;
++  ble_connection_window_deadline_ms = millis() + duration_ms;
++}
++
++void serviceBleDebug() {
++  if (ble_connection_window_active && !deviceConnected &&
++      !isBleConnectionWindowActive()) {
++    logPrintln("BLE connection window expired; shutting BLE down.");
++    stopBleDebug();
++  }
++}
++
++void waitForBleConnectionWindow() {
++  while (isBleConnectionWindowActive() && !deviceConnected) {
++    serviceDisplayAndButton();
++    delay(10);
++  }
++  serviceBleDebug();
++}
++
++
+ 
+ float getBatteryVoltage();
+ uint8_t getBatteryPercentage();
++void refreshBatteryCache(bool force);
++
++void refreshBatteryCache(bool force) {
++  const uint32_t now = millis();
++  if (!force && cached_battery_read_ms != 0 &&
++      (uint32_t)(now - cached_battery_read_ms) < DISPLAY_BATTERY_REFRESH_MS) {
++    return;
++  }
++
++  float voltage = 0.0f;
++  if (BATTERY_SENSE_ENABLED) {
++#if defined(BOARD_WIRELESS_TRACKER)
++    pinMode(ADC_CTRL, OUTPUT);
++    digitalWrite(ADC_CTRL, HIGH);
++    delay(50);
++    const uint32_t millivolts = analogReadMilliVolts(BATT_PIN);
++    digitalWrite(ADC_CTRL, LOW);
++    voltage = (millivolts / 1000.0f) * 4.9f;
++#else
++    const uint32_t millivolts = analogReadMilliVolts(BATT_PIN);
++    voltage = (millivolts * 2.0f) / 1000.0f;
++#endif
++  }
++
++  cached_battery_voltage = voltage;
++  if (voltage > 0.0f) {
++    const int pct = (int)(((voltage - MIN_BATTERY_VOLTAGE) * 100.0f) /
++                          (MAX_BATTERY_VOLTAGE - MIN_BATTERY_VOLTAGE));
++    cached_battery_percentage = (uint8_t)constrain(pct, 0, 100);
++  } else {
++    cached_battery_percentage = 0;
++  }
++  cached_battery_read_ms = now;
++}
+ 
+ void logRTCState() {
+-  logPrint("RTC state -> has_fix: ");
+-  logPrint(has_initial_fix ? "true" : "false");
+-  float v = getBatteryVoltage();
+-  uint8_t p = getBatteryPercentage();
+-  logPrintf(", dist: %.2f m, age: %u s, daily_reset_age: %u s, strikes: %u, hist_count: %u, next_seq: %lu, batt: %.2fV (%u%%)\n",
+-                total_distance_meters,
+-                seconds_since_last_fix,
+-                seconds_since_daily_reset,
+-                teleport_strikes,
+-                history_count,
+-                (unsigned long)next_point_seq,
+-                v, p);
++  refreshBatteryCache(false);
++  logPrintf("RTC state -> has_fix: %s, dist: %.2f m, age: %u s, daily_reset_age: %u s, "
++            "strikes: %u, hist_count: %u, next_seq: %lu, stationary: %u, "
++            "since_tx: %u s, batt: %.2fV (%u%%)\n",
++            has_initial_fix ? "true" : "false",
++            total_distance_meters,
++            seconds_since_last_fix,
++            seconds_since_daily_reset,
++            teleport_strikes,
++            history_count,
++            (unsigned long)next_point_seq,
++            stationary_fix_streak,
++            seconds_since_last_tx,
++            cached_battery_voltage,
++            cached_battery_percentage);
+ }
+ 
+ float getBatteryVoltage() {
+-  if (!BATTERY_SENSE_ENABLED) return 0.0f;
+-  float voltage = 0.0f;
+-#if defined(BOARD_WIRELESS_TRACKER)
+-  pinMode(ADC_CTRL, OUTPUT);
+-  digitalWrite(ADC_CTRL, HIGH); // Active-HIGH to enable voltage divider on Wireless Tracker
+-  delay(50);                    // Wait for voltage to stabilize
+-  uint32_t millivolts = analogReadMilliVolts(BATT_PIN);
+-  digitalWrite(ADC_CTRL, LOW);  // Disable to save power
+-  voltage = (millivolts / 1000.0f) * 4.9f;
+-#else
+-  uint32_t millivolts = analogReadMilliVolts(BATT_PIN);
+-  voltage = (millivolts * 2.0f) / 1000.0f;
+-#endif
+-  return voltage;
++  refreshBatteryCache(false);
++  return cached_battery_voltage;
+ }
+ 
+ uint8_t getBatteryPercentage() {
+-  float voltage = getBatteryVoltage();
+-  if (voltage == 0.0f) return 0;
+-  int pct = (int)(((voltage - MIN_BATTERY_VOLTAGE) * 100.0f) / (MAX_BATTERY_VOLTAGE - MIN_BATTERY_VOLTAGE));
+-  return (uint8_t)constrain(pct, 0, 100);
++  refreshBatteryCache(false);
++  return cached_battery_percentage;
+ }
+ 
+ void wakeupGPS() {
+@@ -421,20 +558,22 @@
+   digitalWrite(GNSS_RST_PIN, HIGH);
+ #else
+   logPrintln("Waking up GNSS (sending wakeup byte)...");
+-  Serial2.write(0xFF); // Wake up BN-220
++  Serial2.write(0xFF);
+ #endif
+-  responsiveDelay(500);
++  // Start consuming UART data quickly instead of waiting through a fixed 500 ms delay.
++  responsiveDelay(100);
+ }
+ 
+ void sleepGPS() {
+ #if defined(BOARD_WIRELESS_TRACKER)
+   logPrintln("Powering down GNSS (Wireless Tracker)...");
+   digitalWrite(GNSS_PWR_PIN, LOW);
+-  digitalWrite(GNSS_RST_PIN, LOW);
++  // Do not drive the reset line into an unpowered module: high impedance
++  // avoids both a forced reset and possible GPIO back-powering.
++  pinMode(GNSS_RST_PIN, INPUT);
+   digitalWrite(VEXT_CTRL_PIN, LOW);
+ 
+-  // TFT and GNSS share VEXT on the Wireless Tracker. Once VEXT is cut,
+-  // the TFT controller has lost state and must be initialized again.
++  // TFT and GNSS share VEXT. Cutting it invalidates the TFT controller state.
+   display_initialized = false;
+   display_awake = false;
+ #else
+@@ -444,7 +583,7 @@
+   }
+   Serial2.flush();
+ #endif
+-  delay(100);
++  delay(50);
+ }
+ 
+ #if defined(BOARD_WIRELESS_TRACKER)
+@@ -680,7 +819,7 @@
+     html += "<input type='checkbox' name='ble_log' value='1' ";
+     if(ble_debug_enabled) html += "checked";
+     html += "> Enable BLE Debug Logs<br>";
+-    html += "<small style='color:red;'><b>Warning:</b> Enabling BLE debugging keeps the device awake and the display on, significantly reducing battery life.</small><br><br>";
++    html += "<small style='color:red;'><b>Warning:</b> BLE debugging is opened only in a bounded connection window; a connected client keeps the tracker awake.</small><br><br>";
+     html += "<input type='submit' value='Save Settings' style='padding:10px;background:#007BFF;color:white;border:none;border-radius:4px;'></form>";
+     html += "<hr><form action='/start' method='POST'><input type='submit' value='Turn Off WiFi & Start Tracking' style='padding:10px;background:#28A745;color:white;border:none;border-radius:4px;width:100%;'></form>";
+     html += "<hr><h3>Live Logs</h3><pre id='logs' style='background:#f4f4f4;padding:10px;max-height:300px;overflow-y:auto;'>Loading...</pre>";
+@@ -1049,21 +1188,7 @@
+ }
+ 
+ void refreshDisplayBatteryCache(bool force) {
+-  const uint32_t now = millis();
+-  if (!force && cached_battery_read_ms != 0 &&
+-      (uint32_t)(now - cached_battery_read_ms) < DISPLAY_BATTERY_REFRESH_MS) {
+-    return;
+-  }
+-
+-  cached_battery_voltage = getBatteryVoltage();
+-  if (cached_battery_voltage > 0.0f) {
+-    int pct = (int)(((cached_battery_voltage - MIN_BATTERY_VOLTAGE) * 100.0f) /
+-                    (MAX_BATTERY_VOLTAGE - MIN_BATTERY_VOLTAGE));
+-    cached_battery_percentage = (uint8_t)constrain(pct, 0, 100);
+-  } else {
+-    cached_battery_percentage = 0;
+-  }
+-  cached_battery_read_ms = now;
++  refreshBatteryCache(force);
+ }
+ 
+ void initDisplay() {
+@@ -1280,6 +1405,7 @@
+ }
+ 
+ void serviceDisplayAndButton(bool force_refresh) {
++  serviceBleDebug();
+   const uint32_t now = millis();
+   const bool button_pressed = digitalRead(USER_BTN_PIN) == LOW;
+ 
+@@ -1331,9 +1457,10 @@
+           ble_debug_enabled = !ble_debug_enabled;
+           prefs.putBool("ble_log", ble_debug_enabled);
+           setLastError(ble_debug_enabled ? "BLE Debug ON" : "BLE Debug OFF");
+-          if (ble_debug_enabled && !ble_advertising) {
+-            BLEDevice::startAdvertising();
+-            ble_advertising = true;
++          if (ble_debug_enabled) {
++            startBleDebugWindow(BLE_CONNECTION_WINDOW_MS);
++          } else {
++            stopBleDebug();
+           }
+         }
+         pending_confirmation = ConfirmationState::NONE;
+@@ -1399,28 +1526,171 @@
+ #if defined(BOARD_WIRELESS_TRACKER)
+   pinMode(VEXT_CTRL_PIN, OUTPUT);
+   pinMode(GNSS_PWR_PIN, OUTPUT);
+-  pinMode(GNSS_RST_PIN, OUTPUT);
+-
+-  // Start with GNSS disabled during WiFi/OTA setup.
++  pinMode(GNSS_RST_PIN, INPUT);
++
++  // Start with GNSS disabled during optional WiFi/OTA setup.
+   digitalWrite(VEXT_CTRL_PIN, LOW);
+   digitalWrite(GNSS_PWR_PIN, LOW);
+-  digitalWrite(GNSS_RST_PIN, LOW);
+ 
+   pinMode(ADC_CTRL, OUTPUT);
+-  digitalWrite(ADC_CTRL, LOW); // Disable voltage divider initially to save power
++  digitalWrite(ADC_CTRL, LOW);
+ #endif
+ }
+ 
++bool bootButtonRequestsWifiSetup() {
++  if (digitalRead(USER_BTN_PIN) != LOW) return false;
++
++  const uint32_t hold_start_ms = millis();
++  while (digitalRead(USER_BTN_PIN) == LOW &&
++         (uint32_t)(millis() - hold_start_ms) < WIFI_SETUP_BOOT_HOLD_MS) {
++    delay(10);
++  }
++
++  const bool requested =
++    (uint32_t)(millis() - hold_start_ms) >= WIFI_SETUP_BOOT_HOLD_MS;
++  if (requested) {
++    // Avoid interpreting the same boot-time hold as a normal UI press.
++    previous_button_pressed = true;
++    last_button_event_ms = millis();
++  }
++  return requested;
++}
++
++bool listenForGpsFix(uint32_t listen_duration_ms,
++                     uint32_t current_elapsed_s,
++                     bool& movement_accepted) {
++  const uint32_t listen_start_ms = millis();
++
++  while ((uint32_t)(millis() - listen_start_ms) < listen_duration_ms) {
++    bool processed_gps_bytes = false;
++
++    while (Serial2.available() > 0) {
++      gps.encode(Serial2.read());
++      processed_gps_bytes = true;
++    }
++
++    if (gps.location.isUpdated() && gps.location.isValid() &&
++        gps.location.age() < 1500) {
++      if (fabs(gps.location.lat()) < 0.1 && fabs(gps.location.lng()) < 0.1) {
++        continue;
++      }
++
++      if (gps.hdop.isValid() && gps.satellites.isValid() &&
++          gps.hdop.hdop() <= MAX_HDOP &&
++          gps.satellites.value() >= MIN_SATELLITES) {
++        setTrackerPhase("GPS fix acquired");
++        logPrintf("Solid Fix Acquired! (Sats: %u, HDOP: %.2f)\n",
++                  gps.satellites.value(), gps.hdop.hdop());
++
++        const double candidate_lat = gps.location.lat();
++        const double candidate_lng = gps.location.lng();
++
++        if (has_initial_fix) {
++          const double distance_moved = TinyGPSPlus::distanceBetween(
++            last_lat, last_lng, candidate_lat, candidate_lng
++          );
++
++          double allowed_distance = current_elapsed_s * MAX_SPEED_MPS;
++          if (allowed_distance < 50.0) allowed_distance = 50.0;
++
++          if (distance_moved > allowed_distance) {
++            teleport_strikes++;
++            logPrintf("TELEPORT! Moved: %.0f m. Allowed: %.0f m. (Strike %u/3)\n",
++                      distance_moved, allowed_distance, teleport_strikes);
++
++            if (teleport_strikes >= 3) {
++              logPrintln("3 Strikes! Resetting position.");
++              has_initial_fix = false;
++              teleport_strikes = 0;
++            }
++            return false;
++          }
++
++          teleport_strikes = 0;
++          const double current_speed =
++            gps.speed.isValid() ? gps.speed.kmph() : 0.0;
++
++          const bool position_changed =
++            distance_moved > MIN_DISTANCE_METERS;
++          if (position_changed) {
++            // Be conservative for the power policy even if the GNSS speed
++            // field is temporarily stale or invalid.
++            movement_accepted = true;
++          }
++
++          if (position_changed && current_speed > MIN_SPEED_KMPH) {
++            total_distance_meters += distance_moved;
++            last_lat = candidate_lat;
++            last_lng = candidate_lng;
++            logPrintf("Accepted movement -> total distance now %.2f m\n",
++                      total_distance_meters);
++            maybeAppendSignificantHistoryPoint(candidate_lat, candidate_lng);
++          } else {
++            logPrintln("Jitter/Stationary detected. Freezing map marker.");
++          }
++        } else {
++          last_lat = candidate_lat;
++          last_lng = candidate_lng;
++          has_initial_fix = true;
++          maybeAppendSignificantHistoryPoint(candidate_lat, candidate_lng);
++        }
++
++        seconds_since_last_fix = 0;
++        return true;
++      }
++
++      logPrintf("Weak Fix -> Sats: %u, HDOP: %.2f, Age: %u ms\n",
++                gps.satellites.isValid() ? gps.satellites.value() : 0,
++                gps.hdop.isValid() ? gps.hdop.hdop() : -1.0,
++                gps.location.age());
++    }
++
++    serviceDisplayAndButton();
++    if (!processed_gps_bytes) delay(10);
++  }
++
++  return false;
++}
++
++uint64_t chooseNextSleepDurationUs(bool fix_found, bool movement_accepted) {
++  if (!fix_found) {
++    consecutive_no_fix_cycles++;
++    stationary_fix_streak = 0;
++    return NO_FIX_SLEEP_DURATION_US;
++  }
++
++  consecutive_no_fix_cycles = 0;
++  if (movement_accepted) {
++    stationary_fix_streak = 0;
++    return SLEEP_DURATION_US;
++  }
++
++  if (stationary_fix_streak < UINT16_MAX) stationary_fix_streak++;
++  if (stationary_fix_streak >= STATIONARY_FIXES_FOR_MAX_SLEEP) {
++    return LONG_STATIONARY_SLEEP_DURATION_US;
++  }
++  if (stationary_fix_streak >= STATIONARY_FIXES_FOR_LONG_SLEEP) {
++    return STATIONARY_SLEEP_DURATION_US;
++  }
++  return SLEEP_DURATION_US;
++}
++
+ void setup() {
++  // Determine wake type before any optional USB wait.
++  last_reset_reason = esp_reset_reason();
++  const bool hard_boot = (last_reset_reason != ESP_RST_DEEPSLEEP);
++  const esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
++
+   Serial.begin(115200);
+ #if defined(BOARD_WIRELESS_TRACKER)
+-  // Wait up to 4 seconds for native USB serial port to connect.
+-  const uint32_t start_ms = millis();
+-  while (!Serial && (uint32_t)(millis() - start_ms) < 4000) {
+-    delay(10);
++  if (hard_boot) {
++    const uint32_t start_ms = millis();
++    while (!Serial && (uint32_t)(millis() - start_ms) < 4000) {
++      delay(10);
++    }
+   }
+ #else
+-  delay(250);
++  if (hard_boot) delay(250);
+ #endif
+ 
+   prefs.begin("tracker", false);
+@@ -1428,17 +1698,14 @@
+ 
+   initBoardPins();
+   pinMode(USER_BTN_PIN, INPUT_PULLUP);
++  const bool wifi_setup_requested =
++    hard_boot && bootButtonRequestsWifiSetup();
+ 
+   if (BATTERY_SENSE_ENABLED) {
+     analogReadResolution(12);
+     analogSetPinAttenuation(BATT_PIN, ADC_11db);
+   }
+ 
+-  last_reset_reason = esp_reset_reason();
+-  const bool hard_boot = (last_reset_reason != ESP_RST_DEEPSLEEP);
+-  const esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
+-
+-  // Load state before drawing anything, so every display page is immediately useful.
+   if (hard_boot) {
+     logPrintln("\n[boot] HARD BOOT DETECTED! Loading data from flash memory...");
+ 
+@@ -1454,11 +1721,15 @@
+     wakeup_counter = 0;
+     seconds_since_daily_reset = prefs.getUInt("daily_age", 0);
+     next_point_seq = 0;
++    stationary_fix_streak = 0;
++    consecutive_no_fix_cycles = 0;
++    seconds_since_last_tx = LORA_TX_INTERVAL_S;
+     clearHistory();
+ 
+     struct timeval tv;
+     gettimeofday(&tv, NULL);
+-    session_start_time_us = (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;
++    session_start_time_us =
++      (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;
+   } else {
+     wakeup_counter++;
+     boot_id = prefs.getUInt("boot_id", 1);
+@@ -1471,51 +1742,48 @@
+   Serial2.begin(GPS_BAUD, SERIAL_8N1, RXD2, TXD2);
+ 
+ #if !defined(BOARD_WIRELESS_TRACKER)
+-  // The BN-220 is independent of the OLED power rail.
+-  if (hard_boot) {
+-    sleepGPS();
+-  }
++  if (hard_boot) sleepGPS();
+ #endif
+ 
+-  if (hard_boot || wakeup_cause == ESP_SLEEP_WAKEUP_EXT0 || wifi_setup_active) {
++  if (hard_boot || wakeup_cause == ESP_SLEEP_WAKEUP_EXT0) {
+     initDisplay();
+     setTrackerPhase(hard_boot ? "Booting" : "Wake cycle");
+-    if (hard_boot) {
+-      requestDisplayWake(30000, false);
+-    }
++    if (hard_boot) requestDisplayWake(30000, false);
+   } else {
+-    // Lazy-load display. We still need to power VEXT for GNSS on the Tracker.
+-#if defined(BOARD_WIRELESS_TRACKER)
+-    pinMode(VEXT_CTRL_PIN, OUTPUT);
+-    digitalWrite(VEXT_CTRL_PIN, HIGH);
+-    pinMode(TFT_BL, OUTPUT);
+-    digitalWrite(TFT_BL, LOW); // explicitly keep backlight off
+-#endif
++    // Timer wake: leave the display completely uninitialized.
+     setTrackerPhase("Wake cycle");
+   }
+ 
+-  // A button-only deep-sleep wake is a status request, not a tracking cycle.
+-  // Show all pages for a while, then resume the original sleep deadline.
++  // A button-only wake opens the status UI and, when enabled, a bounded BLE
++  // connection window. It otherwise resumes the original sleep deadline.
+   if (!hard_boot && wakeup_cause == ESP_SLEEP_WAKEUP_EXT0) {
+     previous_button_pressed = digitalRead(USER_BTN_PIN) == LOW;
+     last_button_event_ms = millis();
+     setTrackerPhase("Button status");
+     requestDisplayWake(DISPLAY_BUTTON_TIMEOUT_MS, false);
+-    while ((int32_t)(display_on_until_ms - millis()) > 0) {
++
++    if (ble_debug_enabled) {
++      startBleDebugWindow(BLE_CONNECTION_WINDOW_MS);
++    }
++
++    while ((int32_t)(display_on_until_ms - millis()) > 0 ||
++           isBleConnectionWindowActive()) {
+       serviceDisplayAndButton();
++      if (deviceConnected) break;
+       delay(10);
+     }
+     turnOffDisplay();
+ 
+     struct timeval tv;
+     gettimeofday(&tv, NULL);
+-    const uint64_t now_us = (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;
+-
+-    if (target_wakeup_time_us > now_us) {
++    const uint64_t now_us =
++      (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;
++
++    if (!isDebugModeActive() && target_wakeup_time_us > now_us) {
++      stopBleDebug();
+ #if defined(BOARD_WIRELESS_TRACKER)
+-      // Display use temporarily raised VEXT. Cut it again before returning to sleep.
+       digitalWrite(GNSS_PWR_PIN, LOW);
+-      digitalWrite(GNSS_RST_PIN, LOW);
++      pinMode(GNSS_RST_PIN, INPUT);
+       digitalWrite(VEXT_CTRL_PIN, LOW);
+       display_initialized = false;
+       display_awake = false;
+@@ -1528,8 +1796,17 @@
+     }
+   }
+ 
+-  if (hard_boot) {
++  if (wifi_setup_requested) {
+     runWifiSetupMode();
++  } else if (hard_boot) {
++    logPrintln("WiFi setup skipped. Hold the button during power-up to enable it.");
++  }
++
++  // BLE is on-demand and bounded. A connected client may deliberately keep
++  // the device awake; no connection means BLE is shut down before tracking.
++  if (hard_boot && ble_debug_enabled && !deviceConnected) {
++    startBleDebugWindow(BLE_CONNECTION_WINDOW_MS);
++    waitForBleConnectionWindow();
+   }
+ 
+   setTrackerPhase("GNSS power-up");
+@@ -1537,34 +1814,6 @@
+ 
+   logPrintln("\n--- Equine Tracker Waking Up ---");
+   logRTCState();
+-
+-  if (ble_debug_enabled) {
+-    setTrackerPhase("BLE debug init");
+-    logPrintln("Starting BLE Debug Server...");
+-    BLEDevice::init("EquineTracker");
+-    pServer = BLEDevice::createServer();
+-    pServer->setCallbacks(new MyServerCallbacks());
+-    BLEService *pService = pServer->createService(SERVICE_UUID);
+-    pTxCharacteristic = pService->createCharacteristic(
+-                      CHARACTERISTIC_UUID_TX,
+-                      BLECharacteristic::PROPERTY_NOTIFY
+-                     );
+-    pTxCharacteristic->addDescriptor(new BLE2902());
+-    BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(
+-                         CHARACTERISTIC_UUID_RX,
+-                         BLECharacteristic::PROPERTY_WRITE
+-                       );
+-    (void)pRxCharacteristic;
+-    pService->start();
+-    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+-    pAdvertising->addServiceUUID(SERVICE_UUID);
+-    pAdvertising->setScanResponse(true);
+-    pAdvertising->setMinPreferred(0x06);
+-    pAdvertising->setMinPreferred(0x12);
+-    BLEDevice::startAdvertising();
+-    ble_advertising = true;
+-    logPrintln("BLE Advertising Started.");
+-  }
+ 
+   setTrackerPhase("LoRa init");
+   lora_initialized = initLoRaRadio();
+@@ -1581,7 +1830,8 @@
+ 
+       struct timeval tv;
+       gettimeofday(&tv, NULL);
+-      const uint64_t now_us = (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;
++      const uint64_t now_us =
++        (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;
+       target_wakeup_time_us = now_us + SLEEP_DURATION_US;
+ 
+       prefs.end();
+@@ -1589,7 +1839,7 @@
+       esp_sleep_enable_timer_wakeup(SLEEP_DURATION_US);
+       esp_deep_sleep_start();
+     } else {
+-      logPrintln("Debug mode active, skipping deep sleep on LoRa fail.");
++      logPrintln("Connected BLE debug client keeps the device awake.");
+     }
+   }
+ 
+@@ -1597,180 +1847,127 @@
+   serviceDisplayAndButton(true);
+ 
+   if (!isDebugModeActive()) {
+-    // Normal operation is low-power: display off unless the button temporarily wakes it.
+     display_on_until_ms = 0;
+     serviceDisplayAndButton(true);
+     performTrackingCycle();
+   } else {
+-    logPrintln("Setup finished. Debug mode active; display stays on and status pages rotate.");
++    logPrintln("BLE debug client connected; entering live debug operation.");
+   }
+ }
+ 
+ void performTrackingCycle() {
+-  uint32_t cycle_start_ms = millis();
++  const uint32_t cycle_start_ms = millis();
+   setTrackerPhase("GPS acquisition");
+   serviceDisplayAndButton(true);
++
+   // =====================================================
+   // GPS ACQUISITION
+   // =====================================================
+-  uint32_t elapsed_wait_ms = 0;
+-  const uint32_t LIGHT_SLEEP_CHUNK_MS = 15000;
+-  const uint32_t ACTIVE_LISTEN_MS = GPS_LISTEN_WINDOW_MS;
+-  uint32_t current_elapsed_s = seconds_since_last_fix;
+-
+-  if (has_initial_fix && current_elapsed_s > MAX_FIX_AGE_S) {
+-    logPrintf("WARNING: Last fix is %u seconds old. Discarding it!\n", current_elapsed_s);
++  const uint32_t fix_age_at_cycle_start = seconds_since_last_fix;
++  const uint32_t acquisition_start_ms = millis();
++  bool cycle_fix_found = false;
++  bool cycle_movement_accepted = false;
++
++  if (has_initial_fix && fix_age_at_cycle_start > MAX_FIX_AGE_S) {
++    logPrintf("WARNING: Last fix is %u seconds old. Discarding it!\n",
++              fix_age_at_cycle_start);
+     has_initial_fix = false;
+   }
+ 
+-  logPrintln("Starting GPS acquisition with Light Sleep cycles...");
+-
+-  while (elapsed_wait_ms < GPS_TIMEOUT_MS) {
++  logPrintf("Listening immediately for GNSS for up to %u ms...\n",
++            GPS_INITIAL_LISTEN_MS);
++  uint32_t first_window_ms = GPS_INITIAL_LISTEN_MS;
++  if (first_window_ms > GPS_TIMEOUT_MS) first_window_ms = GPS_TIMEOUT_MS;
++  cycle_fix_found = listenForGpsFix(
++    first_window_ms,
++    fix_age_at_cycle_start,
++    cycle_movement_accepted
++  );
++
++  while (!cycle_fix_found) {
++    const uint32_t elapsed_ms = millis() - acquisition_start_ms;
++    if (elapsed_ms >= GPS_TIMEOUT_MS) break;
++
++    uint32_t remaining_ms = GPS_TIMEOUT_MS - elapsed_ms;
++    uint32_t sleep_chunk_ms = GPS_LIGHT_SLEEP_CHUNK_MS;
++    if (sleep_chunk_ms > remaining_ms) sleep_chunk_ms = remaining_ms;
++
+     if (isDebugModeActive()) {
+       setTrackerPhase("GPS wait (debug)");
+-      logPrintf("ESP32 waiting for %u ms (skipping light sleep)...\n", LIGHT_SLEEP_CHUNK_MS);
+-      const uint32_t wait_start = millis();
+-      while ((uint32_t)(millis() - wait_start) < LIGHT_SLEEP_CHUNK_MS) {
+-        serviceDisplayAndButton();
+-        delay(10);
+-      }
++      responsiveDelay(sleep_chunk_ms);
+     } else {
+-      logPrintf("ESP32 entering Light Sleep for %u ms...\n", LIGHT_SLEEP_CHUNK_MS);
++      setTrackerPhase("GPS light sleep");
+       Serial.flush();
+       esp_sleep_enable_ext0_wakeup((gpio_num_t)USER_BTN_PIN, 0);
+-      esp_sleep_enable_timer_wakeup(LIGHT_SLEEP_CHUNK_MS * 1000ULL);
++      esp_sleep_enable_timer_wakeup((uint64_t)sleep_chunk_ms * 1000ULL);
+       esp_light_sleep_start();
++
+       if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
+         previous_button_pressed = digitalRead(USER_BTN_PIN) == LOW;
+         last_button_event_ms = millis();
+-        logPrintln("Button pressed during light sleep! Showing live status...");
++        logPrintln("Button pressed during GNSS light sleep.");
+         requestDisplayWake(DISPLAY_BUTTON_TIMEOUT_MS, false);
+       }
+     }
+ 
+-    elapsed_wait_ms += LIGHT_SLEEP_CHUNK_MS;
+-    current_elapsed_s += (LIGHT_SLEEP_CHUNK_MS / 1000);
++    const uint32_t elapsed_after_sleep_ms = millis() - acquisition_start_ms;
++    if (elapsed_after_sleep_ms >= GPS_TIMEOUT_MS) break;
++
++    remaining_ms = GPS_TIMEOUT_MS - elapsed_after_sleep_ms;
++    uint32_t listen_ms = GPS_LISTEN_WINDOW_MS;
++    if (listen_ms > remaining_ms) listen_ms = remaining_ms;
+ 
+     setTrackerPhase("GPS listen");
+-    serviceDisplayAndButton(true);
+-    uint32_t listen_start = millis();
+-    bool chunk_fix_found = false;
+-
+-    while ((millis() - listen_start) < ACTIVE_LISTEN_MS) {
+-      bool processed_gps_bytes = false;
+-
+-      while (Serial2.available() > 0) {
+-        gps.encode(Serial2.read());
+-        processed_gps_bytes = true;
+-      }
+-
+-      if (gps.location.isUpdated() && gps.location.isValid() && gps.location.age() < 1500) {
+-        if (fabs(gps.location.lat()) < 0.1 && fabs(gps.location.lng()) < 0.1) {
+-          continue;
+-        }
+-
+-        if (gps.hdop.isValid() && gps.satellites.isValid() &&
+-            gps.hdop.hdop() <= MAX_HDOP && gps.satellites.value() >= MIN_SATELLITES) {
+-
+-          setTrackerPhase("GPS fix acquired");
+-          logPrintf("Solid Fix Acquired! (Sats: %u, HDOP: %.2f)\n",
+-                        gps.satellites.value(), gps.hdop.hdop());
+-
+-          double candidate_lat = gps.location.lat();
+-          double candidate_lng = gps.location.lng();
+-
+-          if (has_initial_fix) {
+-            logPrintf("Evaluating movement from last fix -> candidate: (%.6f, %.6f) vs last: (%.6f, %.6f)\n",
+-                          candidate_lat, candidate_lng, last_lat, last_lng);
+-            double distance_moved = TinyGPSPlus::distanceBetween(last_lat, last_lng, candidate_lat, candidate_lng);
+-
+-            double allowed_distance = current_elapsed_s * MAX_SPEED_MPS;
+-            if (allowed_distance < 50.0) allowed_distance = 50.0;
+-
+-            if (distance_moved > allowed_distance) {
+-              teleport_strikes++;
+-              logPrintf("TELEPORT! Moved: %.0f m. Allowed: %.0f m. (Strike %u/3)\n",
+-                            distance_moved, allowed_distance, teleport_strikes);
+-
+-              if (teleport_strikes >= 3) {
+-                logPrintln("3 Strikes! Resetting position.");
+-                has_initial_fix = false;
+-                teleport_strikes = 0;
+-              }
+-              break;
+-            }
+-
+-            teleport_strikes = 0;
+-            double current_speed = gps.speed.isValid() ? gps.speed.kmph() : 0.0;
+-
+-            if (distance_moved > MIN_DISTANCE_METERS && current_speed > MIN_SPEED_KMPH) {
+-              total_distance_meters += distance_moved;
+-              last_lat = candidate_lat;
+-              last_lng = candidate_lng;
+-              logPrintf("Accepted movement -> total distance now %.2f m\n", total_distance_meters);
+-
+-              maybeAppendSignificantHistoryPoint(candidate_lat, candidate_lng);
+-            } else {
+-              logPrintln("Jitter/Stationary detected. Freezing map marker.");
+-            }
+-          } else {
+-            last_lat = candidate_lat;
+-            last_lng = candidate_lng;
+-            has_initial_fix = true;
+-
+-            maybeAppendSignificantHistoryPoint(candidate_lat, candidate_lng);
+-          }
+-
+-          chunk_fix_found = true;
+-          seconds_since_last_fix = 0;
+-          break;
+-        }
+-      } else {
+-        if (gps.location.isValid()) {
+-          logPrintf("Weak Fix -> Sats: %u, HDOP: %.2f, Age: %u ms\n",
+-                        gps.satellites.isValid() ? gps.satellites.value() : 0,
+-                        gps.hdop.isValid() ? gps.hdop.hdop() : -1.0,
+-                        gps.location.age());
+-        }
+-      }
+-
+-      serviceDisplayAndButton();
+-      if (!processed_gps_bytes) {
+-        delay(10);
+-      }
+-    }
+-
+-    elapsed_wait_ms += ACTIVE_LISTEN_MS;
+-    current_elapsed_s += (ACTIVE_LISTEN_MS / 1000);
+-
+-    if (chunk_fix_found) {
+-      break;
+-    } else {
+-      logPrintln("No confident fix yet. Going back to Light Sleep...");
+-    }
+-  }
++    const uint32_t current_elapsed_s =
++      fix_age_at_cycle_start + elapsed_after_sleep_ms / 1000U;
++    cycle_fix_found = listenForGpsFix(
++      listen_ms,
++      current_elapsed_s,
++      cycle_movement_accepted
++    );
++  }
++
++  const uint32_t acquisition_elapsed_ms = millis() - acquisition_start_ms;
++  uint32_t current_elapsed_s = 0;
++  if (!cycle_fix_found) {
++    current_elapsed_s =
++      fix_age_at_cycle_start + acquisition_elapsed_ms / 1000U;
++    logPrintf("No confident GNSS fix before the %u ms deadline.\n",
++              GPS_TIMEOUT_MS);
++  }
++
++  const uint64_t next_sleep_duration_us =
++    chooseNextSleepDurationUs(cycle_fix_found, cycle_movement_accepted);
++  const uint32_t next_sleep_s =
++    (uint32_t)(next_sleep_duration_us / 1000000ULL);
++  logPrintf("Power policy -> fix=%s moved=%s stationary_streak=%u no_fix=%u next_sleep=%u s\n",
++            cycle_fix_found ? "yes" : "no",
++            cycle_movement_accepted ? "yes" : "no",
++            stationary_fix_streak,
++            consecutive_no_fix_cycles,
++            next_sleep_s);
+ 
+   // =====================================================
+   // FLASH SAVE
+   // =====================================================
+   bool should_save_to_flash = false;
+-
+   if ((total_distance_meters - last_saved_dist) >= SAVE_DIST_THRESHOLD) {
+     should_save_to_flash = true;
+   }
+-
+-  if (wakeup_counter > 0 && (wakeup_counter % SAVE_CYCLE_THRESHOLD == 0)) {
++  if (wakeup_counter > 0 &&
++      (wakeup_counter % SAVE_CYCLE_THRESHOLD == 0)) {
+     should_save_to_flash = true;
+   }
+ 
+   if (should_save_to_flash) {
+     setTrackerPhase("Saving state");
+     serviceDisplayAndButton(true);
+-    logPrintln("Saving current daily distance and reset age safely to flash (NVS)...");
++    logPrintln("Saving current daily distance and reset age to flash.");
+     prefs.putDouble("dist", total_distance_meters);
+-    uint32_t projected_daily_age = seconds_since_daily_reset +
+-                                   ((millis() - cycle_start_ms) / 1000) +
+-                                   (SLEEP_DURATION_US / 1000000);
++    const uint32_t projected_daily_age =
++      seconds_since_daily_reset +
++      ((millis() - cycle_start_ms) / 1000U) +
++      next_sleep_s;
+     prefs.putUInt("daily_age", projected_daily_age);
+     last_saved_dist = total_distance_meters;
+   }
+@@ -1778,20 +1975,26 @@
+   // =====================================================
+   // PACK AND TRANSMIT
+   // =====================================================
+-  if (history_count > 0) {
++  const bool tx_due =
++    history_count > 0 &&
++    (history_count >= LORA_TX_MIN_POINTS ||
++     seconds_since_last_tx >= LORA_TX_INTERVAL_S ||
++     history_count >= (HISTORY_SIZE - 16));
++
++  if (tx_due) {
+     setTrackerPhase("LoRa transmit");
+     serviceDisplayAndButton(true);
+-    logPrintf("Unacknowledged points in queue: %u\n", history_count);
+-    
++    logPrintf("LoRa batch due: %u queued points, %u s since last ACK.\n",
++              history_count, seconds_since_last_tx);
++
+     for (int tx_loop = 0; tx_loop < 5; tx_loop++) {
+-      if (history_count == 0) {
+-        logPrintln("All points acknowledged. Done transmitting.");
+-        break;
+-      }
++      if (history_count == 0) break;
+ 
+       uint8_t payload_buffer[240];
+       uint16_t points_packed = 0;
+-      size_t payload_len = buildDynamicPayload(payload_buffer, sizeof(payload_buffer), points_packed);
++      const size_t payload_len = buildDynamicPayload(
++        payload_buffer, sizeof(payload_buffer), points_packed
++      );
+ 
+       if (payload_len == 0 || points_packed == 0) {
+         logPrintln("Skipping LoRa send because payload build failed.");
+@@ -1801,80 +2004,94 @@
+       last_tx_bytes = payload_len;
+       last_tx_points = points_packed;
+       last_ack_status = -1;
+-      bool txResult = transmitLoRaPacket(payload_buffer, payload_len);
+-      last_tx_status = txResult ? 1 : 0;
++      const bool tx_result = transmitLoRaPacket(payload_buffer, payload_len);
++      last_tx_status = tx_result ? 1 : 0;
+       serviceDisplayAndButton(true);
+ 
+-      if (txResult) {
+-        setTrackerPhase("Waiting for ACK");
+-        logPrintf("LoRa sent %u bytes (%u packet points). Listening for ACK...\n", payload_len, points_packed);
+-        
+-        // Wait for ACK
+-        uint8_t rx_buffer[sizeof(AckPayload)];
+-        int rxResult = receiveLoRaAck(rx_buffer, sizeof(rx_buffer), 2500);
+-        bool ack_received = false;
+-
+-        if (rxResult == sizeof(AckPayload)) {
+-          AckPayload ack;
+-          memcpy(&ack, rx_buffer, sizeof(AckPayload));
+-          
+-          if (ack.boot_id == boot_id) {
+-            last_acked_seq = ack.acked_seq;
+-            logPrintf("Received ACK for seq up to %lu\n", (unsigned long)ack.acked_seq);
+-            
+-            // Clear acknowledged points
+-            uint16_t original_count = history_count;
+-            uint16_t points_to_clear = 0;
+-            for (uint16_t i = 0; i < original_count; i++) {
+-              const StoredHistoryPoint& p = history_points[historyIndexToRing(points_to_clear)];
+-              if (p.seq <= ack.acked_seq) {
+-                 points_to_clear++;
+-              } else {
+-                 break;
+-              }
+-            }
+-            
+-            if (points_to_clear > 0) {
+-               history_count -= points_to_clear;
+-               logPrintf("Cleared %u points. Remaining unacked: %u\n", points_to_clear, history_count);
+-               ack_received = true;
+-               last_ack_status = 1;
+-               setLastError(nullptr);
+-            } else {
+-               last_ack_status = 0;
+-               logPrintf("Ignored stale ACK for seq %lu; nothing cleared.\n", (unsigned long)ack.acked_seq);
+-            }
+-          } else {
+-            last_ack_status = 0;
+-            logPrintf("Ignored ACK for wrong boot_id: %lu\n", (unsigned long)ack.boot_id);
+-          }
+-        } else if (rxResult > 0) {
+-          last_ack_status = 0;
+-          logPrintf("Ignored packet of wrong size: %d bytes\n", rxResult);
+-        } else {
+-          last_ack_status = 0;
+-        }
+-
+-        serviceDisplayAndButton(true);
+-        sleepLoRaRadio();
+-
+-        if (!ack_received) {
+-           setLastError("LoRa ACK not received");
+-           logPrintln("No ACK received. Stopping transmission loop for this cycle.");
+-           break;
+-        }
+-
+-      } else {
++      if (!tx_result) {
+         setLastError("LoRa transmit failed");
+         logPrintln("LoRa transmit failed.");
+         break;
+       }
+ 
+-      responsiveDelay(250); // pause between loop-sent chunks
+-    }
++      setTrackerPhase("Waiting for ACK");
++      logPrintf("LoRa sent %u bytes (%u points); ACK window %u ms.\n",
++                payload_len, points_packed, LORA_ACK_TIMEOUT_MS);
++
++      uint8_t rx_buffer[sizeof(AckPayload)];
++      const int rx_result = receiveLoRaAck(
++        rx_buffer, sizeof(rx_buffer), LORA_ACK_TIMEOUT_MS
++      );
++      bool ack_received = false;
++
++      if (rx_result == sizeof(AckPayload)) {
++        AckPayload ack;
++        memcpy(&ack, rx_buffer, sizeof(AckPayload));
++
++        if (ack.boot_id == boot_id) {
++          last_acked_seq = ack.acked_seq;
++          uint16_t points_to_clear = 0;
++          const uint16_t original_count = history_count;
++
++          for (uint16_t i = 0; i < original_count; i++) {
++            const StoredHistoryPoint& point =
++              history_points[historyIndexToRing(points_to_clear)];
++            if (point.seq <= ack.acked_seq) {
++              points_to_clear++;
++            } else {
++              break;
++            }
++          }
++
++          if (points_to_clear > 0) {
++            history_count -= points_to_clear;
++            ack_received = true;
++            last_ack_status = 1;
++            setLastError(nullptr);
++            logPrintf("ACK cleared %u points; %u remain.\n",
++                      points_to_clear, history_count);
++          } else {
++            last_ack_status = 0;
++            logPrintf("Ignored stale ACK for seq %lu.\n",
++                      (unsigned long)ack.acked_seq);
++          }
++        } else {
++          last_ack_status = 0;
++          logPrintf("Ignored ACK for wrong boot_id: %lu\n",
++                    (unsigned long)ack.boot_id);
++        }
++      } else if (rx_result > 0) {
++        last_ack_status = 0;
++        logPrintf("Ignored packet of wrong size: %d bytes\n", rx_result);
++      } else {
++        last_ack_status = 0;
++      }
++
++      serviceDisplayAndButton(true);
++
++      if (!ack_received) {
++        setLastError("LoRa ACK not received");
++        logPrintln("No valid ACK; retaining queued data for retry.");
++        break;
++      }
++
++      if (history_count == 0) {
++        seconds_since_last_tx = 0;
++        logPrintln("All queued points acknowledged.");
++        break;
++      }
++
++      responsiveDelay(50);
++    }
++
++    sleepLoRaRadio();
++  } else if (history_count > 0) {
++    setTrackerPhase("LoRa batching");
++    logPrintf("Deferring LoRa: %u points queued, %u/%u s elapsed.\n",
++              history_count, seconds_since_last_tx, LORA_TX_INTERVAL_S);
+   } else {
+     setTrackerPhase("No queued points");
+-    logPrintln("No valid history points available. Skipping LoRa send this cycle.");
++    logPrintln("No valid history points available.");
+   }
+ 
+   last_cycle_duration_ms = millis() - cycle_start_ms;
+@@ -1887,61 +2104,77 @@
+     setTrackerPhase("Deep sleep");
+     serviceDisplayAndButton(true);
+     turnOffDisplay();
++    stopBleDebug();
+     prefs.end();
+     Serial.flush();
+     sleepGPS();
+     sleepLoRaRadio();
+ 
+-    uint32_t time_awake_s = (millis() - cycle_start_ms) / 1000;
+-
+-    if (seconds_since_last_fix != 0) {
+-      seconds_since_last_fix = current_elapsed_s + (SLEEP_DURATION_US / 1000000);
++    const uint32_t time_awake_s =
++      (millis() - cycle_start_ms) / 1000U;
++
++    if (cycle_fix_found) {
++      seconds_since_last_fix = next_sleep_s;
+     } else {
+-      seconds_since_last_fix += (SLEEP_DURATION_US / 1000000);
+-    }
+-
+-    seconds_since_daily_reset += time_awake_s;
+-    seconds_since_daily_reset += (SLEEP_DURATION_US / 1000000);
++      seconds_since_last_fix = current_elapsed_s + next_sleep_s;
++    }
++
++    seconds_since_daily_reset += time_awake_s + next_sleep_s;
++    if (UINT32_MAX - seconds_since_last_tx <
++        time_awake_s + next_sleep_s) {
++      seconds_since_last_tx = UINT32_MAX;
++    } else {
++      seconds_since_last_tx += time_awake_s + next_sleep_s;
++    }
+ 
+     struct timeval tv;
+     gettimeofday(&tv, NULL);
+-    uint64_t now_us = (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;
+-    target_wakeup_time_us = now_us + SLEEP_DURATION_US;
++    const uint64_t now_us =
++      (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;
++    target_wakeup_time_us = now_us + next_sleep_duration_us;
+ 
+     esp_sleep_enable_ext0_wakeup((gpio_num_t)USER_BTN_PIN, 0);
+-    esp_sleep_enable_timer_wakeup(SLEEP_DURATION_US);
++    esp_sleep_enable_timer_wakeup(next_sleep_duration_us);
+     esp_deep_sleep_start();
+   } else {
+     setTrackerPhase("Debug idle");
+     serviceDisplayAndButton(true);
+-    logPrintln("Tracking cycle completed. Awaiting next cycle in debug mode...");
+-
+-    uint32_t time_awake_s = (millis() - cycle_start_ms) / 1000;
+-    uint32_t debug_sleep_ms = (SLEEP_DURATION_US / 1000ULL) * 2 / 3;
+-    uint32_t debug_sleep_s = debug_sleep_ms / 1000;
+-
+-    if (seconds_since_last_fix != 0) {
+-      seconds_since_last_fix = current_elapsed_s + debug_sleep_s;
++    logPrintln("Tracking cycle completed; BLE client remains connected.");
++
++    const uint32_t time_awake_s =
++      (millis() - cycle_start_ms) / 1000U;
++    const uint32_t debug_pause_s =
++      (uint32_t)((SLEEP_DURATION_US / 1000ULL) * 2ULL / 3ULL / 1000ULL);
++
++    if (cycle_fix_found) {
++      seconds_since_last_fix = debug_pause_s;
+     } else {
+-      seconds_since_last_fix += debug_sleep_s;
+-    }
+-
+-    seconds_since_daily_reset += time_awake_s + debug_sleep_s;
+-  }
+-
++      seconds_since_last_fix = current_elapsed_s + debug_pause_s;
++    }
++    seconds_since_daily_reset += time_awake_s + debug_pause_s;
++
++    if (UINT32_MAX - seconds_since_last_tx <
++        time_awake_s + debug_pause_s) {
++      seconds_since_last_tx = UINT32_MAX;
++    } else {
++      seconds_since_last_tx += time_awake_s + debug_pause_s;
++    }
++  }
+ }
+ 
+ void loop() {
++  static uint32_t last_cycle_ms = 0;
++  static bool first_debug_cycle = true;
++  const uint32_t debug_pause_ms =
++    (uint32_t)((SLEEP_DURATION_US / 1000ULL) * 2ULL / 3ULL);
++
++  serviceDisplayAndButton();
++
+   if (isDebugModeActive()) {
+-    static uint32_t last_cycle_ms = 0;
+-    static bool first_debug_cycle = true;
+-    const uint32_t debug_sleep_ms = (SLEEP_DURATION_US / 1000ULL) * 2 / 3;
+-
+-    serviceDisplayAndButton();
+-
+-    if ((uint32_t)(millis() - last_cycle_ms) > debug_sleep_ms || last_cycle_ms == 0) {
++    if ((uint32_t)(millis() - last_cycle_ms) >= debug_pause_ms ||
++        last_cycle_ms == 0) {
+       if (!first_debug_cycle) {
+-        logPrintln("\n--- Starting tracking cycle ---");
++        logPrintln("\n--- Starting BLE debug tracking cycle ---");
+         wakeup_counter++;
+         if (seconds_since_daily_reset >= SECONDS_PER_DAY) {
+           resetDailyDistanceAndHistory();
+@@ -1949,17 +2182,19 @@
+         logRTCState();
+       }
+       first_debug_cycle = false;
+-
+       performTrackingCycle();
+       last_cycle_ms = millis();
+     }
+-
+-    serviceDisplayAndButton();
+-    delay(10);
+-  } else {
+-    // Normal mode normally never reaches loop(): performTrackingCycle() enters
+-    // deep sleep. Keep the button/display service safe if an error path does.
+-    serviceDisplayAndButton();
+-    delay(10);
+-  }
+-}
++  } else if (isBleConnectionWindowActive()) {
++    // Allow a recently disconnected client to reconnect briefly.
++    serviceBleDebug();
++  } else if (ble_initialized) {
++    // A debug session ended. Shut BLE down and run one normal cycle, which
++    // will select the appropriate adaptive deep-sleep interval.
++    stopBleDebug();
++    logPrintln("BLE debug session ended; returning to low-power tracking.");
++    performTrackingCycle();
++  }
++
++  delay(10);
++}

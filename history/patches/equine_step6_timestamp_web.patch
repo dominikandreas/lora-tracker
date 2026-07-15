@@ -1,0 +1,2610 @@
+--- tracker/equine_protocol.h
++++ tracker/equine_protocol.h.v2
+@@ -7,23 +7,26 @@
+ 
+ // Shared on-wire definitions for trackers, gateways, relays and apps.
+ //
+-// Wire encoding in protocol v1 is packed little-endian, matching the ESP32
+-// endpoints. Applications on other platforms must decode the integer fields
+-// explicitly as little-endian values rather than mapping these structs directly.
++// Wire encoding is packed little-endian, matching the ESP32 endpoints.
++// Applications on other platforms must decode integer fields explicitly as
++// little-endian values rather than mapping these structs directly.
+ namespace EquineProtocol {
+ 
+ constexpr uint16_t FRAME_MAGIC = 0x5145;  // bytes "EQ" on little-endian targets
+ constexpr uint8_t TRANSPORT_VERSION = 1;
+-constexpr uint8_t HISTORY_SCHEMA_VERSION = 1;
++constexpr uint8_t HISTORY_SCHEMA_VERSION_V1 = 1;
++constexpr uint8_t HISTORY_SCHEMA_VERSION = 2;
+ constexpr uint8_t ACK_SCHEMA_VERSION = 1;
+ constexpr uint8_t MQTT_API_VERSION = 1;
++constexpr size_t MAX_ULEB128_U32_BYTES = 5;
+ 
+-// Flags are reserved now so encryption and relaying can be added without
+-// changing the v1 envelope layout.
++// Flags are part of the stable envelope so encryption and relaying do not need
++// another envelope layout. FLAG_HAS_TIMESTAMPS applies to history schema v2.
+ enum FrameFlags : uint8_t {
+-  FLAG_NONE      = 0,
+-  FLAG_ENCRYPTED = 1U << 0,
+-  FLAG_RELAYED   = 1U << 1,
++  FLAG_NONE           = 0,
++  FLAG_ENCRYPTED      = 1U << 0,
++  FLAG_RELAYED        = 1U << 1,
++  FLAG_HAS_TIMESTAMPS = 1U << 2,
+ };
+ 
+ enum class MessageType : uint8_t {
+@@ -42,6 +45,7 @@
+   uint64_t device_id_hash;
+ } __attribute__((packed));
+ 
++// Kept for rolling upgrades. Schema v1 has no point timestamps.
+ struct HistoryHeaderV1 {
+   FrameHeaderV1 frame;
+   uint32_t boot_id;
+@@ -50,6 +54,18 @@
+   uint8_t batt_pct;
+ } __attribute__((packed));
+ 
++// Schema v2 adds one absolute UTC timestamp for the root point. Every later
++// point stores an unsigned LEB128 delta in seconds from the previous point.
++// A normal 40-120 second interval costs one byte; up to 16383 seconds costs two.
++struct HistoryHeaderV2 {
++  FrameHeaderV1 frame;
++  uint32_t boot_id;
++  uint32_t first_seq;
++  uint32_t root_unix_time_s;
++  uint16_t total_dist_dam;
++  uint8_t batt_pct;
++} __attribute__((packed));
++
+ struct AckPayloadV1 {
+   FrameHeaderV1 frame;
+   uint32_t boot_id;
+@@ -67,15 +83,15 @@
+ } __attribute__((packed));
+ 
+ static_assert(sizeof(FrameHeaderV1) == 14, "Unexpected protocol frame size");
+-static_assert(sizeof(HistoryHeaderV1) == 25, "Unexpected history header size");
++static_assert(sizeof(HistoryHeaderV1) == 25, "Unexpected v1 history header size");
++static_assert(sizeof(HistoryHeaderV2) == 29, "Unexpected v2 history header size");
+ static_assert(sizeof(AckPayloadV1) == 22, "Unexpected ACK size");
+ static_assert(sizeof(AnchorPointV1) == 4, "Unexpected anchor size");
+ static_assert(sizeof(DeltaPointV1) == 2, "Unexpected delta size");
+ 
+ // Stable 64-bit routing identifier derived from the canonical device ID.
+ // FNV-1a is intentionally used only for compact identification/routing. It is
+-// NOT a password hash, authentication mechanism or encryption key. A later
+-// protocol step will add an independent random secret and AEAD authentication.
++// NOT a password hash, authentication mechanism or encryption key.
+ inline uint64_t deviceIdHash(const char* device_id) {
+   constexpr uint64_t OFFSET_BASIS = 14695981039346656037ULL;
+   constexpr uint64_t PRIME = 1099511628211ULL;
+@@ -119,6 +135,64 @@
+          header.schema_version == expected_schema_version;
+ }
+ 
++inline bool isSupportedHistoryFrame(const FrameHeaderV1& header) {
++  return header.magic == FRAME_MAGIC &&
++         header.transport_version == TRANSPORT_VERSION &&
++         header.message_type == static_cast<uint8_t>(MessageType::HISTORY) &&
++         (header.schema_version == HISTORY_SCHEMA_VERSION_V1 ||
++          header.schema_version == HISTORY_SCHEMA_VERSION);
++}
++
++inline size_t uleb128SizeU32(uint32_t value) {
++  size_t size = 1;
++  while (value >= 0x80U) {
++    value >>= 7U;
++    size++;
++  }
++  return size;
++}
++
++inline size_t encodeUleb128U32(uint32_t value, uint8_t* output, size_t output_size) {
++  if (!output) return 0;
++  const size_t required = uleb128SizeU32(value);
++  if (required > output_size) return 0;
++
++  size_t written = 0;
++  do {
++    uint8_t byte = static_cast<uint8_t>(value & 0x7FU);
++    value >>= 7U;
++    if (value != 0) byte |= 0x80U;
++    output[written++] = byte;
++  } while (value != 0);
++  return written;
++}
++
++inline bool decodeUleb128U32(
++    const uint8_t* input,
++    size_t input_size,
++    uint32_t& value,
++    size_t& bytes_read) {
++  value = 0;
++  bytes_read = 0;
++  if (!input) return false;
++
++  uint32_t shift = 0;
++  for (size_t index = 0;
++       index < input_size && index < MAX_ULEB128_U32_BYTES;
++       index++) {
++    const uint8_t byte = input[index];
++    const uint32_t payload = static_cast<uint32_t>(byte & 0x7FU);
++
++    // On the fifth byte only four payload bits are legal for uint32_t.
++    if (index == 4 && (payload & 0x70U) != 0) return false;
++    value |= payload << shift;
++    bytes_read++;
++    if ((byte & 0x80U) == 0) return true;
++    shift += 7U;
++  }
++  return false;
++}
++
+ inline void formatDeviceHash(uint64_t hash, char* output, size_t output_size) {
+   if (!output || output_size == 0) return;
+   const uint32_t high = static_cast<uint32_t>(hash >> 32);
+--- tracker/equine_tracker_onboarding_v3.ino
++++ tracker/equine_tracker_timestamp_v4.ino
+@@ -172,7 +172,7 @@
+ // VERSIONED PAYLOAD FORMAT
+ // =====================================================
+ using AckPayload = EquineProtocol::AckPayloadV1;
+-using LoRaHeader = EquineProtocol::HistoryHeaderV1;
++using LoRaHeader = EquineProtocol::HistoryHeaderV2;
+ using AnchorPoint = EquineProtocol::AnchorPointV1;
+ using DeltaPoint = EquineProtocol::DeltaPointV1;
+ 
+@@ -180,9 +180,10 @@
+ // INTERNAL RTC HISTORY
+ // =====================================================
+ struct StoredHistoryPoint {
+-  int32_t lat;     // microdegrees
+-  int32_t lon;     // microdegrees
+-  uint32_t seq;    // monotonic point sequence
++  int32_t lat;          // microdegrees
++  int32_t lon;          // microdegrees
++  uint32_t seq;         // monotonic point sequence
++  uint32_t unix_time_s; // GNSS UTC; zero only when time is unavailable
+ } __attribute__((packed));
+ 
+ // =====================================================
+@@ -1287,9 +1288,12 @@
+ void sendUc6580Assistance() {}
+ #endif
+ 
+-void updateGnssAssistanceState() {
+-  if (gps.date.isValid() && gps.time.isValid() &&
+-      gps.date.age() < 2000 && gps.time.age() < 2000) {
++uint32_t updateGnssAssistanceState(uint32_t elapsed_since_last_fix_s = 0) {
++  const bool fresh_utc =
++    gps.date.isValid() && gps.time.isValid() &&
++    gps.date.age() < 2000 && gps.time.age() < 2000;
++
++  if (fresh_utc) {
+     const uint64_t epoch_s = utcToUnixSeconds(
+       gps.date.year(), gps.date.month(), gps.date.day(),
+       gps.time.hour(), gps.time.minute(), gps.time.second()
+@@ -1298,11 +1302,21 @@
+       last_gnss_utc_epoch_s = epoch_s;
+       has_gnss_utc_time = true;
+     }
++  } else if (has_gnss_utc_time && elapsed_since_last_fix_s > 0) {
++    // GGA can arrive before the matching RMC sentence. Advance the last trusted
++    // RMC epoch by the measured fix age rather than attaching the old epoch to
++    // a new position. The next fresh RMC sentence corrects any accumulated drift.
++    const uint64_t advanced =
++      last_gnss_utc_epoch_s + static_cast<uint64_t>(elapsed_since_last_fix_s);
++    last_gnss_utc_epoch_s = advanced;
+   }
+ 
+   if (gps.altitude.isValid() && gps.altitude.age() < 2000) {
+     last_gnss_altitude_m = gps.altitude.meters();
+   }
++
++  if (!has_gnss_utc_time || last_gnss_utc_epoch_s > UINT32_MAX) return 0;
++  return static_cast<uint32_t>(last_gnss_utc_epoch_s);
+ }
+ 
+ float getBatteryVoltage();
+@@ -1932,11 +1946,12 @@
+   seconds_since_last_nvs_save = 0;
+ }
+ 
+-void appendHistoryPointAbsolute(int32_t lat_micro, int32_t lon_micro) {
++void appendHistoryPointAbsolute(int32_t lat_micro, int32_t lon_micro, uint32_t unix_time_s) {
+   StoredHistoryPoint p;
+   p.lat = lat_micro;
+   p.lon = lon_micro;
+   p.seq = next_point_seq++;
++  p.unix_time_s = unix_time_s;
+ 
+   history_points[history_head] = p;
+   history_head = (history_head + 1) % HISTORY_SIZE;
+@@ -1946,8 +1961,9 @@
+     logPrintln("Warning: History buffer is full! Oldest unacknowledged point will be overwritten.");
+   }
+ 
+-  logPrintf("History append -> seq=%lu lat=%ld lon=%ld count=%u\n",
+-                (unsigned long)p.seq, (long)p.lat, (long)p.lon, history_count);
++  logPrintf("History append -> seq=%lu lat=%ld lon=%ld utc=%lu count=%u\n",
++                (unsigned long)p.seq, (long)p.lat, (long)p.lon,
++                (unsigned long)p.unix_time_s, history_count);
+ }
+ 
+ int32_t quantizeMicrodegToStepGrid(int32_t value_micro) {
+@@ -1959,7 +1975,7 @@
+   }
+ }
+ 
+-void maybeAppendSignificantHistoryPoint(double lat_deg, double lon_deg) {
++void maybeAppendSignificantHistoryPoint(double lat_deg, double lon_deg, uint32_t unix_time_s) {
+   int32_t lat_micro = (int32_t)lround(lat_deg * 1000000.0);
+   int32_t lon_micro = (int32_t)lround(lon_deg * 1000000.0);
+ 
+@@ -1968,7 +1984,7 @@
+   lon_micro = quantizeMicrodegToStepGrid(lon_micro);
+ 
+   if (history_count == 0) {
+-    appendHistoryPointAbsolute(lat_micro, lon_micro);
++    appendHistoryPointAbsolute(lat_micro, lon_micro, unix_time_s);
+     return;
+   }
+ 
+@@ -1986,7 +2002,7 @@
+     return;
+   }
+ 
+-  appendHistoryPointAbsolute(lat_micro, lon_micro);
++  appendHistoryPointAbsolute(lat_micro, lon_micro, unix_time_s);
+ }
+ 
+ uint16_t buildDynamicPayload(uint8_t* buffer, size_t max_len, uint16_t& points_packed) {
+@@ -1999,25 +2015,31 @@
+   header.frame = EquineProtocol::makeFrameHeader(
+     EquineProtocol::MessageType::HISTORY,
+     EquineProtocol::HISTORY_SCHEMA_VERSION,
+-    TRACKER_DEVICE_HASH
++    TRACKER_DEVICE_HASH,
++    root.unix_time_s > 0 ? EquineProtocol::FLAG_HAS_TIMESTAMPS
++                         : EquineProtocol::FLAG_NONE
+   );
+   header.boot_id = boot_id;
+   header.first_seq = root.seq;
++  header.root_unix_time_s = root.unix_time_s;
+   header.total_dist_dam = (uint16_t)(total_distance_meters / 10.0);
+   header.batt_pct = getBatteryPercentage();
+ 
+   AnchorPoint anchors[32];
+   uint8_t num_anchors = 0;
+ 
+-  // We write directly to temporary batch array
++  // Batch body: anchor index, count, followed by repeated
++  // int8 dlat, int8 dlon, ULEB128(delta seconds from previous point).
+   uint8_t batches_buf[250];
+   size_t batches_len = 0;
+   uint8_t num_batches = 0;
+ 
+-  uint8_t current_anchor_idx = 255; 
+-  uint32_t current_batch_count_ptr = 0; // index in batches_buf of the count
++  uint8_t current_anchor_idx = 255;
++  uint32_t current_batch_count_ptr = 0;
++  uint32_t previous_time_s = root.unix_time_s;
++  const bool timestamps_available = root.unix_time_s > 0;
+ 
+-  points_packed = 1; // root point is packed
++  points_packed = 1;
+ 
+   for (uint16_t i = 1; i < history_count; i++) {
+     const StoredHistoryPoint& p = history_points[historyIndexToRing(i)];
+@@ -2028,48 +2050,55 @@
+     int32_t dlat_steps = dlat_micro / DELTA_UNIT_MICRODEG;
+     int32_t dlon_steps = dlon_micro / DELTA_UNIT_MICRODEG;
+ 
+-    if (dlat_steps < -32768 || dlat_steps > 32767 || dlon_steps < -32768 || dlon_steps > 32767) {
+-      // 36km exceeded! Stop packet here. Next packet will re-root.
+-      break; 
++    if (dlat_steps < -32768 || dlat_steps > 32767 ||
++        dlon_steps < -32768 || dlon_steps > 32767) {
++      break;
++    }
++
++    uint32_t delta_time_s = 0;
++    if (timestamps_available) {
++      // Do not create a partially timestamped frame. The next packet can re-root
++      // at the first point that again has a trustworthy monotonic UTC value.
++      if (p.unix_time_s == 0 || p.unix_time_s < previous_time_s) break;
++      delta_time_s = p.unix_time_s - previous_time_s;
+     }
++    const size_t timestamp_bytes =
++      EquineProtocol::uleb128SizeU32(delta_time_s);
+ 
+-    // Try to find an anchor that works
+     uint8_t chosen_anchor = 255;
+     for (uint8_t a = 0; a < num_anchors; a++) {
+       int32_t rel_lat = dlat_steps - anchors[a].dlat;
+       int32_t rel_lon = dlon_steps - anchors[a].dlon;
+-      if (rel_lat >= -128 && rel_lat <= 127 && rel_lon >= -128 && rel_lon <= 127) {
++      if (rel_lat >= -128 && rel_lat <= 127 &&
++          rel_lon >= -128 && rel_lon <= 127) {
+         chosen_anchor = a;
+         break;
+       }
+     }
+ 
+-    bool needs_new_anchor = (chosen_anchor == 255);
+-    if (needs_new_anchor && num_anchors >= 32) {
+-      break; // too many anchors, stop packet here
+-    }
+-
+-    uint8_t target_anchor_idx = needs_new_anchor ? num_anchors : chosen_anchor;
+-    
+-    // We start a new batch if the target anchor differs, if no batches exist yet,
+-    // or if the current batch count has reached 255 items.
+-    bool needs_new_batch = (current_anchor_idx != target_anchor_idx || num_batches == 0 || batches_buf[current_batch_count_ptr] == 255);
+-
+-    // Calculate exact final payload size if we include this point
+-    size_t base_len = sizeof(LoRaHeader) + 8 + 1 + 1; // Header + Root + num_anchors + num_batches
+-    size_t projected_anchor_count = num_anchors + (needs_new_anchor ? 1 : 0);
+-    size_t projected_batches_len = batches_len + (needs_new_batch ? 2 : 0) + 2;
++    const bool needs_new_anchor = chosen_anchor == 255;
++    if (needs_new_anchor && num_anchors >= 32) break;
+ 
+-    size_t projected_total_len = base_len + (projected_anchor_count * sizeof(AnchorPoint)) + projected_batches_len;
++    const uint8_t target_anchor_idx =
++      needs_new_anchor ? num_anchors : chosen_anchor;
++    const bool needs_new_batch =
++      current_anchor_idx != target_anchor_idx ||
++      num_batches == 0 || batches_buf[current_batch_count_ptr] == 255;
++
++    const size_t base_len = sizeof(LoRaHeader) + 8 + 1 + 1;
++    const size_t projected_anchor_count =
++      num_anchors + (needs_new_anchor ? 1 : 0);
++    const size_t projected_batches_len =
++      batches_len + (needs_new_batch ? 2 : 0) + 2 + timestamp_bytes;
++    const size_t projected_total_len =
++      base_len + projected_anchor_count * sizeof(AnchorPoint) +
++      projected_batches_len;
+ 
+-    if (projected_total_len > max_len) {
+-      break;
+-    }
+-    if (projected_batches_len > sizeof(batches_buf)) {
++    if (projected_total_len > max_len ||
++        projected_batches_len > sizeof(batches_buf)) {
+       break;
+     }
+ 
+-    // Now execute state mutations since we are guaranteed to fit
+     if (needs_new_anchor) {
+       chosen_anchor = num_anchors;
+       anchors[num_anchors].dlat = (int16_t)dlat_steps;
+@@ -2081,17 +2110,27 @@
+       current_anchor_idx = target_anchor_idx;
+       batches_buf[batches_len++] = target_anchor_idx;
+       current_batch_count_ptr = batches_len;
+-      batches_buf[batches_len++] = 0; // count to be incremented
++      batches_buf[batches_len++] = 0;
+       num_batches++;
+     }
+ 
+-    int8_t rel_lat = (int8_t)(dlat_steps - anchors[chosen_anchor].dlat);
+-    int8_t rel_lon = (int8_t)(dlon_steps - anchors[chosen_anchor].dlon);
+-    
+-    batches_buf[batches_len++] = rel_lat;
+-    batches_buf[batches_len++] = rel_lon;
++    const int8_t rel_lat =
++      (int8_t)(dlat_steps - anchors[chosen_anchor].dlat);
++    const int8_t rel_lon =
++      (int8_t)(dlon_steps - anchors[chosen_anchor].dlon);
++    batches_buf[batches_len++] = static_cast<uint8_t>(rel_lat);
++    batches_buf[batches_len++] = static_cast<uint8_t>(rel_lon);
++
++    const size_t encoded_timestamp_bytes = EquineProtocol::encodeUleb128U32(
++      delta_time_s,
++      batches_buf + batches_len,
++      sizeof(batches_buf) - batches_len
++    );
++    if (encoded_timestamp_bytes == 0) break;
++    batches_len += encoded_timestamp_bytes;
+     batches_buf[current_batch_count_ptr]++;
+ 
++    previous_time_s = p.unix_time_s;
+     points_packed++;
+   }
+ 
+@@ -2099,9 +2138,8 @@
+     if (offset + (n) > max_len) return 0; \
+   } while (0)
+ 
+-  // Now assemble the final payload
+   size_t offset = 0;
+-  
++
+   REQUIRE_SPACE(sizeof(header));
+   memcpy(buffer + offset, &header, sizeof(header));
+   offset += sizeof(header);
+@@ -2112,7 +2150,7 @@
+ 
+   REQUIRE_SPACE(1);
+   buffer[offset++] = num_anchors;
+-  
++
+   if (num_anchors > 0) {
+     REQUIRE_SPACE(num_anchors * sizeof(AnchorPoint));
+     memcpy(buffer + offset, anchors, num_anchors * sizeof(AnchorPoint));
+@@ -2635,7 +2673,8 @@
+ 
+         const double candidate_lat = gps.location.lat();
+         const double candidate_lng = gps.location.lng();
+-        updateGnssAssistanceState();
++        const uint32_t fix_unix_time_s =
++          updateGnssAssistanceState(current_elapsed_s);
+ 
+         if (has_initial_fix) {
+           const double distance_from_accepted = TinyGPSPlus::distanceBetween(
+@@ -2754,7 +2793,7 @@
+                       derived_speed_kmph, nmea_speed_kmph,
+                       nmea_speed_fresh ? " fresh" : " stale/unavailable",
+                       total_distance_meters);
+-            maybeAppendSignificantHistoryPoint(candidate_lat, candidate_lng);
++            maybeAppendSignificantHistoryPoint(candidate_lat, candidate_lng, fix_unix_time_s);
+           } else if (movement_detected) {
+             logPrintf("Movement detected by speed/hysteresis; %.2f m delta not accumulated.\n",
+                       distance_from_accepted);
+@@ -2779,7 +2818,7 @@
+           position_accepted = true;
+           seconds_since_last_accepted_position = 0;
+           last_effective_speed_kmph = 0.0;
+-          maybeAppendSignificantHistoryPoint(candidate_lat, candidate_lng);
++          maybeAppendSignificantHistoryPoint(candidate_lat, candidate_lng, fix_unix_time_s);
+         }
+ 
+         seconds_since_last_fix = 0;
+--- gateway/equine_protocol.h
++++ gateway/equine_protocol.h.v2
+@@ -7,23 +7,26 @@
+ 
+ // Shared on-wire definitions for trackers, gateways, relays and apps.
+ //
+-// Wire encoding in protocol v1 is packed little-endian, matching the ESP32
+-// endpoints. Applications on other platforms must decode the integer fields
+-// explicitly as little-endian values rather than mapping these structs directly.
++// Wire encoding is packed little-endian, matching the ESP32 endpoints.
++// Applications on other platforms must decode integer fields explicitly as
++// little-endian values rather than mapping these structs directly.
+ namespace EquineProtocol {
+ 
+ constexpr uint16_t FRAME_MAGIC = 0x5145;  // bytes "EQ" on little-endian targets
+ constexpr uint8_t TRANSPORT_VERSION = 1;
+-constexpr uint8_t HISTORY_SCHEMA_VERSION = 1;
++constexpr uint8_t HISTORY_SCHEMA_VERSION_V1 = 1;
++constexpr uint8_t HISTORY_SCHEMA_VERSION = 2;
+ constexpr uint8_t ACK_SCHEMA_VERSION = 1;
+ constexpr uint8_t MQTT_API_VERSION = 1;
++constexpr size_t MAX_ULEB128_U32_BYTES = 5;
+ 
+-// Flags are reserved now so encryption and relaying can be added without
+-// changing the v1 envelope layout.
++// Flags are part of the stable envelope so encryption and relaying do not need
++// another envelope layout. FLAG_HAS_TIMESTAMPS applies to history schema v2.
+ enum FrameFlags : uint8_t {
+-  FLAG_NONE      = 0,
+-  FLAG_ENCRYPTED = 1U << 0,
+-  FLAG_RELAYED   = 1U << 1,
++  FLAG_NONE           = 0,
++  FLAG_ENCRYPTED      = 1U << 0,
++  FLAG_RELAYED        = 1U << 1,
++  FLAG_HAS_TIMESTAMPS = 1U << 2,
+ };
+ 
+ enum class MessageType : uint8_t {
+@@ -42,6 +45,7 @@
+   uint64_t device_id_hash;
+ } __attribute__((packed));
+ 
++// Kept for rolling upgrades. Schema v1 has no point timestamps.
+ struct HistoryHeaderV1 {
+   FrameHeaderV1 frame;
+   uint32_t boot_id;
+@@ -50,6 +54,18 @@
+   uint8_t batt_pct;
+ } __attribute__((packed));
+ 
++// Schema v2 adds one absolute UTC timestamp for the root point. Every later
++// point stores an unsigned LEB128 delta in seconds from the previous point.
++// A normal 40-120 second interval costs one byte; up to 16383 seconds costs two.
++struct HistoryHeaderV2 {
++  FrameHeaderV1 frame;
++  uint32_t boot_id;
++  uint32_t first_seq;
++  uint32_t root_unix_time_s;
++  uint16_t total_dist_dam;
++  uint8_t batt_pct;
++} __attribute__((packed));
++
+ struct AckPayloadV1 {
+   FrameHeaderV1 frame;
+   uint32_t boot_id;
+@@ -67,15 +83,15 @@
+ } __attribute__((packed));
+ 
+ static_assert(sizeof(FrameHeaderV1) == 14, "Unexpected protocol frame size");
+-static_assert(sizeof(HistoryHeaderV1) == 25, "Unexpected history header size");
++static_assert(sizeof(HistoryHeaderV1) == 25, "Unexpected v1 history header size");
++static_assert(sizeof(HistoryHeaderV2) == 29, "Unexpected v2 history header size");
+ static_assert(sizeof(AckPayloadV1) == 22, "Unexpected ACK size");
+ static_assert(sizeof(AnchorPointV1) == 4, "Unexpected anchor size");
+ static_assert(sizeof(DeltaPointV1) == 2, "Unexpected delta size");
+ 
+ // Stable 64-bit routing identifier derived from the canonical device ID.
+ // FNV-1a is intentionally used only for compact identification/routing. It is
+-// NOT a password hash, authentication mechanism or encryption key. A later
+-// protocol step will add an independent random secret and AEAD authentication.
++// NOT a password hash, authentication mechanism or encryption key.
+ inline uint64_t deviceIdHash(const char* device_id) {
+   constexpr uint64_t OFFSET_BASIS = 14695981039346656037ULL;
+   constexpr uint64_t PRIME = 1099511628211ULL;
+@@ -119,6 +135,64 @@
+          header.schema_version == expected_schema_version;
+ }
+ 
++inline bool isSupportedHistoryFrame(const FrameHeaderV1& header) {
++  return header.magic == FRAME_MAGIC &&
++         header.transport_version == TRANSPORT_VERSION &&
++         header.message_type == static_cast<uint8_t>(MessageType::HISTORY) &&
++         (header.schema_version == HISTORY_SCHEMA_VERSION_V1 ||
++          header.schema_version == HISTORY_SCHEMA_VERSION);
++}
++
++inline size_t uleb128SizeU32(uint32_t value) {
++  size_t size = 1;
++  while (value >= 0x80U) {
++    value >>= 7U;
++    size++;
++  }
++  return size;
++}
++
++inline size_t encodeUleb128U32(uint32_t value, uint8_t* output, size_t output_size) {
++  if (!output) return 0;
++  const size_t required = uleb128SizeU32(value);
++  if (required > output_size) return 0;
++
++  size_t written = 0;
++  do {
++    uint8_t byte = static_cast<uint8_t>(value & 0x7FU);
++    value >>= 7U;
++    if (value != 0) byte |= 0x80U;
++    output[written++] = byte;
++  } while (value != 0);
++  return written;
++}
++
++inline bool decodeUleb128U32(
++    const uint8_t* input,
++    size_t input_size,
++    uint32_t& value,
++    size_t& bytes_read) {
++  value = 0;
++  bytes_read = 0;
++  if (!input) return false;
++
++  uint32_t shift = 0;
++  for (size_t index = 0;
++       index < input_size && index < MAX_ULEB128_U32_BYTES;
++       index++) {
++    const uint8_t byte = input[index];
++    const uint32_t payload = static_cast<uint32_t>(byte & 0x7FU);
++
++    // On the fifth byte only four payload bits are legal for uint32_t.
++    if (index == 4 && (payload & 0x70U) != 0) return false;
++    value |= payload << shift;
++    bytes_read++;
++    if ((byte & 0x80U) == 0) return true;
++    shift += 7U;
++  }
++  return false;
++}
++
+ inline void formatDeviceHash(uint64_t hash, char* output, size_t output_size) {
+   if (!output || output_size == 0) return;
+   const uint32_t high = static_cast<uint32_t>(hash >> 32);
+--- gateway/equine_mqtt_api.h
++++ gateway/equine_mqtt_api.h.v2
+@@ -11,9 +11,9 @@
+ namespace EquineMqttApi {
+ 
+ constexpr uint8_t API_VERSION = 1;
+-constexpr uint8_t POINT_SCHEMA_VERSION = 1;
++constexpr uint8_t POINT_SCHEMA_VERSION = 2;
+ constexpr uint8_t COMMAND_SCHEMA_VERSION = 1;
+-constexpr uint8_t HISTORY_SCHEMA_VERSION = 1;
++constexpr uint8_t HISTORY_SCHEMA_VERSION = 2;
+ constexpr size_t MAX_REQUEST_ID_LENGTH = 48;
+ constexpr size_t MAX_COMMAND_LENGTH = 40;
+ constexpr size_t MAX_COMMAND_PAYLOAD = 512;
+--- gateway/equine_gateway_mqtt_v5.ino
++++ gateway/equine_gateway_mqtt_v6.ino
+@@ -100,7 +100,8 @@
+ // VERSIONED PAYLOAD FORMAT
+ // ==========================================
+ using AckPayload = EquineProtocol::AckPayloadV1;
+-using LoRaHeader = EquineProtocol::HistoryHeaderV1;
++using LoRaHeaderV1 = EquineProtocol::HistoryHeaderV1;
++using LoRaHeaderV2 = EquineProtocol::HistoryHeaderV2;
+ using AnchorPoint = EquineProtocol::AnchorPointV1;
+ 
+ // The gateway accepts legacy packets during the rolling upgrade. Update the
+@@ -124,6 +125,8 @@
+   uint64_t device_id_hash;
+   uint32_t boot_id;
+   uint32_t first_seq;
++  uint32_t root_unix_time_s;
++  bool timestamps_present;
+   uint16_t total_dist_dam;
+   uint8_t batt_pct;
+ };
+@@ -1785,31 +1788,23 @@
+     }
+ 
+     if (has_v1_magic) {
+-      if (packetSize < (int)(sizeof(LoRaHeader) + 8 + 2)) {
+-        logPrintf("Protocol-v1 packet is too short: %d bytes.\n", packetSize);
+-        break;
+-      }
+-
+-      LoRaHeader wire_header{};
+-      memcpy(&wire_header, payload_buffer, sizeof(wire_header));
+-      if (!EquineProtocol::isSupportedFrame(
+-            wire_header.frame,
+-            EquineProtocol::MessageType::HISTORY,
+-            EquineProtocol::HISTORY_SCHEMA_VERSION)) {
++      EquineProtocol::FrameHeaderV1 frame{};
++      memcpy(&frame, payload_buffer, sizeof(frame));
++      if (!EquineProtocol::isSupportedHistoryFrame(frame)) {
+         logPrintf(
+           "Unsupported frame: transport=%u type=%u schema=%u flags=0x%02X.\n",
+-          wire_header.frame.transport_version,
+-          wire_header.frame.message_type,
+-          wire_header.frame.schema_version,
+-          wire_header.frame.flags);
++          frame.transport_version,
++          frame.message_type,
++          frame.schema_version,
++          frame.flags);
+         break;
+       }
+ 
+-      tracker = findTrackerByHash(wire_header.frame.device_id_hash);
++      tracker = findTrackerByHash(frame.device_id_hash);
+       if (!tracker) {
+         char unknown_hash[17];
+         EquineProtocol::formatDeviceHash(
+-          wire_header.frame.device_id_hash,
++          frame.device_id_hash,
+           unknown_hash,
+           sizeof(unknown_hash));
+         logPrintf("Ignored unregistered device hash %s.\n", unknown_hash);
+@@ -1817,14 +1812,52 @@
+       }
+ 
+       header.legacy = false;
+-      header.transport_version = wire_header.frame.transport_version;
+-      header.schema_version = wire_header.frame.schema_version;
+-      header.device_id_hash = wire_header.frame.device_id_hash;
+-      header.boot_id = wire_header.boot_id;
+-      header.first_seq = wire_header.first_seq;
+-      header.total_dist_dam = wire_header.total_dist_dam;
+-      header.batt_pct = wire_header.batt_pct;
+-      offset = sizeof(wire_header);
++      header.transport_version = frame.transport_version;
++      header.schema_version = frame.schema_version;
++      header.device_id_hash = frame.device_id_hash;
++      header.root_unix_time_s = 0;
++      header.timestamps_present = false;
++
++      if (frame.schema_version == EquineProtocol::HISTORY_SCHEMA_VERSION_V1) {
++        if (packetSize < (int)(sizeof(LoRaHeaderV1) + 8 + 2)) {
++          logPrintf("Protocol history-v1 packet is too short: %d bytes.\n", packetSize);
++          break;
++        }
++        LoRaHeaderV1 wire_header{};
++        memcpy(&wire_header, payload_buffer, sizeof(wire_header));
++        header.boot_id = wire_header.boot_id;
++        header.first_seq = wire_header.first_seq;
++        header.total_dist_dam = wire_header.total_dist_dam;
++        header.batt_pct = wire_header.batt_pct;
++        offset = sizeof(wire_header);
++      } else {
++        if (packetSize < (int)(sizeof(LoRaHeaderV2) + 8 + 2)) {
++          logPrintf("Protocol history-v2 packet is too short: %d bytes.\n", packetSize);
++          break;
++        }
++        LoRaHeaderV2 wire_header{};
++        memcpy(&wire_header, payload_buffer, sizeof(wire_header));
++        header.boot_id = wire_header.boot_id;
++        header.first_seq = wire_header.first_seq;
++        header.root_unix_time_s = wire_header.root_unix_time_s;
++        header.timestamps_present =
++          (wire_header.frame.flags & EquineProtocol::FLAG_HAS_TIMESTAMPS) != 0;
++        header.total_dist_dam = wire_header.total_dist_dam;
++        header.batt_pct = wire_header.batt_pct;
++        offset = sizeof(wire_header);
++
++        if (header.timestamps_present &&
++            (header.root_unix_time_s < 946684800UL ||
++             header.root_unix_time_s > 4102444800UL)) {
++          logPrintf("Rejected implausible root GNSS timestamp: %lu.\n",
++                    (unsigned long)header.root_unix_time_s);
++          break;
++        }
++        if (!header.timestamps_present && header.root_unix_time_s != 0) {
++          logPrintln("Timestamp value present without timestamp frame flag.");
++          break;
++        }
++      }
+     } else {
+       tracker = findLegacyTracker();
+       if (!tracker) {
+@@ -1840,6 +1873,8 @@
+       header.device_id_hash = tracker->device_id_hash;
+       header.boot_id = legacy_header.boot_id;
+       header.first_seq = legacy_header.first_seq;
++      header.root_unix_time_s = 0;
++      header.timestamps_present = false;
+       header.total_dist_dam = legacy_header.total_dist_dam;
+       header.batt_pct = legacy_header.batt_pct;
+       offset = sizeof(legacy_header);
+@@ -1885,8 +1920,9 @@
+ 
+     logPrintf(
+       "Received %s packet [%s/%s]: transport=%u schema=%u boot=%lu "
+-      "first_seq=%lu root=%.6f,%.6f anchors=%u batches=%u RSSI=%d\n",
+-      header.legacy ? "legacy" : "v1",
++      "first_seq=%lu root=%.6f,%.6f root_utc=%lu timestamps=%s "
++      "anchors=%u batches=%u RSSI=%d\n",
++      header.legacy ? "legacy" : "versioned",
+       tracker->config->device_id,
+       tracker->hash_text,
+       header.transport_version,
+@@ -1895,6 +1931,8 @@
+       (unsigned long)header.first_seq,
+       root_lat / 1000000.0f,
+       root_lon / 1000000.0f,
++      (unsigned long)header.root_unix_time_s,
++      header.timestamps_present ? "yes" : "no",
+       num_anchors,
+       num_batches,
+       packet_rssi);
+@@ -1905,7 +1943,8 @@
+     uint32_t current_seq = header.first_seq;
+     uint32_t highest_ackable_seq = header.first_seq;
+ 
+-    auto processPoint = [&](int32_t p_lat, int32_t p_lon, uint32_t p_seq) {
++    auto processPoint = [&](int32_t p_lat, int32_t p_lon, uint32_t p_seq,
++                            uint32_t p_unix_time_s, bool timestamp_valid) {
+       if (!packet_valid || !publish_success) return;
+ 
+       if (!isValidCoordinateMicrodeg(p_lat, p_lon)) {
+@@ -1929,11 +1968,14 @@
+                  (unsigned long)header.boot_id,
+                  (unsigned long)p_seq);
+ 
+-        logPrintf("  -> New point [%s]: seq=%lu lat=%.6f lon=%.6f dist=%u m\n",
++        logPrintf("  -> New point [%s]: seq=%lu lat=%.6f lon=%.6f "
++                  "utc=%lu valid=%s dist=%u m\n",
+                   tracker->config->device_id,
+                   (unsigned long)p_seq,
+                   real_lat,
+                   real_lon,
++                  (unsigned long)p_unix_time_s,
++                  timestamp_valid ? "yes" : "no",
+                   dist_m);
+ 
+         char escaped_device_id[EquineConfig::DEVICE_ID_SIZE * 2]{};
+@@ -1943,7 +1985,7 @@
+         escapeJsonText(tracker->config->device_name, escaped_device_name, sizeof(escaped_device_name));
+         escapeJsonText(GATEWAY_ID, escaped_gateway_id, sizeof(escaped_gateway_id));
+ 
+-        char jsonBuffer[512];
++        char jsonBuffer[640];
+         const int written = snprintf(
+           jsonBuffer,
+           sizeof(jsonBuffer),
+@@ -1955,7 +1997,9 @@
+           "\"point_id\":\"%s\",\"latitude\":%.6f,"
+           "\"longitude\":%.6f,\"dist_m\":%u,"
+           "\"battery_level\":%u,\"rssi\":%d,\"seq\":%lu,"
+-          "\"boot_id\":%lu,\"gateway_uptime_ms\":%lu}",
++          "\"boot_id\":%lu,\"timestamp_valid\":%s,"
++          "\"fix_time_unix_ms\":%llu,\"time_source\":\"%s\","
++          "\"gateway_uptime_ms\":%lu}",
+           EquineMqttApi::API_VERSION,
+           EquineMqttApi::POINT_SCHEMA_VERSION,
+           header.transport_version,
+@@ -1973,6 +2017,10 @@
+           packet_rssi,
+           (unsigned long)p_seq,
+           (unsigned long)header.boot_id,
++          timestamp_valid ? "true" : "false",
++          (unsigned long long)(timestamp_valid ?
++            static_cast<uint64_t>(p_unix_time_s) * 1000ULL : 0ULL),
++          timestamp_valid ? "gnss" : "unavailable",
+           (unsigned long)millis());
+ 
+         if (written <= 0 || written >= (int)sizeof(jsonBuffer)) {
+@@ -1999,7 +2047,9 @@
+       highest_ackable_seq = p_seq;
+     };
+ 
+-    processPoint(root_lat, root_lon, current_seq++);
++    uint32_t current_point_time_s = header.root_unix_time_s;
++    processPoint(root_lat, root_lon, current_seq++,
++                 current_point_time_s, header.timestamps_present);
+ 
+     for (uint8_t batch = 0;
+          batch < num_batches && packet_valid && publish_success;
+@@ -2018,26 +2068,54 @@
+         break;
+       }
+ 
+-      const size_t points_bytes = (size_t)count * 2U;
+-      if (offset + points_bytes > (size_t)packetSize) {
+-        logPrintln("Batch point count exceeds remaining packet bytes.");
+-        packet_valid = false;
+-        break;
+-      }
+-
+       const int32_t anchor_lat_micro =
+         root_lat + (int32_t)anchors[anchor_idx].dlat * DELTA_UNIT_MICRODEG;
+       const int32_t anchor_lon_micro =
+         root_lon + (int32_t)anchors[anchor_idx].dlon * DELTA_UNIT_MICRODEG;
+ 
+       for (uint8_t point = 0; point < count; point++) {
++        if (offset + 2 > (size_t)packetSize) {
++          logPrintln("Batch point ended before coordinate delta.");
++          packet_valid = false;
++          break;
++        }
+         const int8_t rel_dlat = (int8_t)payload_buffer[offset++];
+         const int8_t rel_dlon = (int8_t)payload_buffer[offset++];
+         const int32_t p_lat_micro =
+           anchor_lat_micro + (int32_t)rel_dlat * DELTA_UNIT_MICRODEG;
+         const int32_t p_lon_micro =
+           anchor_lon_micro + (int32_t)rel_dlon * DELTA_UNIT_MICRODEG;
+-        processPoint(p_lat_micro, p_lon_micro, current_seq++);
++
++        uint32_t delta_time_s = 0;
++        if (header.schema_version == EquineProtocol::HISTORY_SCHEMA_VERSION) {
++          size_t timestamp_bytes = 0;
++          if (!EquineProtocol::decodeUleb128U32(
++                payload_buffer + offset,
++                (size_t)packetSize - offset,
++                delta_time_s,
++                timestamp_bytes)) {
++            logPrintln("Invalid or truncated ULEB128 timestamp delta.");
++            packet_valid = false;
++            break;
++          }
++          offset += timestamp_bytes;
++          if (header.timestamps_present) {
++            if (delta_time_s > UINT32_MAX - current_point_time_s) {
++              logPrintln("Timestamp delta overflow.");
++              packet_valid = false;
++              break;
++            }
++            current_point_time_s += delta_time_s;
++          }
++        }
++
++        processPoint(
++          p_lat_micro,
++          p_lon_micro,
++          current_seq++,
++          current_point_time_s,
++          header.timestamps_present
++        );
+         if (!packet_valid || !publish_success) break;
+       }
+     }
+@@ -2079,7 +2157,7 @@
+     const int txResult = LoRa.endPacket();
+     if (txResult) {
+       logPrintf("Sent %s ACK [%s] boot=%lu seq=%lu\n",
+-                header.legacy ? "legacy" : "v1",
++                header.legacy ? "legacy" : "versioned",
+                 tracker->config->device_id,
+                 (unsigned long)header.boot_id,
+                 (unsigned long)highest_ackable_seq);
+--- archiver-v1/equine_archiver/protocol.py
++++ archiver-v2/equine_archiver/protocol.py
+@@ -6,11 +6,14 @@
+ from typing import Any, Iterable
+ 
+ API_VERSION = 1
+-POINT_SCHEMA_VERSION = 1
+-HISTORY_SCHEMA_VERSION = 1
++POINT_SCHEMA_VERSION = 2
++SUPPORTED_POINT_SCHEMA_VERSIONS = frozenset({1, 2})
++HISTORY_SCHEMA_VERSION = 2
++SUPPORTED_HISTORY_SCHEMA_VERSIONS = frozenset({1, 2})
+ 
+ _DEVICE_HASH_RE = re.compile(r"^[0-9a-f]{16}$")
+ _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,48}$")
++_MAX_UNIX_MS = 32_503_680_000_000  # year 3000
+ 
+ 
+ class ProtocolError(ValueError):
+@@ -23,13 +26,19 @@
+ def validate_device_hash(value: str) -> str:
+     normalized = value.lower()
+     if not _DEVICE_HASH_RE.fullmatch(normalized):
+-        raise ProtocolError("invalid_device_hash", "device_hash must be 16 lowercase hexadecimal characters")
++        raise ProtocolError(
++            "invalid_device_hash",
++            "device_hash must be 16 lowercase hexadecimal characters",
++        )
+     return normalized
+ 
+ 
+ def validate_request_id(value: Any) -> str:
+     if not isinstance(value, str) or not _REQUEST_ID_RE.fullmatch(value):
+-        raise ProtocolError("invalid_request_id", "request_id contains unsupported characters or length")
++        raise ProtocolError(
++            "invalid_request_id",
++            "request_id contains unsupported characters or length",
++        )
+     return value
+ 
+ 
+@@ -42,7 +51,10 @@
+ 
+ 
+ def history_response_topic(base_topic: str, device_hash: str, request_id: str) -> str:
+-    return f"{base_topic}/v{API_VERSION}/trackers/{device_hash}/history/response/{request_id}"
++    return (
++        f"{base_topic}/v{API_VERSION}/trackers/{device_hash}/"
++        f"history/response/{request_id}"
++    )
+ 
+ 
+ def archiver_availability_topic(base_topic: str, archiver_id: str) -> str:
+@@ -55,15 +67,18 @@
+ 
+ def tracker_hash_from_topic(topic: str, expected_suffix: str) -> str:
+     parts = topic.split("/")
+-    # <base...>/v1/trackers/<hash>/<suffix...>
+     try:
+         version_index = parts.index(f"v{API_VERSION}")
+     except ValueError as exc:
+-        raise ProtocolError("invalid_topic", "topic has no supported API version") from exc
++        raise ProtocolError(
++            "invalid_topic", "topic has no supported API version"
++        ) from exc
+     tail = parts[version_index:]
+-    expected = [f"v{API_VERSION}", "trackers"] + ["<hash>"] + expected_suffix.split("/")
++    expected = [f"v{API_VERSION}", "trackers", "<hash>"] + expected_suffix.split("/")
+     if len(tail) != len(expected) or tail[1] != "trackers" or tail[3:] != expected[3:]:
+-        raise ProtocolError("invalid_topic", "topic does not match the expected tracker route")
++        raise ProtocolError(
++            "invalid_topic", "topic does not match the expected tracker route"
++        )
+     return validate_device_hash(tail[2])
+ 
+ 
+@@ -72,20 +87,33 @@
+         text = payload.decode("utf-8") if isinstance(payload, bytes) else payload
+         value = json.loads(text)
+     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+-        raise ProtocolError("invalid_json", "payload is not valid UTF-8 JSON") from exc
++        raise ProtocolError(
++            "invalid_json", "payload is not valid UTF-8 JSON"
++        ) from exc
+     if not isinstance(value, dict):
+         raise ProtocolError("invalid_json", "payload must be a JSON object")
+     return value
+ 
+ 
+-def _require_int(data: dict[str, Any], key: str, minimum: int, maximum: int) -> int:
++def _require_int(
++    data: dict[str, Any], key: str, minimum: int, maximum: int
++) -> int:
+     value = data.get(key)
+-    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+-        raise ProtocolError("invalid_point", f"{key} must be an integer between {minimum} and {maximum}")
++    if (
++        isinstance(value, bool)
++        or not isinstance(value, int)
++        or not minimum <= value <= maximum
++    ):
++        raise ProtocolError(
++            "invalid_point",
++            f"{key} must be an integer between {minimum} and {maximum}",
++        )
+     return value
+ 
+ 
+-def _require_float(data: dict[str, Any], key: str, minimum: float, maximum: float) -> float:
++def _require_float(
++    data: dict[str, Any], key: str, minimum: float, maximum: float
++) -> float:
+     value = data.get(key)
+     if isinstance(value, bool) or not isinstance(value, (int, float)):
+         raise ProtocolError("invalid_point", f"{key} must be numeric")
+@@ -96,14 +124,26 @@
+ 
+ 
+ def validate_point(data: dict[str, Any], topic_device_hash: str) -> dict[str, Any]:
+-    if data.get("api_version") != API_VERSION or data.get("point_schema_version") != POINT_SCHEMA_VERSION:
+-        raise ProtocolError("unsupported_version", "unsupported point API or schema version")
++    schema_version = data.get("point_schema_version")
++    if (
++        data.get("api_version") != API_VERSION
++        or schema_version not in SUPPORTED_POINT_SCHEMA_VERSIONS
++    ):
++        raise ProtocolError(
++            "unsupported_version", "unsupported point API or schema version"
++        )
+     device_hash = validate_device_hash(str(data.get("device_hash", "")))
+     if device_hash != topic_device_hash:
+-        raise ProtocolError("topic_payload_mismatch", "device hash does not match MQTT topic")
++        raise ProtocolError(
++            "topic_payload_mismatch", "device hash does not match MQTT topic"
++        )
+ 
+     point_id = data.get("point_id")
+-    if not isinstance(point_id, str) or len(point_id) > 96 or not point_id.startswith(f"{device_hash}:"):
++    if (
++        not isinstance(point_id, str)
++        or len(point_id) > 96
++        or not point_id.startswith(f"{device_hash}:")
++    ):
+         raise ProtocolError("invalid_point", "point_id is missing or inconsistent")
+ 
+     normalized = dict(data)
+@@ -116,10 +156,36 @@
+     normalized["rssi"] = _require_int(data, "rssi", -200, 50)
+     normalized["boot_id"] = _require_int(data, "boot_id", 0, 4_294_967_295)
+     normalized["seq"] = _require_int(data, "seq", 0, 4_294_967_295)
++
+     for key in ("device_id", "device_name", "gateway_id", "gateway_hash"):
+         value = normalized.get(key, "")
+         if not isinstance(value, str) or len(value) > 96:
+             raise ProtocolError("invalid_point", f"{key} must be a short string")
++
++    if schema_version == 1:
++        normalized["timestamp_valid"] = False
++        normalized["fix_time_unix_ms"] = 0
++        normalized["time_source"] = "unavailable"
++    else:
++        timestamp_valid = data.get("timestamp_valid")
++        if not isinstance(timestamp_valid, bool):
++            raise ProtocolError("invalid_point", "timestamp_valid must be boolean")
++        fix_time = _require_int(data, "fix_time_unix_ms", 0, _MAX_UNIX_MS)
++        source = data.get("time_source")
++        if source not in {"gnss", "unavailable"}:
++            raise ProtocolError("invalid_point", "unsupported time_source")
++        if timestamp_valid and (fix_time == 0 or source != "gnss"):
++            raise ProtocolError(
++                "invalid_point", "valid timestamps require GNSS time"
++            )
++        if not timestamp_valid and fix_time != 0:
++            raise ProtocolError(
++                "invalid_point", "invalid timestamps must use zero epoch"
++            )
++        normalized["timestamp_valid"] = timestamp_valid
++        normalized["fix_time_unix_ms"] = fix_time
++        normalized["time_source"] = source
++
+     return normalized
+ 
+ 
+@@ -130,36 +196,59 @@
+     to_unix_ms: int
+     limit: int
+     cursor: int
++    schema_version: int
+ 
+ 
+-def parse_history_request(data: dict[str, Any], maximum_points: int) -> HistoryRequest:
+-    if data.get("api_version") != API_VERSION or data.get("schema_version") != HISTORY_SCHEMA_VERSION:
+-        raise ProtocolError("unsupported_version", "unsupported history API or schema version")
++def parse_history_request(
++    data: dict[str, Any], maximum_points: int
++) -> HistoryRequest:
++    schema_version = data.get("schema_version")
++    if (
++        data.get("api_version") != API_VERSION
++        or schema_version not in SUPPORTED_HISTORY_SCHEMA_VERSIONS
++    ):
++        raise ProtocolError(
++            "unsupported_version", "unsupported history API or schema version"
++        )
+     request_id = validate_request_id(data.get("request_id"))
+ 
+-    now_max = 32_503_680_000_000  # year 3000, also bounds pathological input
+     from_ms = data.get("from_unix_ms", 0)
+-    to_ms = data.get("to_unix_ms", now_max)
++    to_ms = data.get("to_unix_ms", _MAX_UNIX_MS)
+     cursor = data.get("cursor", 0)
+     limit = data.get("limit", min(250, maximum_points))
+     for key, value, minimum, maximum in (
+-        ("from_unix_ms", from_ms, 0, now_max),
+-        ("to_unix_ms", to_ms, 0, now_max),
++        ("from_unix_ms", from_ms, 0, _MAX_UNIX_MS),
++        ("to_unix_ms", to_ms, 0, _MAX_UNIX_MS),
+         ("cursor", cursor, 0, 9_223_372_036_854_775_807),
+         ("limit", limit, 1, maximum_points),
+     ):
+-        if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+-            raise ProtocolError("invalid_history_request", f"{key} is outside its allowed range")
++        if (
++            isinstance(value, bool)
++            or not isinstance(value, int)
++            or not minimum <= value <= maximum
++        ):
++            raise ProtocolError(
++                "invalid_history_request", f"{key} is outside its allowed range"
++            )
+     if from_ms > to_ms:
+-        raise ProtocolError("invalid_history_request", "from_unix_ms must not exceed to_unix_ms")
+-    return HistoryRequest(request_id, from_ms, to_ms, limit, cursor)
++        raise ProtocolError(
++            "invalid_history_request", "from_unix_ms must not exceed to_unix_ms"
++        )
++    return HistoryRequest(
++        request_id, from_ms, to_ms, limit, cursor, int(schema_version)
++    )
+ 
+ 
+-def make_error_response(request_id: str | None, device_hash: str,
+-                        code: str, message: str) -> dict[str, Any]:
++def make_error_response(
++    request_id: str | None,
++    device_hash: str,
++    code: str,
++    message: str,
++    schema_version: int = HISTORY_SCHEMA_VERSION,
++) -> dict[str, Any]:
+     return {
+         "api_version": API_VERSION,
+-        "schema_version": HISTORY_SCHEMA_VERSION,
++        "schema_version": schema_version,
+         "request_id": request_id or "invalid",
+         "device_hash": device_hash,
+         "ok": False,
+@@ -169,13 +258,19 @@
+     }
+ 
+ 
+-def iter_history_responses(*, request: HistoryRequest, device_hash: str,
+-                           points: list[dict[str, Any]], has_more: bool,
+-                           next_cursor: int, chunk_size: int) -> Iterable[dict[str, Any]]:
++def iter_history_responses(
++    *,
++    request: HistoryRequest,
++    device_hash: str,
++    points: list[dict[str, Any]],
++    has_more: bool,
++    next_cursor: int,
++    chunk_size: int,
++) -> Iterable[dict[str, Any]]:
+     if not points:
+         yield {
+             "api_version": API_VERSION,
+-            "schema_version": HISTORY_SCHEMA_VERSION,
++            "schema_version": request.schema_version,
+             "request_id": request.request_id,
+             "device_hash": device_hash,
+             "ok": True,
+@@ -187,12 +282,12 @@
+         }
+         return
+ 
+-    chunks = [points[i:i + chunk_size] for i in range(0, len(points), chunk_size)]
++    chunks = [points[i : i + chunk_size] for i in range(0, len(points), chunk_size)]
+     for index, chunk in enumerate(chunks):
+         final = index == len(chunks) - 1
+         yield {
+             "api_version": API_VERSION,
+-            "schema_version": HISTORY_SCHEMA_VERSION,
++            "schema_version": request.schema_version,
+             "request_id": request.request_id,
+             "device_hash": device_hash,
+             "ok": True,
+--- archiver-v1/equine_archiver/store.py
++++ archiver-v2/equine_archiver/store.py
+@@ -36,6 +36,9 @@
+                     gateway_hash TEXT NOT NULL,
+                     gateway_id TEXT NOT NULL,
+                     received_at_ms INTEGER NOT NULL,
++                    fix_time_unix_ms INTEGER NOT NULL DEFAULT 0,
++                    timestamp_valid INTEGER NOT NULL DEFAULT 0,
++                    time_source TEXT NOT NULL DEFAULT 'unavailable',
+                     latitude REAL NOT NULL,
+                     longitude REAL NOT NULL,
+                     dist_m INTEGER NOT NULL,
+@@ -47,9 +50,10 @@
+                 )
+                 """
+             )
++            self._migrate_points_table()
+             self._db.execute(
+                 "CREATE INDEX IF NOT EXISTS idx_points_tracker_time "
+-                "ON points(device_hash, received_at_ms, id)"
++                "ON points(device_hash, fix_time_unix_ms, received_at_ms, id)"
+             )
+             self._db.execute(
+                 """
+@@ -67,28 +71,68 @@
+                 """
+             )
+ 
++    def _migrate_points_table(self) -> None:
++        columns = {
++            row["name"]
++            for row in self._db.execute("PRAGMA table_info(points)").fetchall()
++        }
++        migrations = {
++            "fix_time_unix_ms": (
++                "ALTER TABLE points ADD COLUMN "
++                "fix_time_unix_ms INTEGER NOT NULL DEFAULT 0"
++            ),
++            "timestamp_valid": (
++                "ALTER TABLE points ADD COLUMN "
++                "timestamp_valid INTEGER NOT NULL DEFAULT 0"
++            ),
++            "time_source": (
++                "ALTER TABLE points ADD COLUMN "
++                "time_source TEXT NOT NULL DEFAULT 'unavailable'"
++            ),
++        }
++        for column, statement in migrations.items():
++            if column not in columns:
++                self._db.execute(statement)
++
+     def close(self) -> None:
+         with self._lock:
+             self._db.close()
+ 
+     def insert_point(self, point: dict[str, Any], received_at_ms: int) -> bool:
+         payload_json = json.dumps(point, separators=(",", ":"), sort_keys=True)
++        timestamp_valid = bool(point.get("timestamp_valid", False))
++        fix_time_unix_ms = int(point.get("fix_time_unix_ms", 0))
++        time_source = str(point.get("time_source", "unavailable"))
+         values = (
+-            point["point_id"], point["device_hash"], point.get("device_id", ""),
+-            point.get("device_name", ""), point.get("gateway_hash", ""),
+-            point.get("gateway_id", ""), received_at_ms, point["latitude"],
+-            point["longitude"], point["dist_m"], point["battery_level"],
+-            point["rssi"], point["boot_id"], point["seq"], payload_json,
++            point["point_id"],
++            point["device_hash"],
++            point.get("device_id", ""),
++            point.get("device_name", ""),
++            point.get("gateway_hash", ""),
++            point.get("gateway_id", ""),
++            received_at_ms,
++            fix_time_unix_ms,
++            1 if timestamp_valid else 0,
++            time_source,
++            point["latitude"],
++            point["longitude"],
++            point["dist_m"],
++            point["battery_level"],
++            point["rssi"],
++            point["boot_id"],
++            point["seq"],
++            payload_json,
+         )
+         with self._lock, self._db:
+             cursor = self._db.execute(
+                 """
+                 INSERT OR IGNORE INTO points (
+                     point_id, device_hash, device_id, device_name,
+-                    gateway_hash, gateway_id, received_at_ms, latitude,
+-                    longitude, dist_m, battery_level, rssi, boot_id, seq,
+-                    payload_json
+-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                    gateway_hash, gateway_id, received_at_ms,
++                    fix_time_unix_ms, timestamp_valid, time_source,
++                    latitude, longitude, dist_m, battery_level, rssi,
++                    boot_id, seq, payload_json
++                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 """,
+                 values,
+             )
+@@ -104,23 +148,44 @@
+                     rssi = MAX(receptions.rssi, excluded.rssi),
+                     reception_count = receptions.reception_count + 1
+                 """,
+-                (point["point_id"], point.get("gateway_hash", ""),
+-                 point.get("gateway_id", ""), received_at_ms, received_at_ms,
+-                 point["rssi"]),
++                (
++                    point["point_id"],
++                    point.get("gateway_hash", ""),
++                    point.get("gateway_id", ""),
++                    received_at_ms,
++                    received_at_ms,
++                    point["rssi"],
++                ),
+             )
+             return inserted
+ 
+-    def query(self, *, device_hash: str, from_unix_ms: int, to_unix_ms: int,
+-              limit: int, cursor: int = 0) -> QueryResult:
++    def query(
++        self,
++        *,
++        device_hash: str,
++        from_unix_ms: int,
++        to_unix_ms: int,
++        limit: int,
++        cursor: int = 0,
++    ) -> QueryResult:
++        # GNSS fix time is authoritative when available. Legacy points fall back
++        # to server receive time, preserving useful history during migration.
++        effective_time = (
++            "CASE WHEN p.timestamp_valid = 1 AND p.fix_time_unix_ms > 0 "
++            "THEN p.fix_time_unix_ms ELSE p.received_at_ms END"
++        )
+         with self._lock:
+             rows = self._db.execute(
+-                """
+-                SELECT p.id, p.received_at_ms, p.payload_json,
++                f"""
++                SELECT p.id, p.received_at_ms, p.fix_time_unix_ms,
++                       p.timestamp_valid, p.time_source, p.payload_json,
++                       {effective_time} AS effective_time_unix_ms,
+                        COUNT(r.gateway_hash) AS reception_gateway_count,
+                        MAX(r.rssi) AS best_rssi
+                 FROM points AS p
+                 LEFT JOIN receptions AS r ON r.point_id = p.point_id
+-                WHERE p.device_hash = ? AND p.received_at_ms BETWEEN ? AND ?
++                WHERE p.device_hash = ?
++                  AND {effective_time} BETWEEN ? AND ?
+                   AND p.id > ?
+                 GROUP BY p.id
+                 ORDER BY p.id ASC
+@@ -136,30 +201,53 @@
+         for row in rows:
+             point = json.loads(row["payload_json"])
+             point["received_at_ms"] = row["received_at_ms"]
+-            point["reception_gateway_count"] = row["reception_gateway_count"]
++            point["fix_time_unix_ms"] = row["fix_time_unix_ms"]
++            point["timestamp_valid"] = bool(row["timestamp_valid"])
++            point["time_source"] = row["time_source"]
++            point["effective_time_unix_ms"] = row["effective_time_unix_ms"]
++            point["reception_gateway_count"] = row[
++                "reception_gateway_count"
++            ]
+             point["best_rssi"] = row["best_rssi"]
+             points.append(point)
+             next_cursor = row["id"]
+         return QueryResult(points, has_more, next_cursor)
+ 
+     def purge_before(self, cutoff_unix_ms: int) -> int:
++        # Retention is based on effective observation time, not delayed MQTT
++        # delivery time. Legacy points use receive time.
+         with self._lock, self._db:
+-            point_ids = [row[0] for row in self._db.execute(
+-                "SELECT point_id FROM points WHERE received_at_ms < ?",
+-                (cutoff_unix_ms,),
+-            ).fetchall()]
++            point_ids = [
++                row[0]
++                for row in self._db.execute(
++                    """
++                    SELECT point_id FROM points
++                    WHERE (CASE
++                      WHEN timestamp_valid = 1 AND fix_time_unix_ms > 0
++                      THEN fix_time_unix_ms ELSE received_at_ms END) < ?
++                    """,
++                    (cutoff_unix_ms,),
++                ).fetchall()
++            ]
+             if point_ids:
+                 self._db.executemany(
+                     "DELETE FROM receptions WHERE point_id = ?",
+                     ((point_id,) for point_id in point_ids),
+                 )
+             cursor = self._db.execute(
+-                "DELETE FROM points WHERE received_at_ms < ?",
++                """
++                DELETE FROM points
++                WHERE (CASE
++                  WHEN timestamp_valid = 1 AND fix_time_unix_ms > 0
++                  THEN fix_time_unix_ms ELSE received_at_ms END) < ?
++                """,
+                 (cutoff_unix_ms,),
+             )
+             return cursor.rowcount
+ 
+     def count(self) -> int:
+         with self._lock:
+-            row = self._db.execute("SELECT COUNT(*) AS count FROM points").fetchone()
++            row = self._db.execute(
++                "SELECT COUNT(*) AS count FROM points"
++            ).fetchone()
+             return int(row["count"])
+--- archiver-v1/equine_archiver/__init__.py
++++ archiver-v2/equine_archiver/__init__.py
+@@ -1,4 +1,4 @@
+ """MQTT-backed ten-day history archiver for Equine Tracker telemetry."""
+ 
+ __all__ = ["__version__"]
+-__version__ = "0.1.0"
++__version__ = "0.2.0"
+--- archiver-v1/pyproject.toml
++++ archiver-v2/pyproject.toml
+@@ -4,7 +4,7 @@
+ 
+ [project]
+ name = "equine-archiver"
+-version = "0.1.0"
++version = "0.2.0"
+ description = "MQTT/SQLite history archiver for Equine Tracker"
+ requires-python = ">=3.11"
+ dependencies = ["paho-mqtt>=2.1,<3"]
+--- archiver-v1/README.md
++++ archiver-v2/README.md
+@@ -1,17 +1,19 @@
+-# Equine Archiver
++# Equine Archiver v2
+ 
+-A small MQTT-to-SQLite service that keeps the most recent tracker history and
+-serves paginated history requests over MQTT.
++An MQTT-to-SQLite service that keeps recent tracker history and serves
++paginated history requests over MQTT.
+ 
+ ## Features
+ 
+-- Subscribes to protocol-v1 point events.
++- Accepts point JSON schema v1 and v2 during rolling upgrades.
++- Stores GNSS fix time from schema v2 and falls back to server receive time for
++  legacy untimed points.
+ - Deduplicates using stable `point_id`.
+ - Records receptions from multiple gateways independently.
+-- Stores server receive time, coordinates, distance, battery and RSSI.
+-- Keeps ten days by default.
++- Migrates an existing v1 SQLite database in place.
++- Keeps ten days by default using effective observation time.
+ - Optional allowlist of tracker hashes.
+-- Chunked MQTT history responses.
++- Chunked MQTT history-schema v2 responses.
+ - Retained availability and status topics.
+ - Runs directly with Python or in Docker.
+ 
+@@ -42,16 +44,10 @@
+ ```bash
+ mosquitto_pub \
+   -t 'equine/v1/trackers/3db3edf61a18fac0/history/request' \
+-  -m '{"api_version":1,"schema_version":1,"request_id":"demo-1","limit":100}'
++  -m '{"api_version":1,"schema_version":2,"request_id":"demo-1","limit":100}'
+ ```
+ 
+ ## Security
+ 
+-Use broker authentication, ACLs and TLS even though later protocol steps will
+-add end-to-end payload encryption. Suggested ACLs:
+-
+-- Gateways may publish tracker events/state and their own status.
+-- Apps may subscribe to assigned trackers and publish history requests.
+-- Archivers may subscribe to assigned tracker events/requests and publish only
+-  their history responses/status.
+-- Anonymous publishing should be disabled.
++Use broker authentication, ACLs and TLS. End-to-end payload encryption is a
++later protocol step; the broker and archiver currently see plaintext telemetry.
+--- archiver-v1/tests/test_protocol.py
++++ archiver-v2/tests/test_protocol.py
+@@ -1,5 +1,4 @@
+ from equine_archiver.protocol import (
+-    HistoryRequest,
+     ProtocolError,
+     iter_history_responses,
+     parse_history_request,
+@@ -10,10 +9,10 @@
+ HASH = "3db3edf61a18fac0"
+ 
+ 
+-def point(seq: int = 1):
+-    return {
++def point(seq: int = 1, schema: int = 2):
++    data = {
+         "api_version": 1,
+-        "point_schema_version": 1,
++        "point_schema_version": schema,
+         "device_hash": HASH,
+         "point_id": f"{HASH}:5:{seq}",
+         "latitude": 50.1,
+@@ -28,12 +27,38 @@
+         "gateway_id": "home",
+         "gateway_hash": "1111111111111111",
+     }
++    if schema == 2:
++        data.update(
++            timestamp_valid=True,
++            fix_time_unix_ms=1_784_050_000_000 + seq * 60_000,
++            time_source="gnss",
++        )
++    return data
+ 
+ 
+ def test_point_and_topic_validation():
+     topic = f"equine/v1/trackers/{HASH}/events/point"
+     assert tracker_hash_from_topic(topic, "events/point") == HASH
+-    assert validate_point(point(), HASH)["seq"] == 1
++    normalized = validate_point(point(), HASH)
++    assert normalized["seq"] == 1
++    assert normalized["timestamp_valid"] is True
++
++
++def test_legacy_point_gets_timestamp_fallback_fields():
++    normalized = validate_point(point(schema=1), HASH)
++    assert normalized["timestamp_valid"] is False
++    assert normalized["fix_time_unix_ms"] == 0
++
++
++def test_invalid_timestamp_rejected():
++    invalid = point()
++    invalid["timestamp_valid"] = False
++    try:
++        validate_point(invalid, HASH)
++    except ProtocolError as exc:
++        assert exc.code == "invalid_point"
++    else:
++        raise AssertionError("inconsistent timestamp accepted")
+ 
+ 
+ def test_topic_payload_hash_mismatch_rejected():
+@@ -46,23 +71,29 @@
+ 
+ 
+ def test_history_request_and_chunks():
+-    request = parse_history_request({
+-        "api_version": 1,
+-        "schema_version": 1,
+-        "request_id": "app-42",
+-        "limit": 3,
+-        "cursor": 0,
+-    }, 500)
+-    responses = list(iter_history_responses(
+-        request=request,
+-        device_hash=HASH,
+-        points=[point(1), point(2), point(3)],
+-        has_more=True,
+-        next_cursor=9,
+-        chunk_size=2,
+-    ))
++    request = parse_history_request(
++        {
++            "api_version": 1,
++            "schema_version": 2,
++            "request_id": "app-42",
++            "limit": 3,
++            "cursor": 0,
++        },
++        500,
++    )
++    responses = list(
++        iter_history_responses(
++            request=request,
++            device_hash=HASH,
++            points=[point(1), point(2), point(3)],
++            has_more=True,
++            next_cursor=9,
++            chunk_size=2,
++        )
++    )
+     assert len(responses) == 2
+     assert responses[0]["final"] is False
+     assert responses[1]["final"] is True
+     assert responses[1]["has_more"] is True
+     assert responses[1]["next_cursor"] == 9
++    assert responses[1]["schema_version"] == 2
+--- archiver-v1/tests/test_store.py
++++ archiver-v2/tests/test_store.py
+@@ -1,14 +1,16 @@
+ from pathlib import Path
++import sqlite3
+ 
+ from equine_archiver.store import HistoryStore
+ 
+ HASH = "3db3edf61a18fac0"
+ 
+ 
+-def make_point(seq: int):
++def make_point(seq: int, *, fix_time_ms: int | None = None):
++    valid = fix_time_ms is not None
+     return {
+         "api_version": 1,
+-        "point_schema_version": 1,
++        "point_schema_version": 2,
+         "device_hash": HASH,
+         "point_id": f"{HASH}:7:{seq}",
+         "device_id": "wera",
+@@ -22,35 +24,85 @@
+         "rssi": -90,
+         "boot_id": 7,
+         "seq": seq,
++        "timestamp_valid": valid,
++        "fix_time_unix_ms": fix_time_ms or 0,
++        "time_source": "gnss" if valid else "unavailable",
+     }
+ 
+ 
+ def test_insert_deduplicate_query_and_purge(tmp_path: Path):
+     store = HistoryStore(tmp_path / "history.sqlite3")
+     try:
+-        assert store.insert_point(make_point(1), 1000) is True
+-        assert store.insert_point(make_point(1), 1001) is False
+-        assert store.insert_point(make_point(2), 2000) is True
+-        assert store.insert_point(make_point(3), 3000) is True
++        assert store.insert_point(make_point(1, fix_time_ms=10_000), 100_000) is True
++        assert store.insert_point(make_point(1, fix_time_ms=10_000), 100_001) is False
++        assert store.insert_point(make_point(2, fix_time_ms=20_000), 200_000) is True
++        assert store.insert_point(make_point(3, fix_time_ms=30_000), 300_000) is True
+         result = store.query(
+             device_hash=HASH,
+             from_unix_ms=0,
+-            to_unix_ms=10_000,
++            to_unix_ms=25_000,
+             limit=2,
+             cursor=0,
+         )
+         assert [p["seq"] for p in result.points] == [1, 2]
+-        assert result.has_more is True
+-        second = store.query(
++        assert result.points[0]["effective_time_unix_ms"] == 10_000
++        assert result.has_more is False
++        assert store.purge_before(25_000) == 2
++        assert store.count() == 1
++    finally:
++        store.close()
++
++
++def test_receive_time_fallback_for_legacy_timestamp(tmp_path: Path):
++    store = HistoryStore(tmp_path / "history.sqlite3")
++    try:
++        assert store.insert_point(make_point(1), 50_000)
++        result = store.query(
+             device_hash=HASH,
+-            from_unix_ms=0,
+-            to_unix_ms=10_000,
+-            limit=2,
+-            cursor=result.next_cursor,
++            from_unix_ms=40_000,
++            to_unix_ms=60_000,
++            limit=10,
+         )
+-        assert [p["seq"] for p in second.points] == [3]
+-        assert store.purge_before(2500) == 2
+-        assert store.count() == 1
++        assert result.points[0]["effective_time_unix_ms"] == 50_000
++        assert result.points[0]["timestamp_valid"] is False
++    finally:
++        store.close()
++
++
++def test_existing_v1_database_is_migrated(tmp_path: Path):
++    path = tmp_path / "history.sqlite3"
++    db = sqlite3.connect(path)
++    db.execute(
++        """
++        CREATE TABLE points (
++          id INTEGER PRIMARY KEY AUTOINCREMENT,
++          point_id TEXT NOT NULL UNIQUE,
++          device_hash TEXT NOT NULL,
++          device_id TEXT NOT NULL,
++          device_name TEXT NOT NULL,
++          gateway_hash TEXT NOT NULL,
++          gateway_id TEXT NOT NULL,
++          received_at_ms INTEGER NOT NULL,
++          latitude REAL NOT NULL,
++          longitude REAL NOT NULL,
++          dist_m INTEGER NOT NULL,
++          battery_level INTEGER NOT NULL,
++          rssi INTEGER NOT NULL,
++          boot_id INTEGER NOT NULL,
++          seq INTEGER NOT NULL,
++          payload_json TEXT NOT NULL
++        )
++        """
++    )
++    db.commit()
++    db.close()
++    store = HistoryStore(path)
++    try:
++        columns = {
++            row[1]
++            for row in store._db.execute("PRAGMA table_info(points)").fetchall()
++        }
++        assert {"fix_time_unix_ms", "timestamp_valid", "time_source"} <= columns
+     finally:
+         store.close()
+ 
+@@ -58,7 +110,7 @@
+ def test_multiple_gateway_receptions_are_preserved(tmp_path: Path):
+     store = HistoryStore(tmp_path / "history.sqlite3")
+     try:
+-        first = make_point(1)
++        first = make_point(1, fix_time_ms=10_000)
+         second = dict(first)
+         second["gateway_hash"] = "2222222222222222"
+         second["gateway_id"] = "field"
+@@ -68,7 +120,7 @@
+         result = store.query(
+             device_hash=HASH,
+             from_unix_ms=0,
+-            to_unix_ms=10_000,
++            to_unix_ms=20_000,
+             limit=10,
+             cursor=0,
+         )
+--- /dev/null
++++ equine_web_app_v1/EQUINE_MQTT_API_V1.md
+@@ -0,0 +1,105 @@
++# Equine MQTT API v1 — point/history schema v2
++
++The topic API remains `v1`. Point JSON and history response schemas are now
++version 2 to carry tracker fix time. MQTT remains an untrusted transport until
++end-to-end authenticated encryption is added.
++
++## Point events and latest state
++
++```text
++equine/v1/trackers/<device_hash>/events/point   non-retained
++equine/v1/trackers/<device_hash>/state          retained
++```
++
++```json
++{
++  "api_version": 1,
++  "point_schema_version": 2,
++  "transport_version": 1,
++  "schema_version": 2,
++  "device_id": "wera",
++  "device_name": "Wera",
++  "device_hash": "3db3edf61a18fac0",
++  "gateway_id": "home",
++  "gateway_hash": "0123456789abcdef",
++  "point_id": "3db3edf61a18fac0:17:42",
++  "latitude": 50.228470,
++  "longitude": 8.564520,
++  "dist_m": 1230,
++  "battery_level": 79,
++  "rssi": -104,
++  "seq": 42,
++  "boot_id": 17,
++  "timestamp_valid": true,
++  "fix_time_unix_ms": 1784123456000,
++  "time_source": "gnss",
++  "gateway_uptime_ms": 812345
++}
++```
++
++When decoding an old history-v1 or legacy LoRa packet, the gateway still emits
++point schema v2 but uses:
++
++```json
++{
++  "timestamp_valid": false,
++  "fix_time_unix_ms": 0,
++  "time_source": "unavailable"
++}
++```
++
++Consumers must prefer `fix_time_unix_ms` only when `timestamp_valid` is true.
++
++## History request
++
++```text
++equine/v1/trackers/<device_hash>/history/request
++```
++
++```json
++{
++  "api_version": 1,
++  "schema_version": 2,
++  "request_id": "phone-42",
++  "from_unix_ms": 1784000000000,
++  "to_unix_ms": 1784100000000,
++  "limit": 250,
++  "cursor": 0
++}
++```
++
++The archiver accepts history request schemas 1 and 2 during migration. Time
++filtering in schema 2 uses GNSS fix time when available and server receive time
++for old untimed points.
++
++## History response
++
++```text
++equine/v1/trackers/<device_hash>/history/response/<request_id>
++```
++
++Every returned point includes:
++
++- `fix_time_unix_ms`
++- `timestamp_valid`
++- `time_source`
++- `received_at_ms`
++- `effective_time_unix_ms`
++- `reception_gateway_count`
++- `best_rssi`
++
++`effective_time_unix_ms` is GNSS fix time when valid, otherwise receive time. It
++is the recommended display and filtering field for mixed-version history.
++
++Responses remain chunked and use `final`, `has_more`, and `next_cursor`.
++
++## Stable identity and deduplication
++
++`point_id` remains `<device_hash>:<boot_id>:<seq>`. Several gateways may publish
++the same tracker point; archivers must deduplicate by `point_id` and may preserve
++separate reception metadata.
++
++## Gateway management and archiver status
++
++All Step-5 gateway command, availability, status, and archiver status topics are
++unchanged. Only point and history JSON schema versions change.
+--- /dev/null
++++ equine_web_app_v1/README.md
+@@ -0,0 +1,37 @@
++# Equine Web App v1
++
++A dependency-free progressive web app for the Equine MQTT API. It runs as static
++files and uses MQTT 3.1.1 over WebSocket directly in the browser.
++
++## Current features
++
++- MQTT WebSocket connection with username/password
++- Automatic discovery of tracker point/state messages
++- Point-schema v1 and v2 compatibility
++- GNSS timestamp display with receive-time fallback
++- MQTT history-schema v2 requests and chunk collection
++- IndexedDB local point cache
++- Multi-tracker selection and status cards
++- Lightweight SVG route view with no external map or tile dependency
++- Installable/offline application shell through a service worker
++
++## Run
++
++```bash
++python3 -m http.server 8080
++```
++
++Open `http://localhost:8080`. The broker must expose an MQTT WebSocket endpoint,
++preferably `wss://` with a trusted certificate.
++
++The app stores broker URL, base topic and username in localStorage. It never
++persists the MQTT password. MQTT remains an untrusted transport until the later
++end-to-end encryption step is implemented.
++
++## Deliberate limitations of this first app
++
++- No BLE or Wi-Fi onboarding UI yet
++- No QR provisioning or app-to-app transfer yet
++- No end-to-end encryption yet
++- No geographical base map; the route is plotted in local coordinates
++- History pagination beyond the first 500 points is not automated yet
+--- /dev/null
++++ equine_web_app_v1/app.js
+@@ -0,0 +1,268 @@
++import { MqttWebSocketClient } from './mqtt.js';
++import { putPoint, listPoints, clearPoints } from './storage.js';
++
++const els = Object.fromEntries([...document.querySelectorAll('[id]')].map(el => [el.id, el]));
++const mqtt = new MqttWebSocketClient();
++const trackers = new Map();
++let selectedHash = null;
++let connected = false;
++let pendingHistoryRequest = null;
++
++const saved = JSON.parse(localStorage.getItem('equine.web.settings') || '{}');
++els.brokerUrl.value = saved.brokerUrl || '';
++els.baseTopic.value = saved.baseTopic || 'equine';
++els.username.value = saved.username || '';
++
++function saveSettings() {
++  localStorage.setItem('equine.web.settings', JSON.stringify({
++    brokerUrl: els.brokerUrl.value.trim(),
++    baseTopic: els.baseTopic.value.trim() || 'equine',
++    username: els.username.value.trim(),
++  }));
++}
++
++function setConnectionState(state, message = '') {
++  els.connectionBadge.className = `badge ${state === 'online' ? 'online' : state === 'offline' ? 'offline' : 'connecting'}`;
++  els.connectionBadge.textContent = state === 'online' ? 'Online' : state === 'offline' ? 'Offline' : 'Connecting';
++  els.connectionMessage.textContent = message || state;
++  els.connectButton.textContent = state === 'online' || state === 'connecting' ? 'Disconnect' : 'Connect';
++}
++
++function normalizePoint(raw, fallbackNow = Date.now()) {
++  if (!raw || raw.api_version !== 1 || ![1, 2].includes(raw.point_schema_version)) throw new Error('Unsupported point schema');
++  const validTime = raw.point_schema_version >= 2 && raw.timestamp_valid === true && Number.isSafeInteger(raw.fix_time_unix_ms) && raw.fix_time_unix_ms > 0;
++  const effective = validTime ? raw.fix_time_unix_ms : (raw.received_at_ms || fallbackNow);
++  return {
++    ...raw,
++    timestamp_valid: validTime,
++    fix_time_unix_ms: validTime ? raw.fix_time_unix_ms : 0,
++    time_source: validTime ? 'gnss' : 'received',
++    effective_time_unix_ms: raw.effective_time_unix_ms || effective,
++  };
++}
++
++function trackerFromPoint(point) {
++  let tracker = trackers.get(point.device_hash);
++  if (!tracker) {
++    tracker = {
++      hash: point.device_hash,
++      name: point.device_name || point.device_id || point.device_hash,
++      id: point.device_id || '',
++      latest: null,
++    };
++    trackers.set(point.device_hash, tracker);
++  }
++  tracker.name = point.device_name || tracker.name;
++  if (!tracker.latest || point.effective_time_unix_ms >= tracker.latest.effective_time_unix_ms) tracker.latest = point;
++  if (!selectedHash) selectedHash = point.device_hash;
++  return tracker;
++}
++
++async function ingestPoint(raw) {
++  const point = normalizePoint(raw);
++  trackerFromPoint(point);
++  await putPoint(point);
++  renderTrackerList();
++  if (point.device_hash === selectedHash) await renderSelectedTracker();
++}
++
++function ageText(ms) {
++  if (!ms) return '—';
++  const seconds = Math.max(0, Math.floor((Date.now() - ms) / 1000));
++  if (seconds < 60) return `${seconds}s`;
++  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
++  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
++  return `${Math.floor(seconds / 86400)}d`;
++}
++
++function formatTime(ms) {
++  if (!ms) return '—';
++  return new Intl.DateTimeFormat(undefined, { dateStyle: 'short', timeStyle: 'medium' }).format(new Date(ms));
++}
++
++function renderTrackerList() {
++  els.trackerList.innerHTML = '';
++  const sorted = [...trackers.values()].sort((a, b) => (b.latest?.effective_time_unix_ms || 0) - (a.latest?.effective_time_unix_ms || 0));
++  for (const tracker of sorted) {
++    const node = els.trackerTemplate.content.firstElementChild.cloneNode(true);
++    node.classList.toggle('active', tracker.hash === selectedHash);
++    const fresh = tracker.latest && Date.now() - tracker.latest.effective_time_unix_ms < 10 * 60_000;
++    node.classList.toggle('fresh', Boolean(fresh));
++    node.querySelector('.tracker-name').textContent = tracker.name;
++    node.querySelector('.tracker-hash').textContent = tracker.hash;
++    node.querySelector('.tracker-age').textContent = ageText(tracker.latest?.effective_time_unix_ms);
++    node.addEventListener('click', async () => {
++      selectedHash = tracker.hash;
++      renderTrackerList();
++      await renderSelectedTracker();
++    });
++    els.trackerList.append(node);
++  }
++  els.trackerCount.textContent = String(sorted.length);
++}
++
++function drawGrid() {
++  if (els.gridLayer.childElementCount) return;
++  for (let x = 100; x < 1000; x += 100) {
++    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
++    line.setAttribute('x1', x); line.setAttribute('x2', x); line.setAttribute('y1', 0); line.setAttribute('y2', 560);
++    els.gridLayer.append(line);
++  }
++  for (let y = 80; y < 560; y += 80) {
++    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
++    line.setAttribute('x1', 0); line.setAttribute('x2', 1000); line.setAttribute('y1', y); line.setAttribute('y2', y);
++    els.gridLayer.append(line);
++  }
++}
++
++function drawRoute(points) {
++  drawGrid();
++  if (!points.length) {
++    els.routeLine.setAttribute('points', '');
++    els.routeStart.setAttribute('cx', -20); els.routeEnd.setAttribute('cx', -20);
++    els.routeBounds.textContent = '—';
++    return;
++  }
++  let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
++  for (const p of points) {
++    minLat = Math.min(minLat, p.latitude); maxLat = Math.max(maxLat, p.latitude);
++    minLon = Math.min(minLon, p.longitude); maxLon = Math.max(maxLon, p.longitude);
++  }
++  const latSpan = Math.max(maxLat - minLat, 0.0001);
++  const lonSpan = Math.max(maxLon - minLon, 0.0001);
++  const projected = points.map(p => ({
++    x: 40 + ((p.longitude - minLon) / lonSpan) * 920,
++    y: 520 - ((p.latitude - minLat) / latSpan) * 480,
++  }));
++  els.routeLine.setAttribute('points', projected.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' '));
++  const start = projected[0], end = projected.at(-1);
++  els.routeStart.setAttribute('cx', start.x); els.routeStart.setAttribute('cy', start.y);
++  els.routeEnd.setAttribute('cx', end.x); els.routeEnd.setAttribute('cy', end.y);
++  els.routeBounds.textContent = `${minLat.toFixed(5)}, ${minLon.toFixed(5)} → ${maxLat.toFixed(5)}, ${maxLon.toFixed(5)}`;
++}
++
++async function renderSelectedTracker() {
++  const tracker = trackers.get(selectedHash);
++  if (!tracker) return;
++  const latest = tracker.latest;
++  els.selectedTrackerName.textContent = tracker.name;
++  els.lastSeen.textContent = latest ? ageText(latest.effective_time_unix_ms) + ' ago' : '—';
++  els.timeSource.textContent = latest ? `${formatTime(latest.effective_time_unix_ms)} · ${latest.timestamp_valid ? 'GNSS time' : 'receive-time fallback'}` : 'No data';
++  els.battery.textContent = latest ? `${latest.battery_level}%` : '—';
++  els.batteryDetail.textContent = latest ? `Boot ${latest.boot_id} · seq ${latest.seq}` : '—';
++  els.distance.textContent = latest ? `${(latest.dist_m / 1000).toFixed(2)} km` : '—';
++  els.rssi.textContent = latest ? `${latest.rssi} dBm` : '—';
++  els.gateway.textContent = latest ? latest.gateway_id || latest.gateway_hash || 'unknown gateway' : '—';
++
++  const hours = Number(els.historyRange.value || 24);
++  const points = await listPoints(selectedHash, Date.now() - hours * 3600_000, Date.now() + 3600_000);
++  drawRoute(points);
++  els.pointCount.textContent = `${points.length} point${points.length === 1 ? '' : 's'}`;
++  els.eventTable.innerHTML = '';
++  for (const point of points.slice(-30).reverse()) {
++    const row = document.createElement('tr');
++    row.innerHTML = `<td>${formatTime(point.effective_time_unix_ms)}</td><td><code>${point.latitude.toFixed(6)}, ${point.longitude.toFixed(6)}</code></td><td>${point.battery_level}%</td><td>${point.rssi} dBm</td><td>${point.gateway_id || point.gateway_hash || '—'}</td>`;
++    els.eventTable.append(row);
++  }
++}
++
++function parseTopic(topic) {
++  const base = (els.baseTopic.value.trim() || 'equine').split('/').filter(Boolean);
++  const parts = topic.split('/');
++  const start = parts.findIndex((_, i) => base.every((part, j) => parts[i + j] === part));
++  if (start < 0) return null;
++  const tail = parts.slice(start + base.length);
++  return tail;
++}
++
++mqtt.addEventListener('status', event => {
++  const state = event.detail.state;
++  connected = state === 'online';
++  setConnectionState(state, state === 'reconnecting' ? `Reconnecting in ${Math.round(event.detail.delay / 1000)} seconds…` : state === 'online' ? 'Subscribed to tracker telemetry and history responses.' : state === 'connecting' ? 'Opening secure MQTT WebSocket…' : 'Not connected.');
++  if (state === 'online') {
++    const base = els.baseTopic.value.trim() || 'equine';
++    mqtt.subscribe(
++      `${base}/v1/trackers/+/events/point`,
++      `${base}/v1/trackers/+/state`,
++      `${base}/v1/trackers/+/history/response/+`
++    );
++  }
++});
++
++mqtt.addEventListener('error', event => { els.connectionMessage.textContent = event.detail.message; });
++mqtt.addEventListener('message', async event => {
++  const { topic, payload } = event.detail;
++  let data;
++  try { data = JSON.parse(payload); } catch { return; }
++  const tail = parseTopic(topic);
++  if (!tail || tail[0] !== 'v1' || tail[1] !== 'trackers') return;
++  if (tail[3] === 'events' && tail[4] === 'point' || tail[3] === 'state') {
++    try { await ingestPoint(data); } catch (error) { console.warn(error); }
++  } else if (tail[3] === 'history' && tail[4] === 'response') {
++    if (!data.ok || !Array.isArray(data.points)) return;
++    for (const raw of data.points) {
++      try { await ingestPoint(raw); } catch (error) { console.warn(error); }
++    }
++    if (data.final && pendingHistoryRequest === data.request_id) {
++      pendingHistoryRequest = null;
++      els.connectionMessage.textContent = `History received for ${tail[2]}.`;
++      if (data.has_more) els.connectionMessage.textContent += ' More data is available; request pagination is retained for the next app iteration.';
++    }
++  }
++});
++
++els.connectButton.addEventListener('click', () => {
++  if (connected || els.connectButton.textContent === 'Disconnect') {
++    mqtt.disconnect();
++    connected = false;
++    setConnectionState('offline', 'Disconnected by user.');
++    return;
++  }
++  const url = els.brokerUrl.value.trim();
++  if (!/^wss?:\/\//i.test(url)) {
++    els.connectionMessage.textContent = 'Enter an MQTT WebSocket URL beginning with ws:// or wss://.';
++    return;
++  }
++  saveSettings();
++  mqtt.connect({
++    url,
++    username: els.username.value.trim(),
++    password: els.password.value,
++    clientId: `equine-web-${crypto.randomUUID().replaceAll('-', '').slice(0, 18)}`,
++  });
++});
++
++els.historyButton.addEventListener('click', () => {
++  if (!selectedHash || !connected) {
++    els.connectionMessage.textContent = 'Connect to MQTT and select a tracker first.';
++    return;
++  }
++  const base = els.baseTopic.value.trim() || 'equine';
++  const hours = Number(els.historyRange.value || 24);
++  const requestId = `web-${Date.now().toString(36)}`;
++  pendingHistoryRequest = requestId;
++  mqtt.publish(`${base}/v1/trackers/${selectedHash}/history/request`, JSON.stringify({
++    api_version: 1,
++    schema_version: 2,
++    request_id: requestId,
++    from_unix_ms: Date.now() - hours * 3600_000,
++    to_unix_ms: Date.now() + 60_000,
++    limit: 500,
++    cursor: 0,
++  }));
++  els.connectionMessage.textContent = `Requested ${hours} hours of history…`;
++});
++
++els.historyRange.addEventListener('change', renderSelectedTracker);
++els.clearLocalButton.addEventListener('click', async () => {
++  if (!selectedHash) return;
++  await clearPoints(selectedHash);
++  const tracker = trackers.get(selectedHash);
++  if (tracker) tracker.latest = null;
++  await renderSelectedTracker();
++});
++
++setInterval(() => { renderTrackerList(); if (selectedHash) renderSelectedTracker(); }, 30_000);
++if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(console.warn);
++setConnectionState('offline', 'Not connected.');
++drawGrid();
+--- /dev/null
++++ equine_web_app_v1/index.html
+@@ -0,0 +1,94 @@
++<!doctype html>
++<html lang="en">
++<head>
++  <meta charset="utf-8">
++  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
++  <meta name="theme-color" content="#172018">
++  <title>Equine Tracker</title>
++  <link rel="manifest" href="manifest.webmanifest">
++  <link rel="stylesheet" href="styles.css">
++</head>
++<body>
++  <header>
++    <div>
++      <p class="eyebrow">EQUINE NETWORK</p>
++      <h1>Tracker Console</h1>
++    </div>
++    <span id="connectionBadge" class="badge offline">Offline</span>
++  </header>
++
++  <main>
++    <section class="panel connection-panel">
++      <div class="section-title">
++        <div><p class="eyebrow">TRANSPORT</p><h2>MQTT connection</h2></div>
++        <button id="connectButton" class="primary">Connect</button>
++      </div>
++      <div class="form-grid">
++        <label>WebSocket URL<input id="brokerUrl" placeholder="wss://broker.example.com:8084/mqtt"></label>
++        <label>Base topic<input id="baseTopic" value="equine"></label>
++        <label>Username<input id="username" autocomplete="username"></label>
++        <label>Password<input id="password" type="password" autocomplete="current-password"></label>
++      </div>
++      <p class="hint">The password remains in memory only. Broker URL, topic and username are saved locally.</p>
++      <p id="connectionMessage" class="status-line">Not connected.</p>
++    </section>
++
++    <section class="layout">
++      <aside class="panel tracker-list-panel">
++        <div class="section-title"><div><p class="eyebrow">CLIENTS</p><h2>Trackers</h2></div><span id="trackerCount">0</span></div>
++        <div id="trackerList" class="tracker-list"></div>
++      </aside>
++
++      <section class="dashboard">
++        <div class="stats-grid">
++          <article class="stat panel"><span>Last position</span><strong id="lastSeen">—</strong><small id="timeSource">No data</small></article>
++          <article class="stat panel"><span>Battery</span><strong id="battery">—</strong><small id="batteryDetail">—</small></article>
++          <article class="stat panel"><span>Distance</span><strong id="distance">—</strong><small>Daily tracker counter</small></article>
++          <article class="stat panel"><span>LoRa</span><strong id="rssi">—</strong><small id="gateway">—</small></article>
++        </div>
++
++        <section class="panel map-panel">
++          <div class="section-title">
++            <div><p class="eyebrow">ROUTE</p><h2 id="selectedTrackerName">Select a tracker</h2></div>
++            <div class="actions">
++              <select id="historyRange" aria-label="History range">
++                <option value="6">6 hours</option>
++                <option value="24" selected>24 hours</option>
++                <option value="240">10 days</option>
++              </select>
++              <button id="historyButton">Fetch history</button>
++            </div>
++          </div>
++          <svg id="routeMap" viewBox="0 0 1000 560" role="img" aria-label="Tracker route">
++            <g id="gridLayer"></g>
++            <polyline id="routeLine" points=""></polyline>
++            <circle id="routeStart" r="8" cx="-20" cy="-20"></circle>
++            <circle id="routeEnd" r="12" cx="-20" cy="-20"></circle>
++          </svg>
++          <div class="map-footer"><span id="pointCount">0 points</span><span id="routeBounds">—</span></div>
++        </section>
++
++        <section class="panel events-panel">
++          <div class="section-title"><div><p class="eyebrow">EVENTS</p><h2>Recent telemetry</h2></div><button id="clearLocalButton">Clear local history</button></div>
++          <div class="table-wrap">
++            <table>
++              <thead><tr><th>Time</th><th>Position</th><th>Battery</th><th>RSSI</th><th>Gateway</th></tr></thead>
++              <tbody id="eventTable"></tbody>
++            </table>
++          </div>
++        </section>
++      </section>
++    </section>
++  </main>
++
++  <template id="trackerTemplate">
++    <button class="tracker-card">
++      <span class="tracker-dot"></span>
++      <span><strong class="tracker-name"></strong><small class="tracker-hash"></small></span>
++      <span class="tracker-age"></span>
++    </button>
++  </template>
++
++  <script type="module" src="app.js"></script>
++</body>
++</html>
+--- /dev/null
++++ equine_web_app_v1/manifest.webmanifest
+@@ -0,0 +1,9 @@
++{
++  "name": "Equine Tracker Console",
++  "short_name": "Equine",
++  "start_url": "./",
++  "display": "standalone",
++  "background_color": "#0d120e",
++  "theme_color": "#172018",
++  "icons": []
++}
+--- /dev/null
++++ equine_web_app_v1/mqtt.js
+@@ -0,0 +1,212 @@
++const textEncoder = new TextEncoder();
++const textDecoder = new TextDecoder();
++
++function concatBytes(...arrays) {
++  const size = arrays.reduce((sum, a) => sum + a.length, 0);
++  const out = new Uint8Array(size);
++  let offset = 0;
++  for (const a of arrays) { out.set(a, offset); offset += a.length; }
++  return out;
++}
++
++function utf8Field(value) {
++  const encoded = textEncoder.encode(value ?? '');
++  if (encoded.length > 65535) throw new Error('MQTT string too long');
++  return concatBytes(new Uint8Array([encoded.length >> 8, encoded.length & 0xff]), encoded);
++}
++
++export function encodeRemainingLength(length) {
++  if (!Number.isInteger(length) || length < 0 || length > 268435455) throw new Error('Invalid MQTT remaining length');
++  const bytes = [];
++  do {
++    let digit = length % 128;
++    length = Math.floor(length / 128);
++    if (length > 0) digit |= 0x80;
++    bytes.push(digit);
++  } while (length > 0);
++  return new Uint8Array(bytes);
++}
++
++export function decodeRemainingLength(bytes, start = 1) {
++  let multiplier = 1, value = 0, offset = start;
++  for (let i = 0; i < 4; i++) {
++    if (offset >= bytes.length) return null;
++    const digit = bytes[offset++];
++    value += (digit & 0x7f) * multiplier;
++    if ((digit & 0x80) === 0) return { value, bytesUsed: offset - start };
++    multiplier *= 128;
++  }
++  throw new Error('Malformed MQTT remaining length');
++}
++
++function packet(typeAndFlags, body) {
++  return concatBytes(new Uint8Array([typeAndFlags]), encodeRemainingLength(body.length), body);
++}
++
++export function encodeConnect({ clientId, username = '', password = '', keepAlive = 30 }) {
++  let flags = 0x02; // clean session
++  const payload = [utf8Field(clientId)];
++  if (username) { flags |= 0x80; payload.push(utf8Field(username)); }
++  if (password) { flags |= 0x40; payload.push(utf8Field(password)); }
++  const variable = concatBytes(
++    utf8Field('MQTT'),
++    new Uint8Array([0x04, flags, keepAlive >> 8, keepAlive & 0xff])
++  );
++  return packet(0x10, concatBytes(variable, ...payload));
++}
++
++export function encodeSubscribe(packetId, topics) {
++  const body = [new Uint8Array([packetId >> 8, packetId & 0xff])];
++  for (const topic of topics) body.push(utf8Field(topic), new Uint8Array([0]));
++  return packet(0x82, concatBytes(...body));
++}
++
++export function encodePublish(topic, payload, retain = false) {
++  const data = typeof payload === 'string' ? textEncoder.encode(payload) : payload;
++  return packet(0x30 | (retain ? 1 : 0), concatBytes(utf8Field(topic), data));
++}
++
++export function parsePackets(input) {
++  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
++  const packets = [];
++  let offset = 0;
++  while (offset < bytes.length) {
++    if (bytes.length - offset < 2) break;
++    const remaining = decodeRemainingLength(bytes, offset + 1);
++    if (!remaining) break;
++    const headerLength = 1 + remaining.bytesUsed;
++    const end = offset + headerLength + remaining.value;
++    if (end > bytes.length) break;
++    const first = bytes[offset];
++    const type = first >> 4;
++    const flags = first & 0x0f;
++    const body = bytes.slice(offset + headerLength, end);
++    packets.push({ type, flags, body });
++    offset = end;
++  }
++  return { packets, remainder: bytes.slice(offset) };
++}
++
++export function decodePublish(packetData) {
++  const body = packetData.body;
++  if (body.length < 2) throw new Error('Malformed MQTT PUBLISH');
++  const topicLength = (body[0] << 8) | body[1];
++  if (2 + topicLength > body.length) throw new Error('Malformed MQTT topic');
++  const topic = textDecoder.decode(body.slice(2, 2 + topicLength));
++  const qos = (packetData.flags >> 1) & 0x03;
++  let offset = 2 + topicLength;
++  if (qos > 0) offset += 2;
++  if (offset > body.length) throw new Error('Malformed MQTT packet id');
++  return { topic, payload: textDecoder.decode(body.slice(offset)), retain: Boolean(packetData.flags & 1) };
++}
++
++export class MqttWebSocketClient extends EventTarget {
++  constructor() {
++    super();
++    this.socket = null;
++    this.packetId = 1;
++    this.keepAliveTimer = null;
++    this.reconnectTimer = null;
++    this.reconnectAttempt = 0;
++    this.manualClose = false;
++    this.buffer = new Uint8Array();
++    this.options = null;
++    this.subscriptions = new Set();
++  }
++
++  connect(options) {
++    this.options = { keepAlive: 30, ...options };
++    this.manualClose = false;
++    clearTimeout(this.reconnectTimer);
++    this.#open();
++  }
++
++  #emit(name, detail) { this.dispatchEvent(new CustomEvent(name, { detail })); }
++
++  #open() {
++    if (!this.options) return;
++    this.#emit('status', { state: 'connecting' });
++    const socket = new WebSocket(this.options.url, ['mqtt']);
++    socket.binaryType = 'arraybuffer';
++    this.socket = socket;
++    socket.onopen = () => {
++      socket.send(encodeConnect({
++        clientId: this.options.clientId,
++        username: this.options.username,
++        password: this.options.password,
++        keepAlive: this.options.keepAlive,
++      }));
++    };
++    socket.onmessage = event => this.#onBytes(new Uint8Array(event.data));
++    socket.onerror = () => this.#emit('error', { message: 'WebSocket transport error' });
++    socket.onclose = () => {
++      clearInterval(this.keepAliveTimer);
++      this.keepAliveTimer = null;
++      this.#emit('status', { state: 'offline' });
++      if (!this.manualClose) this.#scheduleReconnect();
++    };
++  }
++
++  #onBytes(bytes) {
++    const combined = concatBytes(this.buffer, bytes);
++    const parsed = parsePackets(combined);
++    this.buffer = parsed.remainder;
++    for (const packetData of parsed.packets) {
++      if (packetData.type === 2) {
++        if (packetData.body.length < 2 || packetData.body[1] !== 0) {
++          const code = packetData.body[1] ?? -1;
++          this.#emit('error', { message: `MQTT connection rejected (${code})` });
++          this.socket?.close();
++          continue;
++        }
++        this.reconnectAttempt = 0;
++        this.#emit('status', { state: 'online' });
++        this.#startKeepAlive();
++        if (this.subscriptions.size) this.#sendSubscribe([...this.subscriptions]);
++      } else if (packetData.type === 3) {
++        try { this.#emit('message', decodePublish(packetData)); }
++        catch (error) { this.#emit('error', { message: error.message }); }
++      } else if (packetData.type === 9) {
++        this.#emit('subscribed', {});
++      }
++    }
++  }
++
++  #startKeepAlive() {
++    clearInterval(this.keepAliveTimer);
++    this.keepAliveTimer = setInterval(() => {
++      if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(new Uint8Array([0xc0, 0x00]));
++    }, Math.max(5000, this.options.keepAlive * 500));
++  }
++
++  #scheduleReconnect() {
++    const delay = Math.min(30000, 1000 * 2 ** Math.min(this.reconnectAttempt++, 5));
++    this.#emit('status', { state: 'reconnecting', delay });
++    this.reconnectTimer = setTimeout(() => this.#open(), delay);
++  }
++
++  subscribe(...topics) {
++    topics.flat().filter(Boolean).forEach(t => this.subscriptions.add(t));
++    if (this.socket?.readyState === WebSocket.OPEN) this.#sendSubscribe(topics.flat());
++  }
++
++  #sendSubscribe(topics) {
++    if (!topics.length) return;
++    this.packetId = this.packetId >= 65535 ? 1 : this.packetId + 1;
++    this.socket.send(encodeSubscribe(this.packetId, topics));
++  }
++
++  publish(topic, payload, retain = false) {
++    if (this.socket?.readyState !== WebSocket.OPEN) throw new Error('MQTT is not connected');
++    this.socket.send(encodePublish(topic, payload, retain));
++  }
++
++  disconnect() {
++    this.manualClose = true;
++    clearTimeout(this.reconnectTimer);
++    clearInterval(this.keepAliveTimer);
++    if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(new Uint8Array([0xe0, 0x00]));
++    this.socket?.close();
++    this.socket = null;
++  }
++}
+--- /dev/null
++++ equine_web_app_v1/package.json
+@@ -0,0 +1,10 @@
++{
++  "name": "equine-web-app",
++  "version": "0.1.0",
++  "private": true,
++  "type": "module",
++  "scripts": {
++    "test": "node --test tests/*.test.mjs",
++    "serve": "python3 -m http.server 8080"
++  }
++}
+--- /dev/null
++++ equine_web_app_v1/storage.js
+@@ -0,0 +1,60 @@
++const DB_NAME = 'equine-web-v1';
++const DB_VERSION = 1;
++const STORE = 'points';
++
++function openDb() {
++  return new Promise((resolve, reject) => {
++    const request = indexedDB.open(DB_NAME, DB_VERSION);
++    request.onupgradeneeded = () => {
++      const db = request.result;
++      const store = db.createObjectStore(STORE, { keyPath: 'point_id' });
++      store.createIndex('device_time', ['device_hash', 'effective_time_unix_ms']);
++    };
++    request.onsuccess = () => resolve(request.result);
++    request.onerror = () => reject(request.error);
++  });
++}
++
++export async function putPoint(point) {
++  const db = await openDb();
++  await new Promise((resolve, reject) => {
++    const tx = db.transaction(STORE, 'readwrite');
++    tx.objectStore(STORE).put(point);
++    tx.oncomplete = resolve;
++    tx.onerror = () => reject(tx.error);
++  });
++  db.close();
++}
++
++export async function listPoints(deviceHash, fromMs = 0, toMs = Number.MAX_SAFE_INTEGER) {
++  const db = await openDb();
++  const result = await new Promise((resolve, reject) => {
++    const tx = db.transaction(STORE, 'readonly');
++    const index = tx.objectStore(STORE).index('device_time');
++    const range = IDBKeyRange.bound([deviceHash, fromMs], [deviceHash, toMs]);
++    const request = index.getAll(range);
++    request.onsuccess = () => resolve(request.result);
++    request.onerror = () => reject(request.error);
++  });
++  db.close();
++  return result.sort((a, b) => a.effective_time_unix_ms - b.effective_time_unix_ms || a.seq - b.seq);
++}
++
++export async function clearPoints(deviceHash) {
++  const db = await openDb();
++  await new Promise((resolve, reject) => {
++    const tx = db.transaction(STORE, 'readwrite');
++    const index = tx.objectStore(STORE).index('device_time');
++    const range = IDBKeyRange.bound([deviceHash, 0], [deviceHash, Number.MAX_SAFE_INTEGER]);
++    const request = index.openKeyCursor(range);
++    request.onsuccess = () => {
++      const cursor = request.result;
++      if (!cursor) return;
++      tx.objectStore(STORE).delete(cursor.primaryKey);
++      cursor.continue();
++    };
++    tx.oncomplete = resolve;
++    tx.onerror = () => reject(tx.error);
++  });
++  db.close();
++}
+--- /dev/null
++++ equine_web_app_v1/styles.css
+@@ -0,0 +1 @@
++:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#edf4ec;background:#0d120e;color-scheme:dark;--panel:#151d16;--panel2:#1a241b;--line:#2b392d;--muted:#93a395;--accent:#9bdb7d;--warn:#ffc66d;--danger:#ff8a80}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 80% 0,#1c2a1f 0,transparent 36rem),#0d120e}header{display:flex;justify-content:space-between;align-items:center;padding:28px clamp(20px,4vw,56px) 18px;border-bottom:1px solid var(--line);position:sticky;top:0;background:rgba(13,18,14,.9);backdrop-filter:blur(16px);z-index:10}h1,h2,p{margin:0}h1{font-size:clamp(1.6rem,3vw,2.5rem);letter-spacing:-.04em}h2{font-size:1.05rem}.eyebrow{font-size:.67rem;letter-spacing:.18em;color:var(--accent);font-weight:800;margin-bottom:5px}.badge{border-radius:999px;padding:7px 12px;font-size:.75rem;font-weight:800}.badge.offline{background:#402122;color:#ffb7b2}.badge.online{background:#183722;color:#aaf092}.badge.connecting{background:#3b321b;color:#ffe09c}main{padding:24px clamp(16px,4vw,56px) 56px;max-width:1600px;margin:auto}.panel{background:linear-gradient(145deg,rgba(28,39,29,.96),rgba(19,27,20,.96));border:1px solid var(--line);border-radius:18px;box-shadow:0 18px 60px rgba(0,0,0,.18)}.connection-panel{padding:20px;margin-bottom:22px}.section-title{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:16px}.form-grid{display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:12px}label{display:grid;gap:7px;font-size:.72rem;color:var(--muted);font-weight:700}input,select,button{font:inherit}input,select{width:100%;border:1px solid var(--line);background:#101611;color:#f6fff4;border-radius:10px;padding:11px 12px;outline:none}input:focus,select:focus{border-color:var(--accent)}button{border:1px solid var(--line);background:#202d21;color:#edf4ec;border-radius:10px;padding:10px 14px;cursor:pointer;font-weight:750}button:hover{border-color:#59715d}.primary{background:var(--accent);color:#102011;border-color:transparent}.hint,.status-line{font-size:.75rem;color:var(--muted);margin-top:12px}.layout{display:grid;grid-template-columns:280px 1fr;gap:22px}.tracker-list-panel{padding:18px;height:max-content;position:sticky;top:112px}.tracker-list{display:grid;gap:9px}.tracker-card{display:grid;grid-template-columns:auto 1fr auto;align-items:center;text-align:left;gap:10px;width:100%;padding:12px;background:#111812}.tracker-card.active{border-color:var(--accent);background:#1f2e20}.tracker-card small{display:block;color:var(--muted);font-family:ui-monospace,monospace;font-size:.65rem;margin-top:3px}.tracker-age{font-size:.7rem;color:var(--muted)}.tracker-dot{width:9px;height:9px;border-radius:50%;background:var(--muted)}.tracker-card.fresh .tracker-dot{background:var(--accent);box-shadow:0 0 12px var(--accent)}.dashboard{display:grid;gap:22px;min-width:0}.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.stat{padding:18px;display:grid;gap:6px}.stat span,.stat small{color:var(--muted);font-size:.72rem}.stat strong{font-size:1.35rem}.map-panel,.events-panel{padding:18px}.actions{display:flex;gap:8px}.actions select{width:auto}#routeMap{width:100%;height:auto;min-height:320px;background:#101611;border:1px solid #243126;border-radius:14px}#gridLayer line{stroke:#1f2b21;stroke-width:1}#routeLine{fill:none;stroke:var(--accent);stroke-width:5;stroke-linecap:round;stroke-linejoin:round;filter:drop-shadow(0 0 5px rgba(155,219,125,.35))}#routeStart{fill:#f0c96b}#routeEnd{fill:var(--accent);stroke:#edf4ec;stroke-width:3}.map-footer{display:flex;justify-content:space-between;color:var(--muted);font-size:.72rem;margin-top:10px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:.78rem}th{text-align:left;color:var(--muted);font-size:.68rem;text-transform:uppercase;letter-spacing:.08em}th,td{padding:11px 8px;border-bottom:1px solid #263229;white-space:nowrap}td code{font-size:.7rem;color:#b6c7b8}@media(max-width:1000px){.form-grid{grid-template-columns:1fr 1fr}.layout{grid-template-columns:1fr}.tracker-list-panel{position:static}.stats-grid{grid-template-columns:1fr 1fr}}@media(max-width:600px){header{padding:18px 16px}.form-grid,.stats-grid{grid-template-columns:1fr}.section-title{align-items:flex-start}.actions{width:100%;flex-wrap:wrap}.map-panel .section-title{display:grid}.connection-panel,.map-panel,.events-panel,.tracker-list-panel{border-radius:14px}main{padding:16px}.map-footer{display:grid;gap:4px}}
+--- /dev/null
++++ equine_web_app_v1/sw.js
+@@ -0,0 +1,5 @@
++const CACHE='equine-web-v1';
++const ASSETS=['./','index.html','styles.css','app.js','mqtt.js','storage.js','manifest.webmanifest'];
++self.addEventListener('install',e=>e.waitUntil(caches.open(CACHE).then(c=>c.addAll(ASSETS))));
++self.addEventListener('activate',e=>e.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k))))));
++self.addEventListener('fetch',e=>{if(e.request.method==='GET')e.respondWith(caches.match(e.request).then(r=>r||fetch(e.request)));});
+--- /dev/null
++++ equine_web_app_v1/tests/mqtt_codec.test.mjs
+@@ -0,0 +1,28 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { encodeRemainingLength, decodeRemainingLength, encodeConnect, encodePublish, parsePackets, decodePublish } from '../mqtt.js';
++
++test('remaining length round trip', () => {
++  for (const value of [0, 1, 127, 128, 16383, 16384, 268435455]) {
++    const encoded = encodeRemainingLength(value);
++    const wrapped = new Uint8Array([0, ...encoded]);
++    const decoded = decodeRemainingLength(wrapped, 1);
++    assert.equal(decoded.value, value);
++    assert.equal(decoded.bytesUsed, encoded.length);
++  }
++});
++
++test('connect packet uses MQTT 3.1.1', () => {
++  const packet = encodeConnect({ clientId: 'test', username: 'u', password: 'p' });
++  assert.equal(packet[0], 0x10);
++  assert.ok(packet.includes(0x04));
++});
++
++test('publish packet round trip', () => {
++  const encoded = encodePublish('equine/v1/test', '{"ok":true}');
++  const parsed = parsePackets(encoded);
++  assert.equal(parsed.packets.length, 1);
++  const publish = decodePublish(parsed.packets[0]);
++  assert.equal(publish.topic, 'equine/v1/test');
++  assert.equal(publish.payload, '{"ok":true}');
++});
