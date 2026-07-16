@@ -45,6 +45,12 @@ tracker. Selecting a device also shows dashed red peer links that are currently
 below receiver sensitivity, labeled with their negative margin. Those overlays
 are deterministic diagnostics, not a prediction of field coverage.
 
+The map supports pan mode (plus middle/right mouse drag) and cursor-centred
+zooming with the wheel or the `+` / `−` controls. The current scenario and
+viewport are retained in browser local storage, so a browser refresh restores
+the map without sending data to a service. Browser site-data clearing removes
+that local state.
+
 ## Browser model
 
 | Boundary / behaviour | Implementation |

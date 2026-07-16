@@ -23,6 +23,7 @@
     <section class="map-column" aria-label="Simulation map">
       <div class="map-toolbar" aria-label="Map tools">
         <button type="button" class="tool active" data-tool="select">Select / move</button>
+        <button type="button" class="tool" data-tool="pan">Pan</button>
         <button type="button" class="tool" data-tool="waypoint">Waypoint</button>
         <span class="divider"></span>
         <button type="button" class="tool" data-tool="tracker">+ Tracker</button>
@@ -34,6 +35,9 @@
         <button type="button" class="tool" data-tool="building-large">+ Large building</button>
         <span class="divider"></span>
         <button id="locate" type="button">Use my location</button>
+        <button id="zoom-out" type="button">−</button>
+        <button id="zoom-in" type="button">+</button>
+        <button id="reset-view" type="button">Reset view</button>
       </div>
       <div class="map-wrap" id="map-wrap">
         <canvas id="map" aria-label="Map showing trackers, repeaters, receivers, obstacles and radio traffic"></canvas>

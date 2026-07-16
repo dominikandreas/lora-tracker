@@ -49,6 +49,12 @@ simulator service. Geographic positions shown in the inspector and route/link
 lengths use a great-circle (haversine) calculation. The underlying RF/obstacle
 model remains a local engineering model and is not terrain-aware.
 
+The map can be panned with the **Pan** tool (or middle/right mouse drag), and
+zoomed around the cursor with the wheel or the `+` / `−` controls. Both the
+viewport and the current scenario are stored in browser local storage, so the
+map and its entities return after a refresh. Storage is browser-local, contains
+no secrets and can be cleared with normal browser site-data controls.
+
 ## Inspection and replay
 
 Selecting a device exposes its modeled local state: sleep/radio status,

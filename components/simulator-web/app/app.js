@@ -1,6 +1,8 @@
 import { createDefaultScenario, radioDefaults, repeaterDefaults, trackerDefaults } from './default-scenario.js';
 import { exactDistanceM, geoPosition, isPolygonObstacle, pointInObstacle, pointInPolygon, polygonCenter } from './geometry.js';
 
+const SCENARIO_STORAGE_KEY = 'lora-tracker.network-lab.scenario.v2';
+const VIEW_STORAGE_KEY = 'lora-tracker.network-lab.view.v1';
 const worker = new Worker(new URL('./simulator-worker.js', import.meta.url), { type: 'module' });
 const canvas = document.querySelector('#map');
 const context = canvas.getContext('2d');
@@ -10,7 +12,7 @@ const form = document.querySelector('#device-form');
 const toast = document.querySelector('#toast');
 
 let snapshot;
-let initialScenario = createDefaultScenario();
+let initialScenario = loadStoredScenario() ?? createDefaultScenario();
 let selectedId = null;
 let pendingSelection = null;
 let tool = 'select';
@@ -24,6 +26,10 @@ let trackDeviceId = null;
 let trackTimeS = null;
 let archiveGatewayId = null;
 let archiveTrackerId = null;
+let panning = false;
+let panOrigin = null;
+let persistTimer;
+let view = loadStoredView();
 const satelliteTiles = new Map();
 const animations = [];
 const txOrigins = new Map();
@@ -31,6 +37,18 @@ const txOrigins = new Map();
 const $ = (selector) => document.querySelector(selector);
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const copy = (value) => JSON.parse(JSON.stringify(value));
+
+function loadStoredScenario() {
+  try { const value = JSON.parse(localStorage.getItem(SCENARIO_STORAGE_KEY)); return value?.schemaVersion === 2 ? value : null; } catch { return null; }
+}
+function loadStoredView() {
+  try { const value = JSON.parse(localStorage.getItem(VIEW_STORAGE_KEY)); return value && Number.isFinite(value.zoom) && Number.isFinite(value.panX) && Number.isFinite(value.panY) ? value : { zoom: 1, panX: 0, panY: 0 }; } catch { return { zoom: 1, panX: 0, panY: 0 }; }
+}
+function persistView() { try { localStorage.setItem(VIEW_STORAGE_KEY, JSON.stringify(view)); } catch { /* Private browsing may deny storage. */ } }
+function scheduleScenarioPersist(scenario) {
+  clearTimeout(persistTimer);
+  persistTimer = setTimeout(() => { try { localStorage.setItem(SCENARIO_STORAGE_KEY, JSON.stringify(scenario)); } catch { /* Storage is optional. */ } }, 250);
+}
 
 form.addEventListener('click', (event) => {
   const button = event.target.closest('[data-remove-waypoint]');
@@ -50,6 +68,7 @@ function post(type, payload = {}) { worker.postMessage({ type, ...payload }); }
 worker.onmessage = ({ data }) => {
   if (data.type === 'snapshot') {
     snapshot = data.snapshot;
+    scheduleScenarioPersist(snapshot.scenario);
     if (pendingSelection) { selectedId = pendingSelection; pendingSelection = null; }
     consumeAnimations(snapshot.events);
     updateStatus();
@@ -161,15 +180,17 @@ function renderEvents() {
 
 function worldPoint(event) {
   const rect = canvas.getBoundingClientRect();
+  const sx = rect.width / snapshot.scenario.world.widthM * view.zoom;
+  const sy = rect.height / snapshot.scenario.world.heightM * view.zoom;
   return {
-    x: clamp((event.clientX - rect.left) / rect.width * snapshot.scenario.world.widthM, 0, snapshot.scenario.world.widthM),
-    y: clamp((event.clientY - rect.top) / rect.height * snapshot.scenario.world.heightM, 0, snapshot.scenario.world.heightM),
+    x: clamp((event.clientX - rect.left - rect.width / 2 - view.panX) / sx + snapshot.scenario.world.widthM / 2, 0, snapshot.scenario.world.widthM),
+    y: clamp((event.clientY - rect.top - rect.height / 2 - view.panY) / sy + snapshot.scenario.world.heightM / 2, 0, snapshot.scenario.world.heightM),
   };
 }
 
 function hitTest(point) {
   let best = null;
-  let bestDistance = 28 * snapshot.scenario.world.widthM / canvas.clientWidth;
+  let bestDistance = 28 / (canvas.clientWidth / snapshot.scenario.world.widthM * view.zoom);
   for (const device of snapshot.devices) {
     const gap = Math.hypot(device.x - point.x, device.y - point.y);
     if (gap < bestDistance) { best = device.id; bestDistance = gap; }
@@ -184,11 +205,11 @@ function hitTest(point) {
 }
 
 function pointHit(point, target, radiusPx = 12) {
-  return Math.hypot(point.x - target.x, point.y - target.y) <= radiusPx * snapshot.scenario.world.widthM / canvas.clientWidth;
+  return Math.hypot(point.x - target.x, point.y - target.y) <= radiusPx / (canvas.clientWidth / snapshot.scenario.world.widthM * view.zoom);
 }
 
 function polygonEdgeHit(point, points) {
-  const threshold = 12 * snapshot.scenario.world.widthM / canvas.clientWidth;
+  const threshold = 12 / (canvas.clientWidth / snapshot.scenario.world.widthM * view.zoom);
   for (let index = 0; index < points.length; index += 1) {
     const a = points[index]; const b = points[(index + 1) % points.length];
     const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
@@ -203,6 +224,9 @@ function polygonEdgeHit(point, points) {
 
 canvas.addEventListener('pointerdown', (event) => {
   if (!snapshot) return;
+  if (tool === 'pan' || event.button === 1 || event.button === 2) {
+    panning = true; panOrigin = { x: event.clientX, y: event.clientY }; canvas.setPointerCapture(event.pointerId); return;
+  }
   const point = worldPoint(event);
   if (tool === 'select') {
     const selectedDevice = snapshot.devices.find((item) => item.id === selectedId && item.role === 'tracker');
@@ -236,6 +260,9 @@ canvas.addEventListener('pointerdown', (event) => {
 });
 
 canvas.addEventListener('pointermove', (event) => {
+  if (panning && panOrigin) {
+    view.panX += event.clientX - panOrigin.x; view.panY += event.clientY - panOrigin.y; panOrigin = { x: event.clientX, y: event.clientY }; persistView(); return;
+  }
   if (!dragging || !selectedId || !snapshot) return;
   const point = worldPoint(event);
   if (editTarget) {
@@ -253,6 +280,7 @@ canvas.addEventListener('pointermove', (event) => {
   device.x = point.x; device.y = point.y;
 });
 canvas.addEventListener('pointerup', (event) => {
+  if (panning) { panning = false; panOrigin = null; persistView(); return; }
   if (dragging && selectedId) {
     const point = worldPoint(event);
     if (editTarget?.kind === 'waypoint') post('update-waypoint', { id: editTarget.id, index: editTarget.index, point });
@@ -263,6 +291,23 @@ canvas.addEventListener('pointerup', (event) => {
   }
   dragging = false; editTarget = null;
 });
+canvas.addEventListener('contextmenu', (event) => event.preventDefault());
+function zoomMap(factor, clientX, clientY) {
+  if (!snapshot) return;
+  const rect = canvas.getBoundingClientRect();
+  const point = worldPoint({ clientX, clientY });
+  view.zoom = clamp(view.zoom * factor, .35, 8);
+  const sx = rect.width / snapshot.scenario.world.widthM * view.zoom;
+  const sy = rect.height / snapshot.scenario.world.heightM * view.zoom;
+  view.panX = clientX - rect.left - rect.width / 2 - (point.x - snapshot.scenario.world.widthM / 2) * sx;
+  view.panY = clientY - rect.top - rect.height / 2 - (point.y - snapshot.scenario.world.heightM / 2) * sy;
+  persistView();
+}
+canvas.addEventListener('wheel', (event) => {
+  if (!snapshot) return;
+  event.preventDefault();
+  zoomMap(event.deltaY < 0 ? 1.15 : 1 / 1.15, event.clientX, event.clientY);
+}, { passive: false });
 
 function nextId(prefix) {
   const all = [...snapshot.devices.map((item) => item.id), ...snapshot.scenario.obstacles.map((item) => item.id)];
@@ -300,7 +345,7 @@ document.querySelectorAll('.tool').forEach((button) => button.addEventListener('
 function setTool(value) {
   tool = value;
   document.querySelectorAll('.tool').forEach((button) => button.classList.toggle('active', button.dataset.tool === value));
-  canvas.style.cursor = value === 'select' ? 'default' : 'crosshair';
+  canvas.style.cursor = value === 'pan' ? 'grab' : value === 'select' ? 'default' : 'crosshair';
 }
 
 $('#play').addEventListener('click', () => post(playing ? 'pause' : 'play'));
@@ -308,6 +353,10 @@ $('#step').addEventListener('click', () => post('step', { seconds: 60 }));
 $('#speed').addEventListener('change', (event) => post('speed', { speed: Number(event.target.value) }));
 $('#reset').addEventListener('click', () => { knownEventId = 0; selectedId = null; post('reset', { scenario: initialScenario }); });
 $('#clear-log').addEventListener('click', () => { visibleAfterEventId = knownEventId; renderEvents(); });
+$('#reset-view').addEventListener('click', () => { view = { zoom: 1, panX: 0, panY: 0 }; persistView(); });
+for (const [selector, factor] of [['#zoom-in', 1.25], ['#zoom-out', .8]]) $(selector).addEventListener('click', () => {
+  const rect = canvas.getBoundingClientRect(); zoomMap(factor, rect.left + rect.width / 2, rect.top + rect.height / 2);
+});
 
 for (const [selector, path] of [['#day-temp', 'dayTemperatureC'], ['#night-temp', 'nightTemperatureC'], ['#day-humidity', 'dayHumidityPct'], ['#night-humidity', 'nightHumidityPct'], ['#wetness', 'foliageWetness']]) {
   $(selector).addEventListener('change', (event) => post('environment', { patch: { environment: { [path]: Number(event.target.value) } } }));
@@ -513,7 +562,7 @@ function drawSatelliteBackground(width, height, sx) {
   context.fillStyle = '#12251d'; context.fillRect(0, 0, width, height);
   for (let ty = tileY - radiusY; ty <= tileY + radiusY; ty += 1) for (let tx = tileX - radiusX; tx <= tileX + radiusX; tx += 1) {
     const image = satelliteTile(tx, ty, map.zoom);
-    if (image?.complete && image.naturalWidth) context.drawImage(image, width / 2 + (tx * 256 - centre.x) * scale, height / 2 + (ty * 256 - centre.y) * scale, 256 * scale, 256 * scale);
+    if (image?.complete && image.naturalWidth) context.drawImage(image, width / 2 + view.panX + (tx * 256 - centre.x) * scale, height / 2 + view.panY + (ty * 256 - centre.y) * scale, 256 * scale, 256 * scale);
   }
   return true;
 }
@@ -523,8 +572,9 @@ function draw() {
   if (!snapshot) return;
   const width = canvas.clientWidth; const height = canvas.clientHeight;
   const world = snapshot.scenario.world;
-  const sx = width / world.widthM; const sy = height / world.heightM;
-  const x = (value) => value * sx; const y = (value) => value * sy;
+  const sx = width / world.widthM * view.zoom; const sy = height / world.heightM * view.zoom;
+  const x = (value) => (value - world.widthM / 2) * sx + width / 2 + view.panX;
+  const y = (value) => (value - world.heightM / 2) * sy + height / 2 + view.panY;
   context.clearRect(0, 0, width, height);
   const satellite = drawSatelliteBackground(width, height, sx);
   if (!satellite) { context.fillStyle = '#0c1b16'; context.fillRect(0, 0, width, height); }

@@ -84,3 +84,25 @@ test('shows local device state and timeline/archive viewers', async ({ page }) =
   await expect(page.locator('#archive-gateway')).toHaveValue('gateway-1');
   await expect(page.locator('#archive-summary')).toContainText('committed');
 });
+
+test('pans, zooms and restores the map scenario after refresh', async ({ page }) => {
+  await page.goto('/');
+  await page.evaluate(() => localStorage.clear());
+  await page.reload();
+  await expect(page.locator('#core-status')).toContainText('WASM v1');
+  const box = await page.locator('#map').boundingBox();
+  await page.locator('#zoom-in').click();
+  await page.getByRole('button', { name: 'Pan' }).click();
+  await page.mouse.move(box.x + box.width * .5, box.y + box.height * .5);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width * .6, box.y + box.height * .55);
+  await page.mouse.up();
+  const view = await page.evaluate(() => JSON.parse(localStorage.getItem('lora-tracker.network-lab.view.v1')));
+  expect(view.zoom).toBeGreaterThan(1);
+  expect(Math.abs(view.panX)).toBeGreaterThan(1);
+  await page.locator('#map-latitude').fill('52.520008');
+  await page.locator('#map-latitude').press('Enter');
+  await page.waitForTimeout(350);
+  await page.reload();
+  await expect(page.locator('#map-latitude')).toHaveValue('52.520008');
+});
