@@ -275,12 +275,14 @@ inline bool validateEnvelope(const T& config, DeviceRole expected_role) {
     return false;
   }
 
-  T copy;
-  memcpy(&copy, &config, sizeof(copy));
-  const uint32_t expected_crc = copy.header.crc32;
-  copy.header.crc32 = 0;
-  return expected_crc == crc32(
-    reinterpret_cast<const uint8_t*>(&copy), sizeof(copy));
+  T* copy = new T();
+  memcpy(copy, &config, sizeof(T));
+  const uint32_t expected_crc = copy->header.crc32;
+  copy->header.crc32 = 0;
+  const bool is_valid = expected_crc == crc32(
+    reinterpret_cast<const uint8_t*>(copy), sizeof(T));
+  delete copy;
+  return is_valid;
 }
 
 inline bool validateTrackerConfig(const TrackerConfigV1& config) {

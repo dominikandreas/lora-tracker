@@ -11,6 +11,7 @@
 #include <stdarg.h>
 #include <time.h>
 #include <WebServer.h>
+#include <memory>
 #include "secrets.h"
 #include "equine_protocol.h"
 #include "equine_relay.h"
@@ -416,9 +417,19 @@ bool writeMqttCaCertificate(
   if (!trust.begin("lttrust", false)) return false;
   bool ok = true;
   if (update_backup) {
-    ok = trust.putString("mqtt_ca_bak", runtime_mqtt_ca_certificate) > 0;
+    if (runtime_mqtt_ca_certificate.isEmpty()) {
+      trust.remove("mqtt_ca_bak");
+    } else {
+      ok = trust.putString("mqtt_ca_bak", runtime_mqtt_ca_certificate) == runtime_mqtt_ca_certificate.length();
+    }
   }
-  if (ok) ok = trust.putString("mqtt_ca", certificate) > 0;
+  if (ok) {
+    if (certificate.isEmpty()) {
+      trust.remove("mqtt_ca");
+    } else {
+      ok = trust.putString("mqtt_ca", certificate) == certificate.length();
+    }
+  }
   trust.end();
   if (ok) runtime_mqtt_ca_certificate = certificate;
   return ok;
@@ -573,7 +584,7 @@ void clearGatewayConfigStorage() {
 
 
 bool commitGatewayConfigCandidate(
-    EquineConfig::GatewayConfigV1 candidate,
+    EquineConfig::GatewayConfigV1& candidate,
     bool mark_provisioned,
     char* error,
     size_t error_size,
@@ -603,10 +614,10 @@ bool commitGatewayConfigCandidate(
     snprintf(error, error_size, "failed to write MQTT CA certificate");
     return false;
   }
-  const EquineConfig::GatewayConfigV1 previous = gateway_config;
+  std::unique_ptr<EquineConfig::GatewayConfigV1> previous(new EquineConfig::GatewayConfigV1(gateway_config));
   gateway_config = candidate;
   if (!saveGatewayConfig(false)) {
-    gateway_config = previous;
+    gateway_config = *previous;
     writeMqttCaCertificate(previous_ca, false);
     snprintf(error, error_size, "failed to write active configuration");
     return false;
@@ -623,8 +634,8 @@ bool commitGatewayConfigCandidate(
 }
 
 bool rollbackGatewayConfig(char* error, size_t error_size) {
-  EquineConfig::GatewayConfigV1 backup{};
-  if (!readGatewayConfigBlob(EquineConfig::BACKUP_CONFIG_KEY, backup)) {
+  std::unique_ptr<EquineConfig::GatewayConfigV1> backup(new EquineConfig::GatewayConfigV1());
+  if (!readGatewayConfigBlob(EquineConfig::BACKUP_CONFIG_KEY, *backup)) {
     snprintf(error, error_size, "no valid rollback configuration");
     return false;
   }
@@ -634,7 +645,7 @@ bool rollbackGatewayConfig(char* error, size_t error_size) {
     return false;
   }
   return commitGatewayConfigCandidate(
-    backup, true, error, error_size, &backup_ca);
+    *backup, true, error, error_size, &backup_ca);
 }
 
 String gatewayConfigJson() {
@@ -709,7 +720,7 @@ String gatewayConfigJson() {
 
 bool applyGatewayWebPatch(EquineConfigApi::PatchStatus& status,
                           bool& reboot_requested) {
-  EquineConfig::GatewayConfigV1 candidate = gateway_config;
+  std::unique_ptr<EquineConfig::GatewayConfigV1> candidate(new EquineConfig::GatewayConfigV1(gateway_config));
   String mqtt_ca_candidate = runtime_mqtt_ca_certificate;
   uint32_t expected_revision = 0;
   bool has_revision = false;
@@ -754,7 +765,7 @@ bool applyGatewayWebPatch(EquineConfigApi::PatchStatus& status,
       continue;
     }
     const auto result = EquineConfigApi::applyGatewayField(
-      candidate, key, value, status);
+      *candidate, key, value, status);
     if (result == EquineConfigApi::FieldResult::UNKNOWN) {
       EquineConfigApi::setError(status, key, "unknown setting");
       return false;
@@ -783,7 +794,7 @@ bool applyGatewayWebPatch(EquineConfigApi::PatchStatus& status,
     return true;
   }
   return commitGatewayConfigCandidate(
-    candidate, true, status.error, sizeof(status.error), &mqtt_ca_candidate);
+    *candidate, true, status.error, sizeof(status.error), &mqtt_ca_candidate);
 }
 
 bool gatewayConfigWritesAllowed() {
@@ -1360,6 +1371,10 @@ void setupWebInterface() {
       html += "Wi-Fi password: <input type='password' name='wifi_password' value='__KEEP__'><br>";
       html += "MQTT host: <input name='mqtt_host' value='" + String(gateway_config.mqtt_host) + "'><br>";
       html += "MQTT port: <input name='mqtt_port' value='" + String(gateway_config.mqtt_port) + "'><br>";
+      html += "MQTT TLS: <select name='mqtt_tls_enabled'>";
+      html += "<option value='true'" + String(gateway_config.mqtt_tls_enabled ? " selected" : "") + ">Enabled</option>";
+      html += "<option value='false'" + String(!gateway_config.mqtt_tls_enabled ? " selected" : "") + ">Disabled</option>";
+      html += "</select><br>";
       html += "MQTT user: <input name='mqtt_username' value='" + String(gateway_config.mqtt_username) + "'><br>";
       html += "MQTT password: <input type='password' name='mqtt_password' value='__KEEP__'><br>";
       html += "MQTT root CA (PEM): <textarea name='mqtt_ca_certificate' rows='8' cols='48' placeholder='-----BEGIN CERTIFICATE----- ... -----END CERTIFICATE-----'>__KEEP__</textarea><br>";
@@ -1928,7 +1943,7 @@ void setup() {
   loadAllDedupStates();
 
   pinMode(USER_BTN_PIN, INPUT_PULLUP);
-  gateway_config_mode = gateway_onboarding_required;
+  gateway_config_mode = gateway_onboarding_required || postBootButtonRequestsGatewayConfig();
   setupGatewayNetwork();
 
   setupOTA();

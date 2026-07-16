@@ -1814,21 +1814,23 @@ void runWifiSetupMode() {
   wifi_client_connected = false;
   setTrackerPhase("WiFi setup");
 
-  // WiFi is only enabled in this bounded hard-boot setup window.
-  // Disabling modem sleep here improves association reliability; WiFi is
-  // completely shut down again before normal battery-powered tracking.
-  WiFi.persistent(false);
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.setTxPower(WIFI_POWER_8_5dBm);
-
-  String savedSsid = String(tracker_config.wifi_ssid);
-  String savedPw = String(tracker_config.wifi_password);
   ble_debug_enabled = tracker_config.ble_debug_enabled != 0;
 
   // Configuration BLE is available during an explicit setup/onboarding session
   // even when ordinary BLE debug logging is disabled.
+  // CRITICAL: Initialize BLE before WiFi on ESP32-S3 to prevent coex_enable panic.
   startBleDebugWindow(tracker_onboarding_required ? 600000UL : 120000UL, true);
+
+  // WiFi is only enabled in this bounded hard-boot setup window.
+  // WiFi modem sleep MUST be enabled when both WiFi and BLE are active,
+  // otherwise the ESP32-S3 Wi-Fi driver will explicitly abort.
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(true);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+
+  String savedSsid = String(tracker_config.wifi_ssid);
+  String savedPw = String(tracker_config.wifi_password);
 
   bool connected = false;
   if (savedSsid.length() > 0 && !tracker_onboarding_required) {
