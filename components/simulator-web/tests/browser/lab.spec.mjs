@@ -29,7 +29,7 @@ test('adds, places and configures a virtual tracker', async ({ page }) => {
   await power.press('Enter');
   await expect(page.locator('#toast')).toContainText('Germany radio profile');
   await expect(page.locator('[data-path="radio.txPowerDbm"]')).toHaveValue('14');
-  await page.getByRole('button', { name: 'Waypoint' }).click();
+  await page.getByRole('button', { name: 'Waypoint', exact: true }).click();
   await page.mouse.click(box.x + box.width * 0.7, box.y + box.height * 0.65);
   await expect(page.locator('#events')).toContainText('Waypoint added');
 });
@@ -105,4 +105,24 @@ test('pans, zooms and restores the map scenario after refresh', async ({ page })
   await page.waitForTimeout(350);
   await page.reload();
   await expect(page.locator('#map-latitude')).toHaveValue('52.520008');
+});
+
+test('grows the editable world beyond the initial crop and calibrates site loss', async ({ page }) => {
+  await page.goto('/');
+  await page.evaluate(() => localStorage.clear());
+  await page.reload();
+  const box = await page.locator('#map').boundingBox();
+  await page.getByRole('button', { name: 'Pan' }).click();
+  await page.mouse.move(box.x + box.width * .5, box.y + box.height * .5);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width * .05, box.y + box.height * .5);
+  await page.mouse.up();
+  await page.getByRole('button', { name: '+ Tree' }).click();
+  await page.mouse.click(box.x + box.width * .95, box.y + box.height * .5);
+  await page.waitForTimeout(300);
+  const scenario = await page.evaluate(() => JSON.parse(localStorage.getItem('lora-tracker.network-lab.scenario.v2')));
+  expect(scenario.world.widthM).toBeGreaterThan(1000);
+  await page.locator('#site-loss').fill('22');
+  await page.locator('#site-loss').press('Enter');
+  await expect(page.locator('#site-loss')).toHaveValue('22');
 });

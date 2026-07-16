@@ -51,6 +51,15 @@ viewport are retained in browser local storage, so a browser refresh restores
 the map without sending data to a service. Browser site-data clearing removes
 that local state.
 
+The editable local-metre world expands automatically when users place or move
+devices, waypoints and polygon points outside the old boundary. Its geographic
+anchor stays fixed so existing positions do not shift. Device inspectors expose
+the conducted TX-power setting (within the Germany profile) and installed
+antenna terms. The environment’s **Site loss dB** is a deliberate field
+calibration input for terrain, body attenuation, polarization and multipath;
+it is added to every link budget and is not a substitute for ERP compliance or
+site measurement.
+
 ## Browser model
 
 | Boundary / behaviour | Implementation |

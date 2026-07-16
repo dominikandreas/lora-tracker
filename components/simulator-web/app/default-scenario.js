@@ -52,13 +52,13 @@ export function createDefaultScenario() {
     schemaVersion: SCENARIO_VERSION,
     name: 'Forest edge relay',
     seed: 0x51a7c0de,
-    world: { widthM: 1000, heightM: 620, gridM: 50 },
-    map: { mode: 'grid', centerLat: 51.1657, centerLng: 10.4515, zoom: 17 },
+    world: { minXM: 0, minYM: 0, widthM: 1000, heightM: 620, gridM: 50 },
+    map: { mode: 'grid', centerLat: 51.1657, centerLng: 10.4515, zoom: 17, anchorX: 500, anchorY: 310 },
     clock: { startHour: 7, speed: 60 },
     environment: {
       dayTemperatureC: 24, nightTemperatureC: 10,
       dayHumidityPct: 48, nightHumidityPct: 88,
-      foliageWetness: 0.35,
+      foliageWetness: 0.35, siteLossDb: 0,
     },
     mqtt: { online: true, latencyMs: 350, archiveLatencyMs: 500 },
     devices: [

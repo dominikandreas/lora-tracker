@@ -23,8 +23,8 @@ export function pointInObstacle(point, obstacle) {
 export function geoPosition(scenario, point) {
   const map = scenario.map;
   if (!map || !Number.isFinite(map.centerLat) || !Number.isFinite(map.centerLng)) return null;
-  const originX = scenario.world.widthM / 2;
-  const originY = scenario.world.heightM / 2;
+  const originX = map.anchorX ?? (scenario.world.minXM ?? 0) + scenario.world.widthM / 2;
+  const originY = map.anchorY ?? (scenario.world.minYM ?? 0) + scenario.world.heightM / 2;
   const latitude = map.centerLat - (point.y - originY) / EARTH_RADIUS_M * 180 / Math.PI;
   const longitude = map.centerLng + (point.x - originX) /
     (EARTH_RADIUS_M * Math.cos(map.centerLat * Math.PI / 180)) * 180 / Math.PI;

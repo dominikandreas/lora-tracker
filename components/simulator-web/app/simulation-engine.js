@@ -82,17 +82,18 @@ export function calculateLink(scenario, core, from, to, timeS, frameKey = '') {
   const environment = environmentAt(scenario, timeS);
   const obstacles = obstacleLossDb(scenario, from, to, environment);
   const atmosphereLoss = rangeM / 1000 * (0.0002 + environment.humidityPct * 0.000004);
+  const siteLossDb = scenario.environment.siteLossDb ?? 0;
   const fadeHash = hashText(`${scenario.seed}:${frameKey}:${to.id}`);
   const fadingDb = (fadeHash / 0xffffffff - 0.5) * 8;
   const rxPowerDbm = from.radio.txPowerDbm + from.antennaGainDbi - from.cableLossDb +
     to.antennaGainDbi - to.cableLossDb - freeSpaceLoss - excessGroundLoss +
-    heightBenefitDb - obstacles.total - atmosphereLoss + fadingDb;
+    heightBenefitDb - obstacles.total - atmosphereLoss - siteLossDb + fadingDb;
   const temperaturePenalty = Math.max(0, environment.temperatureC - 20) * 0.025;
   const sensitivityDbm = core.sensitivityDbm(to.radio) + temperaturePenalty;
   return {
     rangeM, rxPowerDbm, sensitivityDbm,
     marginDb: rxPowerDbm - sensitivityDbm,
-    freeSpaceLoss, excessGroundLoss, heightBenefitDb, atmosphereLoss, fadingDb,
+    freeSpaceLoss, excessGroundLoss, heightBenefitDb, atmosphereLoss, siteLossDb, fadingDb,
     ...obstacles,
   };
 }
@@ -101,6 +102,8 @@ export async function validateScenario(scenario, core) {
   const errors = [];
   if (scenario.schemaVersion !== SCENARIO_VERSION) errors.push('Unsupported scenario schema');
   const world = scenario.world ?? {};
+  const minXM = world.minXM ?? 0; const minYM = world.minYM ?? 0;
+  const maxXM = minXM + world.widthM; const maxYM = minYM + world.heightM;
   if (world.widthM < 100 || world.heightM < 100) {
     errors.push('World must be at least 100 m by 100 m');
   }
@@ -110,7 +113,7 @@ export async function validateScenario(scenario, core) {
   const environment = scenario.environment ?? {};
   if (![environment.dayTemperatureC, environment.nightTemperatureC].every((value) => value >= -30 && value <= 60) ||
       ![environment.dayHumidityPct, environment.nightHumidityPct].every((value) => value >= 0 && value <= 100) ||
-      !(environment.foliageWetness >= 0 && environment.foliageWetness <= 1)) errors.push('Environment values are outside supported bounds');
+      !(environment.foliageWetness >= 0 && environment.foliageWetness <= 1) || !((environment.siteLossDb ?? 0) >= 0 && (environment.siteLossDb ?? 0) <= 80)) errors.push('Environment values are outside supported bounds');
   if (!scenario.mqtt || ![scenario.mqtt.latencyMs, scenario.mqtt.archiveLatencyMs].every((value) => value >= 0 && value <= 60000)) {
     errors.push('MQTT latency must be between 0 and 60000 ms');
   }
@@ -130,7 +133,7 @@ export async function validateScenario(scenario, core) {
     if (installedEirp > 16.15 + 1e-6) errors.push(`${device.id} exceeds 14 dBm ERP (16.15 dBm EIRP)`);
     if (device.radio.relayHopLimit < 0 || device.radio.relayHopLimit > 4) errors.push(`${device.id} has an invalid hop limit`);
     if (!Number.isFinite(device.x) || !Number.isFinite(device.y) || device.x < 0 || device.y < 0 ||
-        device.x > world.widthM || device.y > world.heightM) errors.push(`${device.id} is outside the world`);
+        device.x > maxXM || device.y > maxYM || device.x < minXM || device.y < minYM) errors.push(`${device.id} is outside the world`);
     if (!(device.antennaHeightM > 0 && device.antennaHeightM <= 100) ||
         !Number.isFinite(device.antennaGainDbi) || !Number.isFinite(device.cableLossDb)) errors.push(`${device.id} has invalid antenna properties`);
     if (device.role === 'tracker') {
@@ -177,7 +180,7 @@ export async function validateScenario(scenario, core) {
     if (!['forest', 'tree', 'building-small', 'building-large'].includes(obstacle.type)) errors.push(`${obstacle.id} has an invalid obstacle type`);
     if (obstacle.type === 'tree' && !(obstacle.radius > 0 && obstacle.radius <= 100)) errors.push(`${obstacle.id} has an invalid radius`);
     if (obstacle.type !== 'tree' && (!Array.isArray(obstacle.points) || obstacle.points.length < 3 ||
-        obstacle.points.some((point) => !Number.isFinite(point.x) || !Number.isFinite(point.y) || point.x < 0 || point.y < 0 || point.x > world.widthM || point.y > world.heightM))) errors.push(`${obstacle.id} has an invalid polygon`);
+        obstacle.points.some((point) => !Number.isFinite(point.x) || !Number.isFinite(point.y) || point.x < minXM || point.y < minYM || point.x > maxXM || point.y > maxYM))) errors.push(`${obstacle.id} has an invalid polygon`);
     if (obstacle.type === 'forest' && !(obstacle.density >= 0 && obstacle.density <= 1)) errors.push(`${obstacle.id} has invalid density`);
   }
   if (!(scenario.devices ?? []).some((d) => d.role === 'receiver')) errors.push('At least one receiver is required');
@@ -251,6 +254,7 @@ export class SimulationEngine {
     if (patch.mqtt) Object.assign(this.scenario.mqtt, patch.mqtt);
     if (patch.clock) Object.assign(this.scenario.clock, patch.clock);
     if (patch.map) Object.assign(this.scenario.map, patch.map);
+    if (patch.world) Object.assign(this.scenario.world, patch.world);
   }
 
   replaceScenario(scenario) {

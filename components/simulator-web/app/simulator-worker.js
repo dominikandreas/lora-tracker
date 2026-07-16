@@ -10,7 +10,36 @@ let speed = 60;
 function send(type, payload = {}) { self.postMessage({ type, ...payload }); }
 function snapshot() { send('snapshot', { snapshot: engine.snapshot() }); }
 
+function normalizeScenario(scenario) {
+  scenario.world.minXM ??= 0; scenario.world.minYM ??= 0;
+  scenario.map.anchorX ??= scenario.world.minXM + scenario.world.widthM / 2;
+  scenario.map.anchorY ??= scenario.world.minYM + scenario.world.heightM / 2;
+  scenario.environment.siteLossDb ??= 0;
+  return scenario;
+}
+
+function expandWorldForScenario(scenario) {
+  const world = scenario.world;
+  let minX = world.minXM ?? 0; let minY = world.minYM ?? 0;
+  let maxX = minX + world.widthM; let maxY = minY + world.heightM;
+  const include = (point, margin = 0) => {
+    minX = Math.min(minX, point.x - margin); minY = Math.min(minY, point.y - margin);
+    maxX = Math.max(maxX, point.x + margin); maxY = Math.max(maxY, point.y + margin);
+  };
+  for (const device of scenario.devices) { include(device); for (const point of device.waypoints ?? []) include(point); }
+  for (const obstacle of scenario.obstacles) {
+    if (obstacle.type === 'tree') include(obstacle, obstacle.radius ?? 0);
+    else for (const point of obstacle.points ?? []) include(point);
+  }
+  const grid = Math.max(1, world.gridM ?? 50);
+  world.minXM = Math.floor(minX / grid) * grid;
+  world.minYM = Math.floor(minY / grid) * grid;
+  world.widthM = Math.ceil((maxX - world.minXM) / grid) * grid;
+  world.heightM = Math.ceil((maxY - world.minYM) / grid) * grid;
+}
+
 async function initialize(scenario = createDefaultScenario()) {
+  scenario = normalizeScenario(scenario);
   core ??= await FirmwareCore.load();
   const errors = await validateScenario(scenario, core);
   if (errors.length) throw new Error(errors.join('; '));
@@ -23,8 +52,10 @@ async function initialize(scenario = createDefaultScenario()) {
 async function requireValidMutation(mutate) {
   const candidate = engine.snapshot().scenario;
   mutate(candidate);
+  expandWorldForScenario(candidate);
   const errors = await validateScenario(candidate, core);
   if (errors.length) throw new Error(errors.join('; '));
+  engine.updateScenario({ world: candidate.world });
 }
 
 function stop() {

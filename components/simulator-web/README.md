@@ -55,6 +55,16 @@ viewport and the current scenario are stored in browser local storage, so the
 map and its entities return after a refresh. Storage is browser-local, contains
 no secrets and can be cleared with normal browser site-data controls.
 
+The editable metre world grows automatically when an entity, waypoint or
+polygon is placed beyond its previous boundary; the geographic anchor remains
+fixed, so existing coordinates do not drift. Each device inspector exposes
+**TX power (dBm conducted)** (2–14 dBm for the German profile), alongside
+antenna gain and cable loss; the resulting installation is still checked
+against the 14 dBm ERP limit. For field calibration, **Site loss dB** adds a
+measured terrain/body/polarization/multipath penalty to every link. It is the
+appropriate control when real range is materially shorter than the simplified
+free-space model; it does not alter regulatory limits.
+
 ## Inspection and replay
 
 Selecting a device exposes its modeled local state: sleep/radio status,

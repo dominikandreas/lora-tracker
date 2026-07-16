@@ -32,6 +32,16 @@ test('day and night conditions change wet foliage loss without inventing large a
   assert.ok(wetLink.atmosphereLoss < 0.01);
 });
 
+test('site loss calibration reduces a link budget by the configured measured margin', () => {
+  const core = new ReferenceCore();
+  const scenario = createDefaultScenario();
+  const baseline = calculateLink(scenario, core, scenario.devices[0], scenario.devices[2], 0, 'calibration');
+  scenario.environment.siteLossDb = 22;
+  const calibrated = calculateLink(scenario, core, scenario.devices[0], scenario.devices[2], 0, 'calibration');
+  assert.equal(calibrated.siteLossDb, 22);
+  assert.ok(Math.abs(calibrated.marginDb - baseline.marginDb + 22) < 1e-9);
+});
+
 test('fixed seed produces an identical event trace', () => {
   const core = new ReferenceCore();
   const first = new SimulationEngine(createDefaultScenario(), core);

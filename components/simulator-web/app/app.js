@@ -39,7 +39,15 @@ const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const copy = (value) => JSON.parse(JSON.stringify(value));
 
 function loadStoredScenario() {
-  try { const value = JSON.parse(localStorage.getItem(SCENARIO_STORAGE_KEY)); return value?.schemaVersion === 2 ? value : null; } catch { return null; }
+  try {
+    const value = JSON.parse(localStorage.getItem(SCENARIO_STORAGE_KEY));
+    if (value?.schemaVersion !== 2) return null;
+    value.world.minXM ??= 0; value.world.minYM ??= 0;
+    value.map.anchorX ??= value.world.minXM + value.world.widthM / 2;
+    value.map.anchorY ??= value.world.minYM + value.world.heightM / 2;
+    value.environment.siteLossDb ??= 0;
+    return value;
+  } catch { return null; }
 }
 function loadStoredView() {
   try { const value = JSON.parse(localStorage.getItem(VIEW_STORAGE_KEY)); return value && Number.isFinite(value.zoom) && Number.isFinite(value.panX) && Number.isFinite(value.panY) ? value : { zoom: 1, panX: 0, panY: 0 }; } catch { return { zoom: 1, panX: 0, panY: 0 }; }
@@ -49,13 +57,6 @@ function scheduleScenarioPersist(scenario) {
   clearTimeout(persistTimer);
   persistTimer = setTimeout(() => { try { localStorage.setItem(SCENARIO_STORAGE_KEY, JSON.stringify(scenario)); } catch { /* Storage is optional. */ } }, 250);
 }
-
-form.addEventListener('click', (event) => {
-  const button = event.target.closest('[data-remove-waypoint]');
-  if (!button || !selectedId) return;
-  event.preventDefault();
-  post('remove-waypoint', { id: selectedId, index: Number(button.dataset.removeWaypoint) });
-});
 
 function notify(message) {
   toast.textContent = message;
@@ -131,7 +132,7 @@ function updateStatus() {
   const e = snapshot.scenario.environment;
   setValue('#day-temp', e.dayTemperatureC); setValue('#night-temp', e.nightTemperatureC);
   setValue('#day-humidity', e.dayHumidityPct); setValue('#night-humidity', e.nightHumidityPct);
-  setValue('#wetness', e.foliageWetness); $('#mqtt-online').checked = snapshot.mqtt.online;
+  setValue('#wetness', e.foliageWetness); setValue('#site-loss', e.siteLossDb ?? 0); $('#mqtt-online').checked = snapshot.mqtt.online;
   setValue('#mqtt-latency', snapshot.mqtt.latencyMs);
   setValue('#archive-latency', snapshot.mqtt.archiveLatencyMs);
   const map = snapshot.scenario.map;
@@ -182,9 +183,11 @@ function worldPoint(event) {
   const rect = canvas.getBoundingClientRect();
   const sx = rect.width / snapshot.scenario.world.widthM * view.zoom;
   const sy = rect.height / snapshot.scenario.world.heightM * view.zoom;
+  const centerX = (snapshot.scenario.world.minXM ?? 0) + snapshot.scenario.world.widthM / 2;
+  const centerY = (snapshot.scenario.world.minYM ?? 0) + snapshot.scenario.world.heightM / 2;
   return {
-    x: clamp((event.clientX - rect.left - rect.width / 2 - view.panX) / sx + snapshot.scenario.world.widthM / 2, 0, snapshot.scenario.world.widthM),
-    y: clamp((event.clientY - rect.top - rect.height / 2 - view.panY) / sy + snapshot.scenario.world.heightM / 2, 0, snapshot.scenario.world.heightM),
+    x: (event.clientX - rect.left - rect.width / 2 - view.panX) / sx + centerX,
+    y: (event.clientY - rect.top - rect.height / 2 - view.panY) / sy + centerY,
   };
 }
 
@@ -299,8 +302,10 @@ function zoomMap(factor, clientX, clientY) {
   view.zoom = clamp(view.zoom * factor, .35, 8);
   const sx = rect.width / snapshot.scenario.world.widthM * view.zoom;
   const sy = rect.height / snapshot.scenario.world.heightM * view.zoom;
-  view.panX = clientX - rect.left - rect.width / 2 - (point.x - snapshot.scenario.world.widthM / 2) * sx;
-  view.panY = clientY - rect.top - rect.height / 2 - (point.y - snapshot.scenario.world.heightM / 2) * sy;
+  const centerX = (snapshot.scenario.world.minXM ?? 0) + snapshot.scenario.world.widthM / 2;
+  const centerY = (snapshot.scenario.world.minYM ?? 0) + snapshot.scenario.world.heightM / 2;
+  view.panX = clientX - rect.left - rect.width / 2 - (point.x - centerX) * sx;
+  view.panY = clientY - rect.top - rect.height / 2 - (point.y - centerY) * sy;
   persistView();
 }
 canvas.addEventListener('wheel', (event) => {
@@ -358,7 +363,7 @@ for (const [selector, factor] of [['#zoom-in', 1.25], ['#zoom-out', .8]]) $(sele
   const rect = canvas.getBoundingClientRect(); zoomMap(factor, rect.left + rect.width / 2, rect.top + rect.height / 2);
 });
 
-for (const [selector, path] of [['#day-temp', 'dayTemperatureC'], ['#night-temp', 'nightTemperatureC'], ['#day-humidity', 'dayHumidityPct'], ['#night-humidity', 'nightHumidityPct'], ['#wetness', 'foliageWetness']]) {
+for (const [selector, path] of [['#day-temp', 'dayTemperatureC'], ['#night-temp', 'nightTemperatureC'], ['#day-humidity', 'dayHumidityPct'], ['#night-humidity', 'nightHumidityPct'], ['#wetness', 'foliageWetness'], ['#site-loss', 'siteLossDb']]) {
   $(selector).addEventListener('change', (event) => post('environment', { patch: { environment: { [path]: Number(event.target.value) } } }));
 }
 $('#mqtt-online').addEventListener('change', (event) => post('environment', { patch: { mqtt: { online: event.target.checked } } }));
@@ -406,7 +411,7 @@ function field(label, path, value, options = {}) {
   const wide = options.wide ? 'wide' : '';
   if (type === 'checkbox') return `<label class="switch ${wide}"><input data-path="${path}" type="checkbox" ${value ? 'checked' : ''}><span>${label}</span></label>`;
   if (type === 'select') return `<label class="${wide}">${label}<select data-path="${path}">${options.values.map((item) => `<option value="${item}" ${item === value ? 'selected' : ''}>${item}</option>`).join('')}</select></label>`;
-  return `<label class="${wide}">${label}<input data-path="${path}" type="${type}" value="${escapeHtml(Array.isArray(value) ? value.join(', ') : value)}" ${options.step ? `step="${options.step}"` : ''}></label>`;
+  return `<label class="${wide}">${label}<input data-path="${path}" type="${type}" value="${escapeHtml(Array.isArray(value) ? value.join(', ') : value)}" ${options.step ? `step="${options.step}"` : ''} ${options.min !== undefined ? `min="${options.min}"` : ''} ${options.max !== undefined ? `max="${options.max}"` : ''}></label>`;
 }
 
 function renderInspector() {
@@ -421,7 +426,7 @@ function renderInspector() {
   if (entity.role) renderLocalState(entity);
   const locationPoint = entity.role || entity.type === 'tree' ? entity : polygonCenter(entity.points);
   const location = geoPosition(snapshot.scenario, locationPoint);
-  if (location) form.insertAdjacentHTML('beforeend', `<div class="wide point-location">Map point ${location.latitude.toFixed(6)}, ${location.longitude.toFixed(6)} · ${exactDistanceM(snapshot.scenario, locationPoint, { x: snapshot.scenario.world.widthM / 2, y: snapshot.scenario.world.heightM / 2 }).toFixed(1)} m from map centre</div><button class="remove-entity wide" type="button" id="remove-entity">Remove ${escapeHtml(entity.name ?? entity.label ?? entity.id)}</button>`);
+  if (location) form.insertAdjacentHTML('beforeend', `<div class="wide point-location">Map point ${location.latitude.toFixed(6)}, ${location.longitude.toFixed(6)} · ${exactDistanceM(snapshot.scenario, locationPoint, { x: snapshot.scenario.map.anchorX, y: snapshot.scenario.map.anchorY }).toFixed(1)} m from map centre</div><button class="remove-entity wide" type="button" id="remove-entity">Remove ${escapeHtml(entity.name ?? entity.label ?? entity.id)}</button>`);
   $('#remove-entity')?.addEventListener('click', () => {
     if (entity.role === 'receiver' && snapshot.devices.filter((item) => item.role === 'receiver').length <= 1) return notify('A scenario needs at least one receiver');
     selectedId = null; post('remove-entity', { id: entity.id });
@@ -430,7 +435,7 @@ function renderInspector() {
   if (latestLink) {
     const link = latestLink.link;
     $('#link-detail').hidden = false;
-    $('#link-detail').innerHTML = `<strong>Latest link budget</strong><br>${link.rangeM.toFixed(0)} m · ${link.rxPowerDbm.toFixed(1)} dBm received · ${link.marginDb.toFixed(1)} dB margin<br>Free space ${link.freeSpaceLoss.toFixed(1)} dB · ground ${link.excessGroundLoss.toFixed(1)} dB · height ${link.heightBenefitDb.toFixed(1)} dB benefit · forest ${link.forestLoss.toFixed(1)} dB · buildings ${link.buildingLoss.toFixed(1)} dB · trees ${link.treeLoss.toFixed(1)} dB · seeded fading ${link.fadingDb.toFixed(1)} dB · atmosphere ${link.atmosphereLoss.toFixed(4)} dB`;
+    $('#link-detail').innerHTML = `<strong>Latest link budget</strong><br>${link.rangeM.toFixed(0)} m · ${link.rxPowerDbm.toFixed(1)} dBm received · ${link.marginDb.toFixed(1)} dB margin<br>Free space ${link.freeSpaceLoss.toFixed(1)} dB · ground ${link.excessGroundLoss.toFixed(1)} dB · height ${link.heightBenefitDb.toFixed(1)} dB benefit · forest ${link.forestLoss.toFixed(1)} dB · buildings ${link.buildingLoss.toFixed(1)} dB · trees ${link.treeLoss.toFixed(1)} dB · site calibration ${link.siteLossDb.toFixed(1)} dB · seeded fading ${link.fadingDb.toFixed(1)} dB · atmosphere ${link.atmosphereLoss.toFixed(4)} dB`;
   } else $('#link-detail').hidden = true;
 }
 
@@ -460,7 +465,7 @@ function renderDeviceForm(device) {
     field('Name', 'name', device.name, { type: 'text', wide: true }) + field('X (m)', 'x', device.x, { step: '.1' }) + field('Y (m)', 'y', device.y, { step: '.1' }) +
     field('Antenna height (m)', 'antennaHeightM', device.antennaHeightM, { step: '.1' }) + field('Antenna gain (dBi)', 'antennaGainDbi', device.antennaGainDbi, { step: '.1' }) + field('Cable loss (dB)', 'cableLossDb', device.cableLossDb, { step: '.1' });
   html += '<h3>LoRa radio · Germany 868 MHz</h3>' + field('Frequency (Hz)', 'radio.frequencyHz', radio.frequencyHz) + field('Bandwidth (Hz)', 'radio.bandwidthHz', radio.bandwidthHz) +
-    field('Conducted power (dBm)', 'radio.txPowerDbm', radio.txPowerDbm) + field('Spreading factor', 'radio.spreadingFactor', radio.spreadingFactor) +
+    field('TX power (dBm conducted)', 'radio.txPowerDbm', radio.txPowerDbm, { min: 2, max: 14 }) + field('Spreading factor', 'radio.spreadingFactor', radio.spreadingFactor) +
     field('Coding denominator', 'radio.codingRateDenominator', radio.codingRateDenominator) + field('Preamble symbols', 'radio.preambleSymbols', radio.preambleSymbols) +
     field('Sync word', 'radio.syncWord', radio.syncWord) + field('Relay hop limit', 'radio.relayHopLimit', radio.relayHopLimit);
   if (device.role === 'tracker') {
@@ -476,7 +481,7 @@ function renderDeviceForm(device) {
       field('Capacity (mAh)', 'config.batteryCapacityMah', c.batteryCapacityMah) + field('Sleep current (mA)', 'config.sleepCurrentMa', c.sleepCurrentMa, { step: '.1' }) +
       field('GNSS current (mA)', 'config.gnssCurrentMa', c.gnssCurrentMa, { step: '.1' }) + field('TX current (mA)', 'config.txCurrentMa', c.txCurrentMa, { step: '.1' });
     const routeDistance = device.waypoints.reduce((total, waypoint, index) => index ? total + exactDistanceM(snapshot.scenario, device.waypoints[index - 1], waypoint) : total, 0) + (device.pathMode === 'loop' && device.waypoints.length > 1 ? exactDistanceM(snapshot.scenario, device.waypoints.at(-1), device.waypoints[0]) : 0);
-    html += `<h3>Waypoints · ${routeDistance.toFixed(1)} m route</h3><div class="waypoint-list wide">${device.waypoints.map((point, index) => `<span>${index + 1}. ${point.x.toFixed(1)}, ${point.y.toFixed(1)} <button type="button" data-remove-waypoint="${index}" ${device.waypoints.length <= 1 ? 'disabled' : ''}>Remove</button></span>`).join('')}</div>`;
+    html += `<h3>Waypoints · ${routeDistance.toFixed(1)} m route</h3><div class="waypoint-list wide">${device.waypoints.map((point, index) => `<span>${index + 1}. ${point.x.toFixed(1)}, ${point.y.toFixed(1)} <button type="button" data-remove-waypoint="${index}" aria-label="Remove waypoint ${index + 1}" ${device.waypoints.length <= 1 ? 'disabled' : ''}>Remove waypoint</button></span>`).join('')}</div>`;
     $('#selection-status').textContent = `${device.batteryPct.toFixed(1)}% · queue ${device.runtime.queue.length}`;
   } else if (device.role === 'repeater') {
     const c = device.config;
@@ -489,6 +494,10 @@ function renderDeviceForm(device) {
   }
   form.innerHTML = html;
   bindForm(device);
+  form.querySelectorAll('[data-remove-waypoint]').forEach((button) => button.addEventListener('click', (event) => {
+    event.preventDefault(); event.stopPropagation();
+    post('remove-waypoint', { id: device.id, index: Number(button.dataset.removeWaypoint) });
+  }));
 }
 
 function renderObstacleForm(obstacle) {
@@ -550,7 +559,7 @@ function satelliteTile(xTile, yTile, zoom) {
   return satelliteTiles.get(key);
 }
 
-function drawSatelliteBackground(width, height, sx) {
+function drawSatelliteBackground(width, height, sx, x, y) {
   const map = snapshot.scenario.map;
   if (map.mode !== 'satellite') return false;
   const centre = mercatorPixel(map.centerLat, map.centerLng, map.zoom);
@@ -562,7 +571,7 @@ function drawSatelliteBackground(width, height, sx) {
   context.fillStyle = '#12251d'; context.fillRect(0, 0, width, height);
   for (let ty = tileY - radiusY; ty <= tileY + radiusY; ty += 1) for (let tx = tileX - radiusX; tx <= tileX + radiusX; tx += 1) {
     const image = satelliteTile(tx, ty, map.zoom);
-    if (image?.complete && image.naturalWidth) context.drawImage(image, width / 2 + view.panX + (tx * 256 - centre.x) * scale, height / 2 + view.panY + (ty * 256 - centre.y) * scale, 256 * scale, 256 * scale);
+    if (image?.complete && image.naturalWidth) context.drawImage(image, x(map.anchorX) + (tx * 256 - centre.x) * scale, y(map.anchorY) + (ty * 256 - centre.y) * scale, 256 * scale, 256 * scale);
   }
   return true;
 }
@@ -573,15 +582,17 @@ function draw() {
   const width = canvas.clientWidth; const height = canvas.clientHeight;
   const world = snapshot.scenario.world;
   const sx = width / world.widthM * view.zoom; const sy = height / world.heightM * view.zoom;
-  const x = (value) => (value - world.widthM / 2) * sx + width / 2 + view.panX;
-  const y = (value) => (value - world.heightM / 2) * sy + height / 2 + view.panY;
+  const centerX = (world.minXM ?? 0) + world.widthM / 2; const centerY = (world.minYM ?? 0) + world.heightM / 2;
+  const x = (value) => (value - centerX) * sx + width / 2 + view.panX;
+  const y = (value) => (value - centerY) * sy + height / 2 + view.panY;
   context.clearRect(0, 0, width, height);
-  const satellite = drawSatelliteBackground(width, height, sx);
+  const satellite = drawSatelliteBackground(width, height, sx, x, y);
   if (!satellite) { context.fillStyle = '#0c1b16'; context.fillRect(0, 0, width, height); }
   if (backgroundImage) { context.globalAlpha = .28; context.drawImage(backgroundImage, 0, 0, width, height); context.globalAlpha = 1; }
   context.strokeStyle = satellite ? 'rgba(237,246,242,.16)' : 'rgba(116,153,139,.12)'; context.lineWidth = 1;
-  for (let gx = 0; gx <= world.widthM; gx += world.gridM) { context.beginPath(); context.moveTo(x(gx), 0); context.lineTo(x(gx), height); context.stroke(); }
-  for (let gy = 0; gy <= world.heightM; gy += world.gridM) { context.beginPath(); context.moveTo(0, y(gy)); context.lineTo(width, y(gy)); context.stroke(); }
+  const minX = world.minXM ?? 0; const minY = world.minYM ?? 0;
+  for (let gx = Math.floor(minX / world.gridM) * world.gridM; gx <= minX + world.widthM; gx += world.gridM) { context.beginPath(); context.moveTo(x(gx), 0); context.lineTo(x(gx), height); context.stroke(); }
+  for (let gy = Math.floor(minY / world.gridM) * world.gridM; gy <= minY + world.heightM; gy += world.gridM) { context.beginPath(); context.moveTo(0, y(gy)); context.lineTo(width, y(gy)); context.stroke(); }
 
   for (const obstacle of snapshot.scenario.obstacles) drawObstacle(obstacle, x, y, sx, sy);
   drawHistoryOverlays(x, y);
