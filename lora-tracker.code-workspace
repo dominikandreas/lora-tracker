@@ -2,7 +2,8 @@
   "folders": [
     { "path": "." },
     { "path": "components/tracker-firmware" },
-    { "path": "components/gateway-firmware" }
+    { "path": "components/gateway-firmware" },
+    { "path": "components/repeater-firmware" }
   ],
   "settings": {
     "platformio-ide.useBuiltinPIOCore": true

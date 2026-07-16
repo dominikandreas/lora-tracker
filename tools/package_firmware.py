@@ -42,6 +42,26 @@ TARGETS = {
         "flash_freq": "40m",
         "flash_size": "8MB",
     },
+    "repeater-heltec-lora32": {
+        "project": "repeater-firmware",
+        "environment": "heltec_wifi_lora_32_v2",
+        "chip": "esp32",
+        "chip_family": "ESP32",
+        "bootloader_offset": "0x1000",
+        "flash_mode": "dio",
+        "flash_freq": "40m",
+        "flash_size": "8MB",
+    },
+    "repeater-wireless-tracker": {
+        "project": "repeater-firmware",
+        "environment": "heltec_wireless_tracker",
+        "chip": "esp32s3",
+        "chip_family": "ESP32-S3",
+        "bootloader_offset": "0x0",
+        "flash_mode": "dio",
+        "flash_freq": "80m",
+        "flash_size": "8MB",
+    },
 }
 
 

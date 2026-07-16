@@ -29,6 +29,7 @@
 #include <string>
 #include "secrets.h"
 #include "equine_protocol.h"
+#include "equine_relay.h"
 #include "equine_crypto.h"
 #include "equine_config.h"
 #include "equine_config_api.h"
@@ -102,6 +103,7 @@ const float MAX_BATTERY_VOLTAGE = 4.2f;
 #define LORA_CODING_RATE                  ((int)tracker_config.lora.coding_rate_denominator)
 #define LORA_PREAMBLE_LENGTH              ((int)tracker_config.lora.preamble_length)
 #define LORA_SYNC_WORD                    ((int)tracker_config.lora.sync_word)
+#define LORA_RELAY_HOP_LIMIT              ((uint8_t)tracker_config.lora.relay_hop_limit)
 #define MIN_DISTANCE_METERS               ((double)tracker_config.min_distance_m)
 #define MIN_SPEED_KMPH                    ((double)tracker_config.min_speed_kmph)
 #define MAX_HDOP                          ((double)tracker_config.max_hdop)
@@ -840,7 +842,8 @@ String trackerConfigJson() {
          ",\"sf\":" + String(tracker_config.lora.spreading_factor) +
          ",\"coding_rate\":" + String(tracker_config.lora.coding_rate_denominator) +
          ",\"preamble_length\":" + String(tracker_config.lora.preamble_length) +
-         ",\"sync_word\":" + String(tracker_config.lora.sync_word) + "}";
+         ",\"sync_word\":" + String(tracker_config.lora.sync_word) +
+         ",\"relay_hop_limit\":" + String(tracker_config.lora.relay_hop_limit) + "}";
   out += ",\"communication\":{";
   out += "\"tx_interval_s\":" + String(tracker_config.lora_tx_interval_s) +
          ",\"tx_min_points\":" + String(tracker_config.lora_tx_min_points) +
@@ -1671,6 +1674,20 @@ bool transmitLoRaPacket(uint8_t* buffer, size_t len) {
 #endif
 }
 
+bool isCandidateAckPacket(const uint8_t* buffer, size_t length) {
+  const size_t expected_size =
+    sizeof(EquineRelay::LinkHeaderV1) + sizeof(SecureFrameHeader) +
+    sizeof(AckPayload) + EquineProtocol::AEAD_TAG_SIZE;
+  if (!buffer || length != expected_size) return false;
+  EquineRelay::LinkHeaderV1 link{};
+  SecureFrameHeader header{};
+  return EquineRelay::parseLinkedFrame(buffer, length, link, header) &&
+         header.frame.message_type == static_cast<uint8_t>(
+           EquineProtocol::MessageType::ACK) &&
+         header.frame.device_id_hash == TRACKER_DEVICE_HASH &&
+         header.boot_id == boot_id;
+}
+
 int receiveLoRaAck(uint8_t* buffer, size_t max_len, uint32_t timeout_ms) {
 #if defined(BOARD_WIRELESS_TRACKER)
   int state = radio.startReceive();
@@ -1678,56 +1695,59 @@ int receiveLoRaAck(uint8_t* buffer, size_t max_len, uint32_t timeout_ms) {
     logPrintf("RadioLib startReceive failed, code: %d\n", state);
     return -1;
   }
-  
+
   unsigned long start = millis();
   while (millis() - start < timeout_ms) {
     uint16_t irq = radio.getIrqStatus();
     if (irq & RADIOLIB_SX126X_IRQ_RX_DONE) {
       size_t length = radio.getPacketLength();
-      if (length > max_len) {
-        length = max_len;
-      }
+      if (length > max_len) length = max_len;
       state = radio.readData(buffer, length);
       if (state == RADIOLIB_ERR_NONE) {
-        last_ack_rssi = radio.getRSSI();
-        last_ack_snr = radio.getSNR();
-        return length;
+        if (isCandidateAckPacket(buffer, length)) {
+          last_ack_rssi = radio.getRSSI();
+          last_ack_snr = radio.getSNR();
+          return length;
+        }
+        // A repeater can echo this tracker's HISTORY before the gateway ACK.
+        // Keep listening instead of ending the ACK window on expected traffic.
+        state = radio.startReceive();
+        if (state != RADIOLIB_ERR_NONE) return -1;
       } else {
         logPrintf("RadioLib readData failed, code: %d\n", state);
         return -1;
       }
     } else if (irq & RADIOLIB_SX126X_IRQ_CRC_ERR) {
-      logPrintln("RadioLib CRC error during ACK receive");
-      return -1;
+      radio.startReceive();
     } else if (irq & RADIOLIB_SX126X_IRQ_TIMEOUT) {
-      return 0; // timed out
+      return 0;
     }
     serviceDisplayAndButton();
     delay(10);
   }
-  return 0; // timed out
+  return 0;
 #else
   LoRa.receive();
   unsigned long start = millis();
   while (millis() - start < timeout_ms) {
     int packetSize = LoRa.parsePacket();
     if (packetSize) {
-      if (packetSize > (int)max_len) {
-        LoRa.readBytes(buffer, max_len);
-        last_ack_rssi = LoRa.packetRssi();
-        last_ack_snr = LoRa.packetSnr();
-        return max_len;
+      if (packetSize <= (int)max_len) {
+        const int bytes_read = LoRa.readBytes(buffer, packetSize);
+        if (bytes_read == packetSize &&
+            isCandidateAckPacket(buffer, packetSize)) {
+          last_ack_rssi = LoRa.packetRssi();
+          last_ack_snr = LoRa.packetSnr();
+          return packetSize;
+        }
       } else {
-        LoRa.readBytes(buffer, packetSize);
-        last_ack_rssi = LoRa.packetRssi();
-        last_ack_snr = LoRa.packetSnr();
-        return packetSize;
+        while (LoRa.available()) LoRa.read();
       }
     }
     serviceDisplayAndButton();
     delay(10);
   }
-  return 0; // timed out
+  return 0;
 #endif
 }
 
@@ -1890,6 +1910,10 @@ void runWifiSetupMode() {
             String(tracker_config.min_satellites) + "'></label>";
     html += "<label>LoRa spreading factor<input type='number' name='lora_sf' value='" +
             String(tracker_config.lora.spreading_factor) + "'></label>";
+    html += "<label>Maximum relay hops (0-4)<input type='number' min='0' max='4' name='lora_relay_hop_limit' value='" +
+            String(tracker_config.lora.relay_hop_limit) + "'></label>";
+    html += "<label>ACK window (ms)<input type='number' min='100' max='30000' name='lora_ack_timeout_ms' value='" +
+            String(tracker_config.lora_ack_timeout_ms) + "'></label>";
     html += "<input type='hidden' name='reboot' value='1'>";
     html += "<button type='submit'>Validate, save and reboot</button></form>";
     html += "<p>The complete transactional API is available at <code>GET/POST /api/v1/config</code>. POST bodies use <code>application/x-www-form-urlencoded</code> and must include <code>expected_revision</code>.</p>";
@@ -1918,7 +1942,8 @@ void runWifiSetupMode() {
     const char* fields[] = {
       "device_id", "device_name", "wifi_ssid", "wifi_password",
       "moving_sleep_s", "stationary_sleep_s", "max_hdop",
-      "min_satellites", "lora_sf"
+      "min_satellites", "lora_sf", "lora_relay_hop_limit",
+      "lora_ack_timeout_ms"
     };
     for (const char* field : fields) {
       if (!webServer.hasArg(field)) continue;
@@ -3536,7 +3561,8 @@ void performTrackingCycle() {
       if (history_count == 0) break;
 
       constexpr size_t MAX_SECURE_PLAINTEXT =
-        255 - sizeof(SecureFrameHeader) - EquineProtocol::AEAD_TAG_SIZE;
+        EquineRelay::MAX_PACKET_SIZE - sizeof(EquineRelay::LinkHeaderV1) -
+        sizeof(SecureFrameHeader) - EquineProtocol::AEAD_TAG_SIZE;
       uint8_t plaintext_buffer[MAX_SECURE_PLAINTEXT];
       uint16_t points_packed = 0;
       const size_t plaintext_len = buildDynamicPayload(
@@ -3566,8 +3592,13 @@ void performTrackingCycle() {
         packet_root.unix_time_s > 0 ? EquineProtocol::FLAG_HAS_TIMESTAMPS
                                     : EquineProtocol::FLAG_NONE);
       uint8_t payload_buffer[255];
-      memcpy(payload_buffer, &secure_header, sizeof(secure_header));
-      uint8_t* ciphertext = payload_buffer + sizeof(secure_header);
+      const EquineRelay::LinkHeaderV1 link_header =
+        EquineRelay::makeOriginHeader(LORA_RELAY_HOP_LIMIT);
+      memcpy(payload_buffer, &link_header, sizeof(link_header));
+      memcpy(payload_buffer + sizeof(link_header),
+             &secure_header, sizeof(secure_header));
+      uint8_t* ciphertext = payload_buffer + sizeof(link_header) +
+                            sizeof(secure_header);
       uint8_t* tag = ciphertext + plaintext_len;
       if (!EquineCrypto::encrypt(
             tracker_config.lora_aead_key,
@@ -3581,7 +3612,8 @@ void performTrackingCycle() {
         break;
       }
       const size_t payload_len =
-        sizeof(secure_header) + plaintext_len + EquineProtocol::AEAD_TAG_SIZE;
+        sizeof(link_header) + sizeof(secure_header) + plaintext_len +
+        EquineProtocol::AEAD_TAG_SIZE;
 
       last_tx_bytes = payload_len;
       last_tx_points = points_packed;
@@ -3608,11 +3640,19 @@ void performTrackingCycle() {
       bool ack_received = false;
 
       const size_t expected_ack_size =
-        sizeof(SecureFrameHeader) + sizeof(AckPayload) +
+        sizeof(EquineRelay::LinkHeaderV1) + sizeof(SecureFrameHeader) +
+        sizeof(AckPayload) +
         EquineProtocol::AEAD_TAG_SIZE;
       if (rx_result == static_cast<int>(expected_ack_size)) {
+        EquineRelay::LinkHeaderV1 ack_link{};
         SecureFrameHeader ack_header{};
-        memcpy(&ack_header, rx_buffer, sizeof(ack_header));
+        if (!EquineRelay::parseLinkedFrame(
+              rx_buffer, rx_result, ack_link, ack_header)) {
+          last_ack_status = 0;
+          logPrintln("Ignored malformed relay link envelope.");
+          serviceDisplayAndButton(true);
+          continue;
+        }
         const bool supported_ack = EquineProtocol::isSupportedFrame(
           ack_header.frame,
           EquineProtocol::MessageType::ACK,
@@ -3637,7 +3677,8 @@ void performTrackingCycle() {
           logPrintf("Ignored ACK for device hash %s.\n", received_hash);
         } else if (ack_header.boot_id == boot_id) {
           AckPayload ack{};
-          const uint8_t* ack_ciphertext = rx_buffer + sizeof(ack_header);
+          const uint8_t* ack_ciphertext =
+            rx_buffer + sizeof(ack_link) + sizeof(ack_header);
           const uint8_t* ack_tag = ack_ciphertext + sizeof(ack);
           if (!EquineCrypto::decrypt(
                 tracker_config.lora_aead_key,

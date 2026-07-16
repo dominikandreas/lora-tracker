@@ -15,6 +15,8 @@ Never select an image only because its connector fits.
 | Heltec WiFi LoRa 32 V2 tracker with external BN-220 | `tracker-v2` | ESP32 |
 | Heltec Wireless Tracker with UC6580/SX1262/TFT | `tracker-wireless-tracker` | ESP32-S3 |
 | Heltec WiFi LoRa 32 V2 gateway | `gateway-v2` | ESP32 |
+| Heltec WiFi LoRa 32 V2 repeater | `repeater-heltec-lora32` | ESP32 |
+| Heltec Wireless Tracker used as repeater | `repeater-wireless-tracker` | ESP32-S3 |
 
 The V2 tracker and gateway use the same ESP32 board but different firmware.
 ESP Web Tools can detect the chip family, not the role, so this choice remains
@@ -38,8 +40,9 @@ the operator's responsibility.
 6. Open the flasher's serial console at 115200 baud. On an erased device, record
    the generated `admin` credential shown in the first-boot output. It is unique
    to that device and is not embedded in the release image.
-7. Connect to `LoRaTracker-<id>` or `LoRaGateway-<id>`, authenticate as `admin`,
-   and complete [onboarding](ONBOARDING.md).
+7. Connect to the role's setup AP (`LoRaTracker-<id>`, `LoRaGateway-<id>` or
+   `lora-repeater-<suffix>`), authenticate as `admin`, and complete
+   [onboarding](ONBOARDING.md).
 
 The official [esptool-js project](https://github.com/espressif/esptool-js)
 documents the underlying Web Serial transport. ESP Web Tools requires a merged

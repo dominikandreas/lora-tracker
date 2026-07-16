@@ -176,6 +176,12 @@ LoRa:
 ```text
 lora_frequency_hz, lora_bandwidth_hz, lora_tx_power_dbm,
 lora_sf, lora_coding_rate, lora_preamble_length, lora_sync_word,
+lora_relay_hop_limit
+```
+
+Tracker communication policy:
+
+```text
 lora_tx_interval_s, lora_tx_min_points, lora_ack_timeout_ms,
 lora_retry_backoff_1_s ... lora_retry_backoff_4_s
 ```
@@ -213,7 +219,8 @@ mqtt_password, mqtt_ca_certificate, mqtt_base_topic, mqtt_buffer_size,
 dedup_save_interval, wifi_retry_interval_ms, mqtt_retry_interval_ms
 ```
 
-LoRa fields are identical to the tracker LoRa field names.
+Gateway LoRa fields are identical to the tracker radio field names; tracker
+batching, ACK timeout and retry fields do not apply to the gateway.
 
 Registry:
 

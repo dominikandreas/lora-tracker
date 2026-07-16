@@ -56,12 +56,14 @@ jobs:
           pio run -d components/tracker-firmware -e heltec_wifi_lora_32_v2
           pio run -d components/tracker-firmware -e heltec_wireless_tracker
           pio run -d components/gateway-firmware -e heltec_wifi_lora_32_v2
+          pio run -d components/repeater-firmware -e heltec_wifi_lora_32_v2
+          pio run -d components/repeater-firmware -e heltec_wireless_tracker
       - name: Package browser-flashable images
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}"
-          for TARGET in tracker-v2 tracker-wireless-tracker gateway-v2; do
+          for TARGET in tracker-v2 tracker-wireless-tracker gateway-v2 repeater-heltec-lora32 repeater-wireless-tracker; do
             python tools/package_firmware.py --target "$TARGET" --version "$VERSION" --output dist --download-base "$BASE"
           done
           (cd dist && sha256sum * > SHA256SUMS)

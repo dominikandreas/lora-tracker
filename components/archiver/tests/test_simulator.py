@@ -66,6 +66,10 @@ def test_archiver_service_simulation_covers_mqtt_lifecycle_and_errors(tmp_path: 
     not _host_cpp_compiler_available(),
     reason="embedded simulator requires a host C++ compiler",
 )
-def test_embedded_simulation_compiles_and_runs_both_firmware_contracts():
+def test_embedded_simulation_compiles_and_runs_all_firmware_contracts():
     result = run_embedded_simulation()
-    assert result["components"] == ["tracker-firmware", "gateway-firmware"]
+    assert result["components"] == [
+        "tracker-firmware",
+        "gateway-firmware",
+        "repeater-firmware",
+    ]

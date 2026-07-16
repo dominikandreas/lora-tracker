@@ -49,7 +49,10 @@ hardware support or multiple public interfaces.
 - [ ] Rename the remaining historical embedded filenames and C++ namespaces as part of the shared-library refactor.
 - [ ] Fuzz LoRa, MQTT and onboarding parsers and timestamp chains.
 - [ ] Add altitude, speed, heading, HDOP, fix quality and radio metadata.
-- [ ] Define relay routing, hop limits, deduplication and trust boundaries.
+- [x] Define and implement keyless bounded relay forwarding, hop limits,
+      duplicate suppression, reverse ACK propagation and trust boundaries.
+- [ ] Qualify repeater RF topology, collision behavior, legal airtime and power
+      hardware with a multi-node hardware-in-the-loop testbed.
 - [ ] Revisit 32-bit Unix timestamps before 2106.
 
 ## Hardware backlog

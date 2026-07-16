@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "equine_config.h"
+#include "equine_relay.h"
 
 namespace {
 
@@ -52,6 +53,57 @@ void testProtocol() {
   uint32_t decoded = 0;
   size_t consumed = 0;
   assert(!decodeUleb128U32(overflow, sizeof(overflow), decoded, consumed));
+}
+
+void testRelayLink() {
+  using namespace EquineProtocol;
+  using namespace EquineRelay;
+
+  const uint64_t device_hash = deviceIdHash("horse-1");
+  const SecureFrameHeaderV2 secure = makeSecureFrameHeader(
+    MessageType::HISTORY, HISTORY_SCHEMA_VERSION, device_hash,
+    0x1234ULL, 9, 77, FLAG_HAS_TIMESTAMPS);
+  uint8_t packet[sizeof(LinkHeaderV1) + sizeof(secure) + AEAD_TAG_SIZE]{};
+  const LinkHeaderV1 origin = makeOriginHeader(2);
+  memcpy(packet, &origin, sizeof(origin));
+  memcpy(packet + sizeof(origin), &secure, sizeof(secure));
+
+  LinkHeaderV1 parsed_link{};
+  SecureFrameHeaderV2 parsed_secure{};
+  assert(parseLinkedFrame(
+    packet, sizeof(packet), parsed_link, parsed_secure));
+  assert(parsed_link.hop_count == 0 && parsed_link.hop_limit == 2);
+  assert(parsed_secure.counter == 77);
+
+  const FrameIdentityV1 identity = frameIdentity(parsed_secure);
+  assert(identity.device_id_hash == device_hash);
+  assert(identity.boot_id == 9 && identity.counter == 77);
+  assert(sameIdentity(identity, frameIdentity(parsed_secure)));
+  assert(forwardingDelayMs(identity, 0x55, 40, 8, 45) >= 40);
+  assert(forwardingDelayMs(identity, 0x55, 40, 8, 45) <= 355);
+  assert(duplicateCacheTtlMs(identity, 120) == 120000);
+  FrameIdentityV1 ack_identity = identity;
+  ack_identity.message_type = static_cast<uint8_t>(MessageType::ACK);
+  ack_identity.schema_version = ACK_SCHEMA_VERSION;
+  assert(duplicateCacheTtlMs(ack_identity, 120) == ACK_DUPLICATE_CACHE_MS);
+  assert(peerForwardSuppressesPending(1, 1));
+  assert(!peerForwardSuppressesPending(0, 1));
+
+  assert(advanceHop(packet, sizeof(packet), 2));
+  memcpy(&parsed_link, packet, sizeof(parsed_link));
+  assert(parsed_link.hop_count == 1);
+  assert(advanceHop(packet, sizeof(packet), 2));
+  assert(!advanceHop(packet, sizeof(packet), 2));
+
+  parsed_link.hop_count = 3;
+  parsed_link.hop_limit = 2;
+  memcpy(packet, &parsed_link, sizeof(parsed_link));
+  assert(!parseLinkedFrame(
+    packet, sizeof(packet), parsed_link, parsed_secure));
+
+  const uint32_t airtime = estimateAirtimeMs(255, 10, 125000, 5, 8);
+  assert(airtime > 1000 && airtime < 3000);
+  assert(estimateAirtimeMs(0, 10, 125000, 5, 8) == 0);
 }
 
 void testConfiguration() {
@@ -110,12 +162,22 @@ void testConfiguration() {
   strlcpy(gateway.trackers[1].device_id, "horse-1", sizeof(gateway.trackers[1].device_id));
   finalize(gateway, DeviceRole::GATEWAY, 1);
   assert(!validateGatewayConfig(gateway));
+
+  RepeaterConfigV1 repeater{};
+  makeDefaultRepeaterConfig(repeater, "hill-1", "Hill repeater");
+  assert(validateRepeaterConfig(repeater));
+  assert(repeater.lora.relay_hop_limit == 2);
+  assert(repeater.airtime_budget_ms_per_hour == 36000);
+  repeater.forwarding_slot_count = 0;
+  finalize(repeater, DeviceRole::REPEATER, 2);
+  assert(!validateRepeaterConfig(repeater));
 }
 
 }  // namespace
 
 int main() {
   testProtocol();
+  testRelayLink();
   testConfiguration();
   return 0;
 }

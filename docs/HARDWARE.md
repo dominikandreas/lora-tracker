@@ -9,6 +9,7 @@ The current tracker firmware directly supports two development configurations:
 | Tracker | Heltec Wireless Tracker | Integrated ESP32-S3, SX1262 and UC6580 GNSS; closest match to the current low-power tracker branch | Supported PlatformIO target |
 | Gateway for existing prototypes | Heltec WiFi LoRa 32 V2 | Matches the checked-in SX1276 pin map | Supported, but not recommended for a new design |
 | Gateway for new hardware work | Heltec WiFi LoRa 32 V3/V4 | ESP32-S3 and SX1262; a better common radio platform | Firmware port is a P0 TODO |
+| Repeater | Heltec WiFi LoRa 32 V2 or Wireless Tracker | Reuses either supported radio path; tracker GNSS/display are unused | Supported PlatformIO targets |
 
 The [Wireless Tracker documentation](https://docs.heltec.org/en/node/esp32/wireless_tracker/index.html)
 identifies its ESP32-S3, SX1262 and integrated GNSS. The current
@@ -17,8 +18,10 @@ describes the ESP32-S3/SX1262 V3 and V4 generations. Do not flash the V2 target
 onto V3/V4: radio type and GPIO mappings differ.
 
 Choose the radio variant and antenna for the legal band at the deployment
-location (for example EU 868 MHz versus US 915 MHz). Firmware frequency alone
-cannot make a mismatched RF network or antenna compliant.
+location. The checked-in configuration currently accepts only 863–870 MHz and
+must be treated as an EU-region build. Supporting another region requires a
+deliberate firmware validation-range change, a matching radio/antenna variant,
+and a new regional compliance review; changing only the frequency is not enough.
 
 ### Checked-in pin assignments
 
@@ -27,6 +30,8 @@ cannot make a mismatched RF network or antenna compliant.
 | Wireless Tracker | RX 33, TX 34, reset 35, Vext 3, GNSS power 37, 115200 baud | SCK 9, MISO 11, MOSI 10, NSS 8, reset 12, busy 13, DIO1 14 | battery ADC 1, divider enable 2; TFT pins are in `platformio.ini` |
 | WiFi LoRa 32 V2 tracker | RX 33, TX 32, 9600 baud | SCK 5, MISO 19, MOSI 27, NSS 18, reset 14, DIO0 26 | battery ADC 36; OLED SCL 15, SDA 4, reset 16 |
 | WiFi LoRa 32 V2 gateway | no GNSS | SCK 5, MISO 19, MOSI 27, NSS 18, reset 14, DIO0 26 | USER button GPIO 0 |
+| WiFi LoRa 32 V2 repeater | no GNSS | SCK 5, MISO 19, MOSI 27, NSS 18, reset 14, DIO0 26 | USER button GPIO 0 |
+| Wireless Tracker repeater | GNSS disabled | SCK 9, MISO 11, MOSI 10, NSS 8, reset 12, busy 13, DIO1 14 | USER button GPIO 0 |
 
 GPIO 0 is a boot-strapping pin. Do not hold it while applying power or reset;
 wait for the firmware prompt before using a setup gesture.
@@ -103,6 +108,15 @@ protocol/backend redesign and is not wire-compatible with the current firmware.
 Use a UPS, watchdog, protected power input and an enclosure appropriate to the
 installation. Ethernet is preferable to Wi-Fi where it is available. A gateway
 must have local durable storage before it can claim loss-tolerant MQTT delivery.
+
+## Repeater direction
+
+A repeater is an always-on receiver and is not suitable for the tracker's small
+1000 mAh battery/runtime assumptions. Use protected mains/UPS power or a solar
+system sized from measured receive, transmit, Wi-Fi setup and cold-weather
+loads. Mount a region-correct vertical antenna high and clear, use a sealed
+enclosure and surge/lightning protection appropriate to the site, and document
+conducted power plus antenna gain. See [repeaters](REPEATERS.md).
 
 ## Qualification before hardware freeze
 

@@ -12,6 +12,7 @@
 #include <WebServer.h>
 #include "secrets.h"
 #include "equine_protocol.h"
+#include "equine_relay.h"
 #include "equine_crypto.h"
 #include "equine_config.h"
 #include "equine_config_api.h"
@@ -52,6 +53,7 @@ uint32_t gateway_button_press_start_ms = 0;
 #define LORA_CODING_RATE            ((int)gateway_config.lora.coding_rate_denominator)
 #define LORA_PREAMBLE_LENGTH        ((int)gateway_config.lora.preamble_length)
 #define LORA_SYNC_WORD              ((int)gateway_config.lora.sync_word)
+#define LORA_RELAY_HOP_LIMIT        ((uint8_t)gateway_config.lora.relay_hop_limit)
 
 struct TrackerRuntime {
   const EquineConfig::GatewayTrackerConfigV1* config;
@@ -605,7 +607,8 @@ String gatewayConfigJson() {
          ",\"sf\":" + String(gateway_config.lora.spreading_factor) +
          ",\"coding_rate\":" + String(gateway_config.lora.coding_rate_denominator) +
          ",\"preamble_length\":" + String(gateway_config.lora.preamble_length) +
-         ",\"sync_word\":" + String(gateway_config.lora.sync_word) + "}";
+         ",\"sync_word\":" + String(gateway_config.lora.sync_word) +
+         ",\"relay_hop_limit\":" + String(gateway_config.lora.relay_hop_limit) + "}";
   out += ",\"dedup_save_interval\":" + String(gateway_config.dedup_save_interval) +
          ",\"wifi_retry_interval_ms\":" + String(gateway_config.wifi_retry_interval_ms) +
          ",\"mqtt_retry_interval_ms\":" + String(gateway_config.mqtt_retry_interval_ms) +
@@ -1260,6 +1263,7 @@ void setupWebInterface() {
       html += "MQTT user: <input name='mqtt_username' value='" + String(gateway_config.mqtt_username) + "'><br>";
       html += "MQTT password: <input type='password' name='mqtt_password' value='__KEEP__'><br>";
       html += "MQTT root CA (PEM): <textarea name='mqtt_ca_certificate' rows='8' cols='48' placeholder='-----BEGIN CERTIFICATE----- ... -----END CERTIFICATE-----'>__KEEP__</textarea><br>";
+      html += "Maximum ACK relay hops (0-4): <input type='number' min='0' max='4' name='lora_relay_hop_limit' value='" + String(gateway_config.lora.relay_hop_limit) + "'><br>";
       html += "<input type='hidden' name='reboot' value='1'><button>Validate, save and reboot</button></form>";
     }
     html += "<p>Full registry and radio configuration uses <code>POST /api/v1/config</code>; tracker fields are named <code>tracker.0.id</code>, <code>tracker.0.name</code>, and so on.</p>";
@@ -1877,7 +1881,8 @@ void loop() {
 
   do {
     // Authenticated envelope + encrypted history, root and batch metadata.
-    if (packetSize < (int)(sizeof(SecureFrameHeader) +
+    if (packetSize < (int)(sizeof(EquineRelay::LinkHeaderV1) +
+                           sizeof(SecureFrameHeader) +
                            sizeof(HistoryPayload) + 8 + 2 +
                            EquineProtocol::AEAD_TAG_SIZE) ||
         packetSize > 255) {
@@ -1900,8 +1905,13 @@ void loop() {
     DecodedHistoryHeader header{};
     TrackerRuntime* tracker = nullptr;
 
+    EquineRelay::LinkHeaderV1 link_header{};
     SecureFrameHeader wire_header{};
-    memcpy(&wire_header, payload_buffer, sizeof(wire_header));
+    if (!EquineRelay::parseLinkedFrame(
+          payload_buffer, packetSize, link_header, wire_header)) {
+      logPrintln("Ignored malformed or unsupported relay link envelope.");
+      break;
+    }
     const EquineProtocol::FrameHeaderV1& frame = wire_header.frame;
     if (!EquineProtocol::isSupportedHistoryFrame(frame)) {
       logPrintf("Unsupported frame: transport=%u type=%u schema=%u flags=0x%02X.\n",
@@ -1920,9 +1930,11 @@ void loop() {
     }
 
     const size_t ciphertext_size =
-      packetSize - sizeof(wire_header) - EquineProtocol::AEAD_TAG_SIZE;
+      packetSize - sizeof(link_header) - sizeof(wire_header) -
+      EquineProtocol::AEAD_TAG_SIZE;
     uint8_t plaintext_buffer[255];
-    const uint8_t* ciphertext = payload_buffer + sizeof(wire_header);
+    const uint8_t* ciphertext = payload_buffer + sizeof(link_header) +
+                                sizeof(wire_header);
     const uint8_t* tag = ciphertext + ciphertext_size;
     if (!EquineCrypto::decrypt(
           tracker->config->lora_aead_key,
@@ -2006,7 +2018,7 @@ void loop() {
     logPrintf(
       "Received packet [%s/%s]: transport=%u schema=%u boot=%lu "
       "first_seq=%lu root=%.6f,%.6f root_utc=%lu timestamps=%s "
-      "anchors=%u batches=%u RSSI=%d\n",
+      "anchors=%u batches=%u RSSI=%d relay_hops=%u/%u\n",
       tracker->config->device_id,
       tracker->hash_text,
       header.transport_version,
@@ -2019,7 +2031,9 @@ void loop() {
       header.timestamps_present ? "yes" : "no",
       num_anchors,
       num_batches,
-      packet_rssi);
+      packet_rssi,
+      link_header.hop_count,
+      link_header.hop_limit);
 
     bool packet_valid = true;
     bool publish_success = true;
@@ -2228,10 +2242,15 @@ void loop() {
       gateway_tx_nonce_prefix,
       header.boot_id,
       highest_ackable_seq);
+    const EquineRelay::LinkHeaderV1 ack_link =
+      EquineRelay::makeOriginHeader(LORA_RELAY_HOP_LIMIT);
     uint8_t ack_packet[
-      sizeof(ack_header) + sizeof(ack) + EquineProtocol::AEAD_TAG_SIZE];
-    memcpy(ack_packet, &ack_header, sizeof(ack_header));
-    uint8_t* ack_ciphertext = ack_packet + sizeof(ack_header);
+      sizeof(ack_link) + sizeof(ack_header) + sizeof(ack) +
+      EquineProtocol::AEAD_TAG_SIZE];
+    memcpy(ack_packet, &ack_link, sizeof(ack_link));
+    memcpy(ack_packet + sizeof(ack_link), &ack_header, sizeof(ack_header));
+    uint8_t* ack_ciphertext =
+      ack_packet + sizeof(ack_link) + sizeof(ack_header);
     uint8_t* ack_tag = ack_ciphertext + sizeof(ack);
     if (!EquineCrypto::encrypt(
           tracker->config->lora_aead_key,

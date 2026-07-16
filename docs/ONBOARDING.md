@@ -87,13 +87,29 @@ available anonymously on the LAN.
 The complete endpoint and field reference is in
 [`protocols/ONBOARDING_API.md`](protocols/ONBOARDING_API.md).
 
+## Repeater first boot
+
+An erased repeater exposes `lora-repeater-<suffix>` and prints its generated
+administrator password and AP address at 115200 baud. Authenticate as `admin`,
+then configure a unique ID and the exact radio settings used by the tracker and
+gateway. Configure the local hop cap, priority delay/slots, duplicate lifetime,
+airtime budget and heartbeat interval. Repeating remains disabled until the
+configuration validates and is saved.
+
+To reopen the portal, hold USER for at least 1.5 seconds during boot. A
+configured repeater closes it after ten minutes. Repeaters do not receive any
+tracker AEAD key. Placement, power and end-to-end acceptance requirements are
+in [repeaters](REPEATERS.md).
+
 ## Post-onboarding acceptance checklist
 
 - Device has a unique generated or factory-injected admin credential; any
   first-boot log containing it has been closed and handled as a secret.
 - Gateway reports verified TLS and rejects plaintext when the test override is false.
 - Tracker and gateway have identical frequency, bandwidth, spreading factor,
-  coding rate, preamble and sync word.
+  coding rate, preamble and sync word; every repeater matches them.
+- Relay hop limits are the minimum needed, the tracker ACK window covers the
+  measured round trip, and repeater queue/airtime-drop counters remain acceptable.
 - Only registered tracker hashes with matching per-device AEAD keys are accepted.
 - `timestamp_valid`, location, battery and sequence values are plausible.
 - Archiver availability is online and a history request ends with `final=true`.

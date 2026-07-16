@@ -3,7 +3,37 @@
 The transport envelope is version 2. The only supported `HISTORY` schema is 2
 and the only supported `ACK` schema is 1. Tracker and gateway reject every
 other transport/schema combination and every frame without the encrypted flag.
-All integers are packed little-endian.
+All integers are packed little-endian. Every secure frame is carried inside the
+current link envelope; raw transport-v2 frames without it are rejected.
+
+## Repeater link envelope
+
+```text
+LinkHeaderV1
+  uint16 magic        0x524c (wire bytes "LR")
+  uint8  version      1
+  uint8  hop_count    number of repeaters already traversed
+  uint8  hop_limit    origin-selected maximum, 0..4
+  uint8  flags        zero in link version 1
+```
+
+The link header is mutable and is not AES-GCM associated data. The secure frame
+that follows remains byte-for-byte end-to-end authenticated. Each repeater
+increments `hop_count` only when it is below both `hop_limit` and its configured
+local cap. Lowering a visible hop limit can deny forwarding, but raising it
+cannot bypass a repeater's local maximum. LoRa itself remains susceptible to
+jamming and denial of service.
+
+The six-byte header reduces the maximum secure frame to 249 bytes. Tracker
+batch packing receives the reduced plaintext capacity and stops cleanly before
+that limit. Repeaters accept only current `HISTORY` and `ACK` secure headers and
+never decrypt either payload.
+
+Forwarding identity is `(message_type, schema_version, device_id_hash, boot_id,
+counter)`. This intentionally treats equivalent ACKs for one tracker sequence
+as duplicates even if different receivers used different nonce prefixes.
+History duplicates use the ordinary configured cache lifetime; ACK duplicates
+use five seconds so later tracker retries can receive a fresh forwarded ACK.
 
 ## Authenticated envelope
 
@@ -97,6 +127,11 @@ The payload must equal the authenticated envelope counter, the device hash and
 boot ID must match the outstanding tracker batch, and the sequence must clear
 at least one queued point. A missing, stale, inconsistent or invalid-tag ACK
 never clears tracker history.
+
+The tracker ignores echoed `HISTORY`, ACKs for other trackers and malformed
+packets while keeping the ACK receive window open. The default window is 15
+seconds for the default two-hop/SF10 profile and is configurable up to 30
+seconds; deployment timing must be measured.
 
 ## Key handling limits
 

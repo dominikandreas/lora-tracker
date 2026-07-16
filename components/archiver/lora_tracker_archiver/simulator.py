@@ -53,7 +53,7 @@ class PublishedMessage:
 
 
 def run_embedded_simulation(*, compiler: str | None = None) -> dict[str, object]:
-    """Compile and run shared tracker and gateway C++ contracts on the host.
+    """Compile and run all embedded C++ contract copies on the host.
 
     The harness uses a deliberately small Arduino compatibility header, so it
     executes production protocol/configuration code but makes no claim about
@@ -77,7 +77,11 @@ def run_embedded_simulation(*, compiler: str | None = None) -> dict[str, object]
     source = harness / "firmware_contract_test.cpp"
     results: dict[str, object] = {"compiler": compiler, "components": []}
     with tempfile.TemporaryDirectory(prefix="lora-tracker-firmware-sim-") as build_dir:
-        for component in ("tracker-firmware", "gateway-firmware"):
+        for component in (
+            "tracker-firmware",
+            "gateway-firmware",
+            "repeater-firmware",
+        ):
             output = Path(build_dir) / component
             command = [
                 *compiler_parts, "-std=c++17", "-Wall", "-Wextra", "-Werror",

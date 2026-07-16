@@ -18,7 +18,7 @@ delivery guarantees and hardware qualification and cannot be papered over.
 - Disabled OTA unless a password hash is provisioned and disabled telnet by default.
 - Strengthened SQLite foreign-key, timeout and durability settings.
 - Added strict browser schema handling and complete service-worker asset caching.
-- Added pinned PlatformIO projects and native tracker/gateway contract simulation.
+- Added pinned PlatformIO projects and native tracker/gateway/repeater contract simulation.
 - Added onboarding, hardware, operations and simulation documentation.
 - Added per-tracker AES-256-GCM history/ACK protection, per-encryption nonce
   counters and monotonic point replay rejection.
@@ -26,6 +26,8 @@ delivery guarantees and hardware qualification and cannot be papered over.
 - Added generated first-boot credentials and random per-tracker radio keys.
 - Added RTC history metadata/bounds/CRC validation.
 - Added CI, tagged release packaging, checksums, provenance and browser-flash images.
+- Added keyless bounded repeater forwarding for encrypted history and ACKs with
+  deterministic suppression, queue bounds and airtime accounting.
 
 ## Release blockers
 
@@ -35,7 +37,8 @@ delivery guarantees and hardware qualification and cannot be papered over.
 | BLE provisioning | Supported onboarding client and QR/recovery workflow beyond the authenticated firmware session | Pairing/replay/recovery tests on supported phones |
 | Firmware trust | Signed OTA, Secure Boot v2, flash/NVS encryption and key custody | Factory provisioning record and failed unsigned-image tests |
 | Gateway delivery | Durable outage queue and confirmed broker delivery | Power-loss/reconnect test with zero silent point loss |
-| Hardware | Current gateway board port and qualified tracker design | HIL CI, RF/power/environmental reports and factory tests |
+| Hardware | Current gateway board port, qualified tracker design and installed repeater power/RF design | HIL CI, RF/power/environmental reports and factory tests |
+| Repeater RF | Hidden-node/capture behavior, multi-hop ACK timing and regulatory airtime remain unqualified | Multi-node installed-topology tests at maximum traffic and worst radio profile |
 | Operations | Monitoring, backup/restore, alerting and credential rotation | Runbooks exercised in a staging deployment |
 | Compliance | Region-specific radio, privacy, battery and product obligations | Review for every market and deployment context |
 
@@ -45,6 +48,8 @@ A controlled field trial may proceed only on a private isolated broker/network,
 with unique credentials/keys, TLS, no public HTTP exposure and attended BLE
 onboarding. Radio traffic is encrypted and authenticated, but traffic analysis
 remains possible and a compromised gateway exposes its registered tracker keys.
+Repeaters are keyless but can still amplify structurally valid hostile traffic
+until their local airtime budget is exhausted; the protocol is not jam-resistant.
 Do not use the system as a safety device or sole means of locating an animal.
 
 The implementation sequence for large changes is maintained in

@@ -337,6 +337,7 @@ inline FieldResult applyLoRaField(EquineConfig::LoRaConfigV1& lora,
   if (strcmp(key, "lora_coding_rate") == 0) EQ_LORA_U8(coding_rate_denominator, 5, 8);
   if (strcmp(key, "lora_preamble_length") == 0) EQ_LORA_U8(preamble_length, 6, 32);
   if (strcmp(key, "lora_sync_word") == 0) EQ_LORA_U8(sync_word, 0, 255);
+  if (strcmp(key, "lora_relay_hop_limit") == 0) EQ_LORA_U8(relay_hop_limit, 0, EquineRelay::MAX_HOPS);
 #undef EQ_LORA_U32
 #undef EQ_LORA_U8
   return FieldResult::UNKNOWN;
@@ -379,7 +380,7 @@ inline FieldResult applyTrackerField(EquineConfig::TrackerConfigV1& config,
 
   EQ_SET_U32("lora_tx_interval_s", lora_tx_interval_s, 10, 86400);
   EQ_SET_U16("lora_tx_min_points", lora_tx_min_points, 1, 100);
-  EQ_SET_U16("lora_ack_timeout_ms", lora_ack_timeout_ms, 100, 10000);
+  EQ_SET_U16("lora_ack_timeout_ms", lora_ack_timeout_ms, 100, 30000);
   for (uint8_t i=0;i<4;i++) { char expected[32]; snprintf(expected,sizeof(expected),"lora_retry_backoff_%u_s",i+1); if(strcmp(key,expected)==0){uint32_t parsed=0;if(!parseUnsigned(value,10,86400,parsed)){setError(status,key,"expected an integer in range");return FieldResult::INVALID;}if(config.lora_retry_backoff_s[i]!=parsed){config.lora_retry_backoff_s[i]=parsed;status.changed=true;}return FieldResult::APPLIED;}}
   EQ_SET_FLOAT("min_distance_m", min_distance_m, 0.5f, 100.0f);
   EQ_SET_FLOAT("min_speed_kmph", min_speed_kmph, 0.0f, 30.0f);

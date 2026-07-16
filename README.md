@@ -2,7 +2,8 @@
 
 LoRa Tracker is a low-power GNSS tracking system with battery-powered tracker
 firmware, a Wi-Fi/MQTT gateway, a SQLite history service, a browser PWA and a
-deterministic cross-component simulator.
+deterministic cross-component simulator. Optional keyless repeaters extend
+encrypted history traffic and receiver ACKs across bounded multi-hop paths.
 
 ## Release status
 
@@ -20,6 +21,7 @@ and [security](https://dominikandreas.github.io/lora-tracker-docs/reference/secu
 |---|---|
 | `components/tracker-firmware` | GNSS acquisition, motion-aware sleep, offline history and LoRa transport |
 | `components/gateway-firmware` | Multi-tracker LoRa reception, ACKs, deduplication and MQTT routing |
+| `components/repeater-firmware` | Keyless bounded forwarding of encrypted history and ACK frames |
 | `components/archiver` | Validated MQTT ingestion, SQLite retention and paginated history |
 | `components/web-app` | Installable MQTT-over-WebSocket monitoring PWA |
 | `components/firmware-simulator` | Native contract tests for shared embedded headers |
@@ -43,10 +45,12 @@ Build every firmware target with the pinned PlatformIO toolchain:
 pio run -d components/tracker-firmware -e heltec_wifi_lora_32_v2
 pio run -d components/tracker-firmware -e heltec_wireless_tracker
 pio run -d components/gateway-firmware -e heltec_wifi_lora_32_v2
+pio run -d components/repeater-firmware -e heltec_wifi_lora_32_v2
+pio run -d components/repeater-firmware -e heltec_wireless_tracker
 ```
 
-Copy each firmware component's `secrets.example.h` to the git-ignored
-`secrets.h` first. Generic builds generate their admin credential on erased
+Copy `secrets.example.h` to git-ignored `secrets.h` for tracker and gateway
+source builds; the repeater has no factory secret header. Generic builds generate their admin credential on erased
 first boot; a factory seed and OTA password hash are optional. Provision the
 gateway broker's PEM root CA through the authenticated setup API or a per-device
 factory build. Plain MQTT is disabled by default.
@@ -61,13 +65,14 @@ The complete reader-facing documentation is rendered on [GitHub Pages](https://d
 - [Build and deployment](https://dominikandreas.github.io/lora-tracker-docs/reference/build-and-deploy.html)
 - [Browser flashing](https://dominikandreas.github.io/lora-tracker-docs/reference/flashing.html)
 - [Hardware recommendations](https://dominikandreas.github.io/lora-tracker-docs/reference/hardware.html)
+- [Repeaters](https://dominikandreas.github.io/lora-tracker-docs/reference/repeaters.html)
 - [Operations](https://dominikandreas.github.io/lora-tracker-docs/reference/operations.html)
 - [Simulation coverage](https://dominikandreas.github.io/lora-tracker-docs/reference/simulation-coverage.html)
 - [Production readiness](https://dominikandreas.github.io/lora-tracker-docs/reference/production-readiness.html)
 - [Protocol specifications](https://dominikandreas.github.io/lora-tracker-docs/protocols.html)
 - [Roadmap and larger refactors](https://dominikandreas.github.io/lora-tracker-docs/reference/roadmap.html)
 
-The simulator validates cross-component contracts, both copies of the embedded
+The simulator validates cross-component contracts, all three copies of the embedded
 headers, storage, MQTT callbacks and browser payload normalization. It does not
 simulate RF, GNSS, power, flash failure, real brokers or browsers. Those limits
 are listed in [simulation coverage](https://dominikandreas.github.io/lora-tracker-docs/reference/simulation-coverage.html).

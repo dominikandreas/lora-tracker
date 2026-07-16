@@ -20,14 +20,17 @@ The factory radio profile is 868.0 MHz, 125 kHz bandwidth, spreading factor 10,
 coding rate 4/5, preamble 8, sync word `0x12`, and 20 dBm requested TX power.
 This is a development profile, not a declaration of legal operation. Set the
 frequency, conducted power, antenna gain and airtime policy for the applicable
-region and hardware. Tracker and gateway values must match exactly.
+region and hardware. Tracker, gateway and repeater values must match exactly.
+`lora_relay_hop_limit` is zero to four on trackers and gateways and one to four
+on repeaters. The shipped origin limit is two.
 
 ## Tracker defaults
 
 | Policy | Default | Effect |
 |---|---:|---|
 | LoRa batch | 3 points or 300 s | Fewer transmissions versus delivery latency |
-| ACK timeout | 800 ms | Time allowed for the gateway response |
+| Relay hop limit | 2 | Maximum forward and reverse repeater hops originated by the endpoint |
+| ACK timeout | 15,000 ms | Allows a two-hop data/ACK round trip at the default radio profile |
 | Retry delays | 60, 120, 300, 600 s | Battery protection while out of coverage |
 | GNSS quality | HDOP ≤ 2.0, ≥ 6 satellites | Rejects weak fixes |
 | Maximum plausible speed | 20 m/s | Rejects teleport-like samples |
@@ -60,6 +63,19 @@ are transactional runtime configuration. The read API exposes only
 `__KEEP__`. `secrets.h` can seed a per-device factory certificate. The
 plaintext-test opt-in remains build-time only, and TLS without a valid CA fails
 closed.
+
+## Repeater defaults
+
+- Unique MAC-derived ID and generated 20-character administrator credential.
+- Two-hop local forwarding cap; 40 ms base delay and eight deterministic 45 ms priority slots.
+- Eight queued frames and a 120-second history duplicate cache; ACKs use five seconds.
+- 36,000 ms/hour airtime token bucket and 14 dBm requested TX power.
+- Repeating disabled until the first valid configuration is saved.
+
+The 15-second tracker ACK window is an energy/coverage tradeoff, not a universal
+constant. Measure and increase it for higher spreading factors or longer paths;
+reduce it only after verifying worst-case end-to-end timing. See
+[repeaters](REPEATERS.md).
 
 ## Safe change procedure
 

@@ -5,7 +5,8 @@
 #include <stdint.h>
 #include <stdio.h>
 
-// Shared on-wire definitions for trackers, gateways, relays and apps.
+// Shared end-to-end on-wire definitions for trackers, gateways and apps.
+// Repeater routing lives in equine_relay.h outside this authenticated frame.
 //
 // Wire encoding is packed little-endian, matching the ESP32 endpoints.
 // Applications on other platforms must decode integer fields explicitly as
@@ -27,7 +28,6 @@ constexpr size_t AEAD_TAG_SIZE = 16;
 enum FrameFlags : uint8_t {
   FLAG_NONE           = 0,
   FLAG_ENCRYPTED      = 1U << 0,
-  FLAG_RELAYED        = 1U << 1,
   FLAG_HAS_TIMESTAMPS = 1U << 2,
 };
 
@@ -35,7 +35,6 @@ enum class MessageType : uint8_t {
   HISTORY = 1,
   ACK = 2,
   CONFIG = 3,
-  RELAY = 4,
 };
 
 struct FrameHeaderV1 {

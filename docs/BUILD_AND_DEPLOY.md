@@ -50,6 +50,17 @@ An unprovisioned gateway starts `LoRaGateway-<gateway_id>`. Once provisioned,
 hold USER for five seconds to unlock writes for ten minutes; HTTP authentication
 is still required.
 
+## Repeater firmware
+
+```bash
+pio run -d components/repeater-firmware -e heltec_wifi_lora_32_v2
+pio run -d components/repeater-firmware -e heltec_wireless_tracker
+```
+
+An erased repeater starts a protected setup AP and prints its generated admin
+credential on serial. It does not need or store tracker AEAD keys. See
+[repeaters](REPEATERS.md) for forwarding policy, placement and qualification.
+
 ## Archiver
 
 ```bash
@@ -97,7 +108,7 @@ cd ../web-app
 npm test
 ```
 
-Run all three PlatformIO builds above. Before any field trial, also exercise a
+Run all five PlatformIO targets above. Before any field trial, also exercise a
 real TLS broker, supported browsers and physical devices as described in
 [simulation coverage](SIMULATION_COVERAGE.md).
 
@@ -109,12 +120,13 @@ maintenance window:
 1. Back up gateway configuration and the archiver database.
 2. Stop consumers and deploy the archiver and web app.
 3. Flash and provision the gateway, then verify TLS and broker ACLs.
-4. Flash each tracker with the matching release and verify its registry entry.
-5. Confirm current timestamps, increasing sequences, ACK-driven queue progress
+4. Flash and place repeaters, if used, then verify their airtime and hop policy.
+5. Flash each tracker with the matching release and verify its registry entry.
+6. Confirm current timestamps, increasing sequences, ACK-driven queue progress
    and a complete history response.
-6. Record the firmware commit and configuration revision for every unit.
+7. Record the firmware commit and configuration revision for every unit.
 
-Use `lora-tracker.code-workspace` to open both PlatformIO projects in VS Code.
+Use `lora-tracker.code-workspace` to open all PlatformIO projects in VS Code.
 
 ## Automated builds and releases
 

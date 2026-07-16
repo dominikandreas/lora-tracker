@@ -3,10 +3,10 @@
 ## System roles
 
 ```text
-+------------------+       LoRa history/ACK       +------------------+
-| Battery tracker  | <--------------------------> | Wi-Fi gateway     |
-| GNSS + RTC queue |                               | multi-tracker RX  |
-+------------------+                               +--------+---------+
++------------------+   encrypted LoRa   +------------------+   encrypted LoRa   +------------------+
+| Battery tracker  | <----------------> | Keyless repeater | <----------------> | Wi-Fi gateway    |
+| GNSS + RTC queue |   HISTORY / ACK     | bounded flooding |   HISTORY / ACK     | multi-tracker RX |
++------------------+                    +------------------+                    +--------+---------+
                                                             |
                                                       MQTT over TLS*
                                                             |
@@ -17,11 +17,12 @@
              | SQLite       |    | MQTT WS/PWA  |                      | consumers   |
              +--------------+    +---------------+                      +-------------+
 
-* TLS is recommended but end-to-end payload encryption is not implemented yet.
+* LoRa payloads are end-to-end AES-256-GCM encrypted between tracker and
+  gateway. MQTT uses independently configured TLS.
 ```
 
-Future relay nodes may forward encrypted LoRa frames without knowing tracker
-keys. They are not implemented in this release.
+Repeaters are optional. Direct tracker/gateway traffic uses the same link header
+with hop count zero and may set the hop limit to zero.
 
 ## Tracker
 
@@ -29,6 +30,9 @@ The tracker wakes on a timer or user action, acquires a GNSS fix under an
 adaptive timeout policy, classifies motion, stores route points in RTC memory,
 and transmits batches when either enough points or enough time has accumulated.
 Missing ACKs retain the queue and trigger exponential retry backoff.
+
+The tracker keeps its radio open for the configured ACK window and ignores its
+own relayed history or unrelated traffic while waiting for a matching ACK.
 
 History v2 combines:
 
@@ -50,6 +54,14 @@ state, and ACKs only after successful packet processing.
 
 The gateway can register up to 12 trackers. Unknown identities and unsupported
 schemas are rejected.
+
+## Repeater
+
+The repeater wraps no new application data and holds no tracker keys. It
+increments a six-byte mutable link header while preserving the authenticated
+secure frame byte-for-byte. Hop limits, deterministic priority jitter, duplicate
+suppression, a bounded queue and an airtime token bucket constrain flooding in
+both directions. See [repeaters](REPEATERS.md).
 
 ## MQTT and archiver
 
@@ -77,8 +89,8 @@ Three concepts must remain separate:
 
 1. `device_id`: human-managed canonical identifier such as `wera`.
 2. `device_hash`: current FNV-1a routing identifier; public and non-secret.
-3. Future device secret/key: random cryptographic material used for AEAD and
-   authentication. It does not exist yet.
+3. `lora_aead_key`: random per-tracker 256-bit secret shared only with authorized
+   gateways; repeaters never receive it.
 
 The routing hash must never be treated as a password or encryption key.
 
@@ -86,6 +98,7 @@ The routing hash must never be treated as a password or encryption key.
 
 - Tracker: RTC history/state plus selected NVS checkpoints and configuration.
 - Gateway: NVS configuration and per-tracker deduplication cursors.
+- Repeater: CRC-protected NVS forwarding/radio configuration and admin credential.
 - Archiver: SQLite point and reception tables.
 - Web app: IndexedDB point cache and localStorage connection preferences.
 

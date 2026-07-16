@@ -1,11 +1,11 @@
 # Persistent configuration schema
 
-The tracker and gateway use a versioned, CRC-protected persistent
-configuration. The current schema version is 2.
+Tracker, gateway and repeater firmware use versioned, CRC-protected persistent
+configuration. The current shared schema version is 4.
 
 ## Storage envelope
 
-Both roles store a fixed-size configuration blob in ESP32 Preferences namespace
+All roles store a fixed-size configuration blob in ESP32 Preferences namespace
 `eqcfg` under two keys:
 
 - `active`: the configuration used at boot
@@ -19,7 +19,7 @@ Every blob begins with `ConfigHeaderV1`:
 | `schema_version` | Configuration data-model version |
 | `struct_size` | Rejects incompatible layouts before decoding |
 | `revision` | Monotonic revision for synchronization and conflict handling |
-| `role` | Tracker or gateway |
+| `role` | Tracker, gateway or repeater |
 | `crc32` | Detects corruption and incomplete writes |
 
 On load, firmware tries `active`, then `backup`, then factory defaults. A valid
@@ -32,8 +32,8 @@ The tracker configuration contains:
 
 - canonical device ID, display name and derived public device hash
 - Wi-Fi setup credentials and bounded BLE-debug preference
-- LoRa frequency, bandwidth, spreading factor, coding rate, preamble, sync word
-  and TX power
+- LoRa frequency, bandwidth, spreading factor, coding rate, preamble, sync word,
+  TX power and relay hop limit
 - normal batching, ACK timeout and retry-backoff policy
 - GPS quality and anti-teleport thresholds
 - acquisition timeout/backoff policy
@@ -44,7 +44,7 @@ The tracker configuration contains:
 The history buffer size and wire delta unit remain firmware-layout constants;
 changing them requires a state/protocol migration rather than a normal setting.
 
-When no valid configuration exists, first boot creates a fresh schema-2 blob
+When no valid configuration exists, first boot creates a fresh schema-4 blob
 from the provisioning seeds in `secrets.h`. Older configuration layouts are
 not imported. Runtime distance, boot ID, history and transmission state remain
 separate from the configuration blob.
@@ -69,6 +69,14 @@ namespaces are based on the device hash.
 the runtime `mqtt_ca_certificate` field; `secrets.h` is an optional factory
 seed. Plaintext MQTT is blocked unless its separate test-only build seed
 explicitly allows it.
+
+## RepeaterConfigV1
+
+The repeater configuration contains its canonical ID/name, matching LoRa
+profile, local hop cap, forwarding base delay and deterministic priority slots,
+duplicate-cache lifetime, heartbeat interval and hourly airtime budget. It has
+no tracker registry or AEAD keys. It uses the same active/backup recovery
+pattern as the other embedded roles.
 
 ## Validation
 

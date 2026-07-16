@@ -46,3 +46,7 @@ jobs:
           pio run -d components/tracker-firmware -e heltec_wireless_tracker
       - name: Build gateway firmware
         run: pio run -d components/gateway-firmware -e heltec_wifi_lora_32_v2
+      - name: Build repeater firmware
+        run: |
+          pio run -d components/repeater-firmware -e heltec_wifi_lora_32_v2
+          pio run -d components/repeater-firmware -e heltec_wireless_tracker

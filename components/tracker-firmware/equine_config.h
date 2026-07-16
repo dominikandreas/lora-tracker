@@ -6,11 +6,12 @@
 #include <math.h>
 
 #include "equine_protocol.h"
+#include "equine_relay.h"
 
 namespace EquineConfig {
 
 constexpr uint32_t CONFIG_MAGIC = 0x45434647UL;  // "ECFG"
-constexpr uint16_t CONFIG_SCHEMA_VERSION = 3;
+constexpr uint16_t CONFIG_SCHEMA_VERSION = 4;
 constexpr uint8_t MAX_GATEWAY_TRACKERS = 12;
 constexpr size_t DEVICE_ID_SIZE = 25;       // 24 chars + NUL
 constexpr size_t DEVICE_NAME_SIZE = 33;     // 32 chars + NUL
@@ -28,6 +29,7 @@ constexpr const char* BACKUP_CONFIG_KEY = "backup";
 enum class DeviceRole : uint8_t {
   TRACKER = 1,
   GATEWAY = 2,
+  REPEATER = 3,
 };
 
 struct ConfigHeaderV1 {
@@ -48,7 +50,8 @@ struct LoRaConfigV1 {
   uint8_t coding_rate_denominator;
   uint8_t preamble_length;
   uint8_t sync_word;
-  uint8_t reserved[3];
+  uint8_t relay_hop_limit;
+  uint8_t reserved[2];
 } __attribute__((packed));
 
 struct TrackerConfigV1 {
@@ -139,10 +142,28 @@ struct GatewayConfigV1 {
   GatewayTrackerConfigV1 trackers[MAX_GATEWAY_TRACKERS];
 } __attribute__((packed));
 
+struct RepeaterConfigV1 {
+  ConfigHeaderV1 header;
+
+  char repeater_id[DEVICE_ID_SIZE];
+  char repeater_name[DEVICE_NAME_SIZE];
+  LoRaConfigV1 lora;
+
+  uint16_t forwarding_base_delay_ms;
+  uint16_t forwarding_slot_width_ms;
+  uint8_t forwarding_slot_count;
+  uint8_t reserved_forwarding;
+  uint16_t duplicate_cache_ttl_s;
+  uint16_t heartbeat_interval_s;
+  uint32_t airtime_budget_ms_per_hour;
+} __attribute__((packed));
+
 static_assert(sizeof(TrackerConfigV1) < 1024,
               "Tracker config should remain a compact NVS blob");
 static_assert(sizeof(GatewayConfigV1) < 2048,
               "Gateway config should remain a compact NVS blob");
+static_assert(sizeof(RepeaterConfigV1) < 256,
+              "Repeater config should remain a compact NVS blob");
 
 inline uint32_t crc32(const uint8_t* data, size_t length) {
   uint32_t crc = 0xFFFFFFFFUL;
@@ -210,7 +231,8 @@ inline bool validateLoRa(const LoRaConfigV1& config) {
          config.spreading_factor >= 7 && config.spreading_factor <= 12 &&
          config.coding_rate_denominator >= 5 &&
          config.coding_rate_denominator <= 8 &&
-         config.preamble_length >= 6 && config.preamble_length <= 32;
+         config.preamble_length >= 6 && config.preamble_length <= 32 &&
+         config.relay_hop_limit <= EquineRelay::MAX_HOPS;
 }
 
 template <typename T>
@@ -257,7 +279,7 @@ inline bool validateTrackerConfig(const TrackerConfigV1& config) {
 
   if (config.lora_tx_interval_s < 10 || config.lora_tx_interval_s > 86400 ||
       config.lora_tx_min_points == 0 || config.lora_tx_min_points > 100 ||
-      config.lora_ack_timeout_ms < 100 || config.lora_ack_timeout_ms > 10000) {
+      config.lora_ack_timeout_ms < 100 || config.lora_ack_timeout_ms > 30000) {
     return false;
   }
   for (uint8_t i = 0; i < 4; i++) {
@@ -355,6 +377,26 @@ inline bool validateGatewayConfig(const GatewayConfigV1& config) {
   return true;
 }
 
+inline bool validateRepeaterConfig(const RepeaterConfigV1& config) {
+  return validateEnvelope(config, DeviceRole::REPEATER) &&
+         isValidCanonicalId(config.repeater_id, sizeof(config.repeater_id)) &&
+         isValidDisplayName(config.repeater_name, sizeof(config.repeater_name)) &&
+         validateLoRa(config.lora) &&
+         config.lora.relay_hop_limit > 0 &&
+         config.forwarding_base_delay_ms >= 10 &&
+         config.forwarding_base_delay_ms <= 2000 &&
+         config.forwarding_slot_width_ms >= 5 &&
+         config.forwarding_slot_width_ms <= 1000 &&
+         config.forwarding_slot_count >= 1 &&
+         config.forwarding_slot_count <= 32 &&
+         config.duplicate_cache_ttl_s >= 10 &&
+         config.duplicate_cache_ttl_s <= 3600 &&
+         config.heartbeat_interval_s >= 10 &&
+         config.heartbeat_interval_s <= 3600 &&
+         config.airtime_budget_ms_per_hour >= 1000 &&
+         config.airtime_budget_ms_per_hour <= 36000;
+}
+
 inline void setDefaultLoRa(LoRaConfigV1& config) {
   memset(&config, 0, sizeof(config));
   config.frequency_hz = 868000000UL;
@@ -364,6 +406,7 @@ inline void setDefaultLoRa(LoRaConfigV1& config) {
   config.coding_rate_denominator = 5;
   config.preamble_length = 8;
   config.sync_word = 0x12;
+  config.relay_hop_limit = 2;
 }
 
 inline void makeDefaultTrackerConfig(
@@ -389,7 +432,7 @@ inline void makeDefaultTrackerConfig(
   setDefaultLoRa(config.lora);
   config.lora_tx_interval_s = 300;
   config.lora_tx_min_points = 3;
-  config.lora_ack_timeout_ms = 800;
+  config.lora_ack_timeout_ms = 15000;
   config.lora_retry_backoff_s[0] = 60;
   config.lora_retry_backoff_s[1] = 120;
   config.lora_retry_backoff_s[2] = 300;
@@ -464,6 +507,27 @@ inline void makeDefaultGatewayConfig(
   config.wifi_retry_interval_ms = 10000;
   config.mqtt_retry_interval_ms = 5000;
   finalize(config, DeviceRole::GATEWAY, 1);
+}
+
+inline void makeDefaultRepeaterConfig(
+    RepeaterConfigV1& config,
+    const char* repeater_id,
+    const char* repeater_name) {
+  memset(&config, 0, sizeof(config));
+  strlcpy(config.repeater_id, repeater_id, sizeof(config.repeater_id));
+  strlcpy(config.repeater_name, repeater_name, sizeof(config.repeater_name));
+  setDefaultLoRa(config.lora);
+  // Repeaters are infrastructure devices; conservative 14 dBm is a safer EU
+  // default than the battery tracker profile. Deployment-specific EIRP and
+  // duty-cycle limits still need to be checked by the operator.
+  config.lora.tx_power_dbm = 14;
+  config.forwarding_base_delay_ms = 40;
+  config.forwarding_slot_width_ms = 45;
+  config.forwarding_slot_count = 8;
+  config.duplicate_cache_ttl_s = 120;
+  config.heartbeat_interval_s = 60;
+  config.airtime_budget_ms_per_hour = 36000;
+  finalize(config, DeviceRole::REPEATER, 1);
 }
 
 }  // namespace EquineConfig

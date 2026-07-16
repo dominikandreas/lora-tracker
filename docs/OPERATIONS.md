@@ -61,11 +61,14 @@ periodically.
 ## Missing LoRa ACKs
 
 Confirm tracker and gateway share frequency, bandwidth, spreading factor,
-coding rate, sync word and preamble. Check gateway RSSI/logs. Failed ACKs retain
+coding rate, sync word and preamble; repeaters must match as well. Check gateway
+RSSI/logs and repeater forwarded/suppressed/drop counters. Failed ACKs retain
 the queue and use 1/2/5/10-minute retry backoff by default.
 
-For multiple gateways or future relays, ACK collision avoidance remains future
-work.
+The link uses deterministic repeater priority slots and peer suppression, but
+hidden repeaters and multiple receivers can still produce duplicate ACKs or
+collisions. Use the smallest useful hop limit, keep repeater IDs unique and
+measure the installed topology. See [repeaters](REPEATERS.md).
 
 ## Database operation
 
