@@ -110,3 +110,15 @@ test('georeferenced points use great-circle distance and support safe editing re
   assert.equal(engine.scenario.devices.some((device) => device.id === 'tracker-1'), false);
   assert.deepEqual(engine.scenario.devices.find((device) => device.role === 'receiver').config.registeredTrackerIds, []);
 });
+
+test('snapshot exposes bounded local tracks, archive provenance and live link margins', () => {
+  const core = new ReferenceCore();
+  const scenario = createDefaultScenario();
+  const engine = new SimulationEngine(scenario, core);
+  engine.advance(1800);
+  const snapshot = engine.snapshot();
+  assert.ok(snapshot.trackHistory['tracker-1'].length > 0);
+  assert.ok(snapshot.archive.length > 0);
+  assert.equal(snapshot.archive.every((point) => point.gatewayId === 'gateway-1' && point.archivedAtS >= 0), true);
+  assert.ok(snapshot.links.some((link) => link.fromId === 'tracker-1' && link.toId === 'gateway-1'));
+});

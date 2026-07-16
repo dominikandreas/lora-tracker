@@ -71,3 +71,16 @@ test('edits polygons, removes waypoints and accepts a manual satellite location'
   await page.locator('[data-remove-waypoint="1"]').click();
   await expect(page.locator('[data-remove-waypoint]')).toHaveCount(3);
 });
+
+test('shows local device state and timeline/archive viewers', async ({ page }) => {
+  await page.goto('/');
+  const box = await page.locator('#map').boundingBox();
+  await page.mouse.click(box.x + box.width * .12, box.y + box.height * .69);
+  await expect(page.locator('summary')).toHaveText('Local device state');
+  await page.locator('summary').click();
+  await expect(page.locator('.local-state pre')).toContainText('airtimeTokensMs');
+  for (let index = 0; index < 10; index += 1) await page.locator('#step').click();
+  await expect(page.locator('#track-summary')).toContainText('points');
+  await expect(page.locator('#archive-gateway')).toHaveValue('gateway-1');
+  await expect(page.locator('#archive-summary')).toContainText('committed');
+});

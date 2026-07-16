@@ -48,3 +48,14 @@ that provider only while satellite mode is selected; no location is sent to the
 simulator service. Geographic positions shown in the inspector and route/link
 lengths use a great-circle (haversine) calculation. The underlying RF/obstacle
 model remains a local engineering model and is not terrain-aware.
+
+## Inspection and replay
+
+Selecting a device exposes its modeled local state: sleep/radio status,
+airtime tokens, queues, retry/GNSS counters, relay cache/queue state and packet
+statistics. The tracker timeline overlays local GNSS points up to a chosen
+simulation time. The archive map separately overlays only points durably
+committed through the selected receiver and tracker, including the archive-node
+provenance. Select a device to show dashed red links to modem-compatible peers
+that are currently below receiver sensitivity; the label gives the negative
+link margin. These are model diagnostics, not a regulatory range statement.

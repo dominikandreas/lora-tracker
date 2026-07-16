@@ -20,6 +20,10 @@ let editTarget = null;
 let knownEventId = 0;
 let visibleAfterEventId = 0;
 let backgroundImage = null;
+let trackDeviceId = null;
+let trackTimeS = null;
+let archiveGatewayId = null;
+let archiveTrackerId = null;
 const satelliteTiles = new Map();
 const animations = [];
 const txOrigins = new Map();
@@ -114,6 +118,30 @@ function updateStatus() {
   const map = snapshot.scenario.map;
   setValue('#map-mode', map.mode); setValue('#map-latitude', map.centerLat); setValue('#map-longitude', map.centerLng); setValue('#map-zoom', map.zoom);
   $('#map-location').textContent = `${map.mode === 'satellite' ? 'Satellite imagery: Esri World Imagery.' : 'Metre grid.'} Centre ${map.centerLat.toFixed(6)}, ${map.centerLng.toFixed(6)} · points use great-circle distances.`;
+  updateHistoryControls();
+}
+
+function setOptions(element, items, selected) {
+  const current = selected && items.some((item) => item.id === selected) ? selected : items[0]?.id ?? '';
+  if (element.value !== current || element.options.length !== items.length) element.innerHTML = items.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join('');
+  element.value = current;
+  return current;
+}
+
+function updateHistoryControls() {
+  const trackers = snapshot.devices.filter((device) => device.role === 'tracker').map((device) => ({ id: device.id, name: device.name }));
+  const gateways = snapshot.devices.filter((device) => device.role === 'receiver').map((device) => ({ id: device.id, name: device.name }));
+  trackDeviceId = setOptions($('#track-device'), trackers, trackDeviceId);
+  archiveTrackerId = setOptions($('#archive-tracker'), trackers, archiveTrackerId ?? trackDeviceId);
+  archiveGatewayId = setOptions($('#archive-gateway'), gateways, archiveGatewayId);
+  trackTimeS ??= snapshot.timeS;
+  trackTimeS = Math.min(trackTimeS, snapshot.timeS);
+  const slider = $('#track-time'); slider.max = String(Math.max(1, Math.floor(snapshot.timeS))); slider.value = String(trackTimeS);
+  const local = snapshot.trackHistory[trackDeviceId] ?? [];
+  const visible = local.filter((point) => point.timeS <= trackTimeS);
+  $('#track-summary').textContent = `${visible.length}/${local.length} points · ${formatTime(trackTimeS, snapshot.scenario.clock.startHour).short}`;
+  const archived = snapshot.archive.filter((point) => point.gatewayId === archiveGatewayId && point.deviceId === archiveTrackerId);
+  $('#archive-summary').textContent = `${archived.length} committed`;
 }
 
 function setValue(selector, value) {
@@ -296,6 +324,10 @@ $('#locate').addEventListener('click', () => {
     post('environment', { patch: { map: { centerLat: position.coords.latitude, centerLng: position.coords.longitude, mode: 'satellite' } } });
   }, (error) => notify(`Location unavailable: ${error.message}`), { enableHighAccuracy: true, timeout: 15000, maximumAge: 300000 });
 });
+$('#track-device').addEventListener('change', (event) => { trackDeviceId = event.target.value; updateHistoryControls(); });
+$('#track-time').addEventListener('input', (event) => { trackTimeS = Number(event.target.value); updateHistoryControls(); });
+$('#archive-gateway').addEventListener('change', (event) => { archiveGatewayId = event.target.value; updateHistoryControls(); });
+$('#archive-tracker').addEventListener('change', (event) => { archiveTrackerId = event.target.value; updateHistoryControls(); });
 
 $('#export').addEventListener('click', () => {
   if (!snapshot) return;
@@ -337,6 +369,7 @@ function renderInspector() {
   $('#selection-status').textContent = entity?.role ?? entity?.type ?? '';
   if (!entity) { form.innerHTML = ''; $('#link-detail').hidden = true; return; }
   if (entity.role) renderDeviceForm(entity); else renderObstacleForm(entity);
+  if (entity.role) renderLocalState(entity);
   const locationPoint = entity.role || entity.type === 'tree' ? entity : polygonCenter(entity.points);
   const location = geoPosition(snapshot.scenario, locationPoint);
   if (location) form.insertAdjacentHTML('beforeend', `<div class="wide point-location">Map point ${location.latitude.toFixed(6)}, ${location.longitude.toFixed(6)} · ${exactDistanceM(snapshot.scenario, locationPoint, { x: snapshot.scenario.world.widthM / 2, y: snapshot.scenario.world.heightM / 2 }).toFixed(1)} m from map centre</div><button class="remove-entity wide" type="button" id="remove-entity">Remove ${escapeHtml(entity.name ?? entity.label ?? entity.id)}</button>`);
@@ -350,6 +383,26 @@ function renderInspector() {
     $('#link-detail').hidden = false;
     $('#link-detail').innerHTML = `<strong>Latest link budget</strong><br>${link.rangeM.toFixed(0)} m · ${link.rxPowerDbm.toFixed(1)} dBm received · ${link.marginDb.toFixed(1)} dB margin<br>Free space ${link.freeSpaceLoss.toFixed(1)} dB · ground ${link.excessGroundLoss.toFixed(1)} dB · height ${link.heightBenefitDb.toFixed(1)} dB benefit · forest ${link.forestLoss.toFixed(1)} dB · buildings ${link.buildingLoss.toFixed(1)} dB · trees ${link.treeLoss.toFixed(1)} dB · seeded fading ${link.fadingDb.toFixed(1)} dB · atmosphere ${link.atmosphereLoss.toFixed(4)} dB`;
   } else $('#link-detail').hidden = true;
+}
+
+function renderLocalState(device) {
+  const runtime = device.runtime;
+  const state = {
+    status: runtime.status,
+    nextWakeS: runtime.nextWakeS,
+    queueDepth: runtime.queue.length,
+    airtimeTokensMs: Math.round(runtime.airtimeTokensMs),
+    airtimeCapacityMs: Math.round(runtime.airtimeCapacityMs),
+    failures: runtime.failures,
+    noFixCycles: runtime.noFixCycles,
+    stationaryStreak: runtime.stationaryStreak,
+    pendingRelays: Object.keys(runtime.pending).length,
+    seenFrames: Object.keys(runtime.seen).length,
+    inflightFrames: Object.keys(runtime.inflight).length,
+    statistics: runtime.stats,
+    queue: runtime.queue.map(({ seq, timeS, batteryPct }) => ({ seq, timeS, batteryPct })),
+  };
+  form.insertAdjacentHTML('beforeend', `<details class="local-state wide"><summary>Local device state</summary><pre>${escapeHtml(JSON.stringify(state, null, 2))}</pre></details>`);
 }
 
 function renderDeviceForm(device) {
@@ -481,6 +534,8 @@ function draw() {
   for (let gy = 0; gy <= world.heightM; gy += world.gridM) { context.beginPath(); context.moveTo(0, y(gy)); context.lineTo(width, y(gy)); context.stroke(); }
 
   for (const obstacle of snapshot.scenario.obstacles) drawObstacle(obstacle, x, y, sx, sy);
+  drawHistoryOverlays(x, y);
+  drawOutOfRangeLinks(x, y);
   for (const device of snapshot.devices.filter((item) => item.role === 'tracker')) {
     context.strokeStyle = 'rgba(92,224,160,.35)'; context.lineWidth = 1.5; context.setLineDash([5, 5]); context.beginPath();
     device.waypoints.forEach((point, index) => index ? context.lineTo(x(point.x), y(point.y)) : context.moveTo(x(point.x), y(point.y)));
@@ -491,6 +546,33 @@ function draw() {
   for (const device of snapshot.devices) drawDevice(device, x, y);
   const selected = snapshot.devices.find((item) => item.id === selectedId);
   if (selected) { context.strokeStyle = '#edf6f2'; context.lineWidth = 1.5; context.beginPath(); context.arc(x(selected.x), y(selected.y), 17, 0, Math.PI * 2); context.stroke(); }
+}
+
+function drawHistoryOverlays(x, y) {
+  const local = (snapshot.trackHistory[trackDeviceId] ?? []).filter((point) => point.timeS <= trackTimeS);
+  const archived = snapshot.archive.filter((point) => point.gatewayId === archiveGatewayId && point.deviceId === archiveTrackerId);
+  const drawPath = (points, stroke, marker, label) => {
+    if (!points.length) return;
+    context.save(); context.strokeStyle = stroke; context.lineWidth = 2; context.setLineDash([4, 3]); context.beginPath();
+    points.forEach((point, index) => index ? context.lineTo(x(point.x), y(point.y)) : context.moveTo(x(point.x), y(point.y))); context.stroke(); context.setLineDash([]);
+    for (const point of points) { context.fillStyle = marker; context.beginPath(); context.arc(x(point.x), y(point.y), 3, 0, Math.PI * 2); context.fill(); }
+    const last = points.at(-1); context.fillStyle = marker; context.font = '10px system-ui'; context.fillText(label, x(last.x) + 7, y(last.y) + 12); context.restore();
+  };
+  drawPath(local, 'rgba(92,224,160,.92)', '#5ce0a0', 'local track');
+  drawPath(archived, 'rgba(104,184,255,.92)', '#68b8ff', 'archive');
+}
+
+function drawOutOfRangeLinks(x, y) {
+  if (!selectedId) return;
+  const from = snapshot.devices.find((device) => device.id === selectedId);
+  if (!from) return;
+  for (const link of snapshot.links.filter((item) => item.fromId === from.id && item.marginDb < 0)) {
+    const to = snapshot.devices.find((device) => device.id === link.toId);
+    if (!to) continue;
+    context.save(); context.strokeStyle = 'rgba(255,117,109,.9)'; context.lineWidth = 2; context.setLineDash([7, 5]); context.beginPath(); context.moveTo(x(from.x), y(from.y)); context.lineTo(x(to.x), y(to.y)); context.stroke(); context.setLineDash([]);
+    context.beginPath(); context.moveTo(x(to.x) - 7, y(to.y) - 7); context.lineTo(x(to.x) + 7, y(to.y) + 7); context.moveTo(x(to.x) + 7, y(to.y) - 7); context.lineTo(x(to.x) - 7, y(to.y) + 7); context.stroke();
+    context.fillStyle = '#ff756d'; context.font = '10px system-ui'; context.fillText(`out of range ${link.marginDb.toFixed(1)} dB`, x((from.x + to.x) / 2) + 4, y((from.y + to.y) / 2) - 4); context.restore();
+  }
 }
 
 function drawObstacle(obstacle, x, y, sx, sy) {

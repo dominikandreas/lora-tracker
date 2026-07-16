@@ -37,6 +37,14 @@ reference only: terrain, elevation and imagery-derived objects are not
 automatically modeled. Scenario schema 2 intentionally requires polygon
 obstacles; old rectangular exports are rejected rather than silently changed.
 
+Selecting a device exposes its modeled local state (queues, sleep/radio state,
+airtime tokens, GNSS/retry counters and traffic statistics). The tracker
+timeline draws locally acquired points at a selected simulation time, while the
+archive map draws only durably committed points for a selected archive node and
+tracker. Selecting a device also shows dashed red peer links that are currently
+below receiver sensitivity, labeled with their negative margin. Those overlays
+are deterministic diagnostics, not a prediction of field coverage.
+
 ## Browser model
 
 | Boundary / behaviour | Implementation |

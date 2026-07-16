@@ -82,6 +82,24 @@
         <form id="device-form" hidden></form>
         <div id="link-detail" class="link-detail" hidden></div>
       </section>
+
+      <section>
+        <div class="section-heading"><div><span class="eyebrow">Playback</span><h2>Tracker timeline</h2></div><span id="track-summary"></span></div>
+        <div class="form-grid">
+          <label class="wide">Tracker<select id="track-device"></select></label>
+          <label class="wide">View time <input id="track-time" type="range" min="0" max="0" value="0" step="1"></label>
+        </div>
+        <p class="hint">Shows local GNSS points from the selected tracker up to the chosen simulation time.</p>
+      </section>
+
+      <section>
+        <div class="section-heading"><div><span class="eyebrow">Archive</span><h2>Historic archive map</h2></div><span id="archive-summary"></span></div>
+        <div class="form-grid">
+          <label>Archive node<select id="archive-gateway"></select></label>
+          <label>Tracker<select id="archive-tracker"></select></label>
+        </div>
+        <p class="hint">Shows points durably committed through the selected receiver. It deliberately excludes queued or merely transmitted points.</p>
+      </section>
     </aside>
   </main>
 

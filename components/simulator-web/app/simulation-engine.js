@@ -222,6 +222,7 @@ export class SimulationEngine {
     this.tasks = [];
     this.transmissions = [];
     this.archive = new Map();
+    this.trackHistory = new Map();
     this.eventId = 0;
     this.taskId = 0;
     this.devices = new Map(this.scenario.devices.map((device) => {
@@ -420,6 +421,9 @@ export class SimulationEngine {
         const point = { seq: r.nextSeq++, x: tracker.x, y: tracker.y, timeS: this.timeS,
           batteryPct: Math.round(r.batteryMah / tracker.config.batteryCapacityMah * 100) };
         r.queue.push(point);
+        const history = this.trackHistory.get(tracker.id) ?? [];
+        history.push(deepCopy(point));
+        this.trackHistory.set(tracker.id, history.slice(-2000));
         r.lastPoint = { x: tracker.x, y: tracker.y };
         r.stationaryStreak = movementAccepted ? 0 : r.stationaryStreak + 1;
         this.log('queue', `${tracker.name} queued point #${point.seq}`, {
@@ -643,7 +647,7 @@ export class SimulationEngine {
     let inserted = 0;
     for (const point of frame.points) {
       const key = `${frame.deviceId}:${frame.bootId}:${point.seq}`;
-      if (!this.archive.has(key)) { this.archive.set(key, { ...point, deviceId: frame.deviceId }); inserted += 1; }
+      if (!this.archive.has(key)) { this.archive.set(key, { ...point, deviceId: frame.deviceId, gatewayId, archivedAtS: this.timeS }); inserted += 1; }
     }
     gateway.runtime.stats.archived += inserted;
     this.log('archive', `MQTT archive committed ${inserted} new point${inserted === 1 ? '' : 's'}`, {
@@ -714,14 +718,19 @@ export class SimulationEngine {
 
   snapshot() {
     const environment = environmentAt(this.scenario, this.timeS);
+    const devices = [...this.devices.values()];
+    const links = [];
+    for (const from of devices) for (const to of devices) if (from.id !== to.id && this.sameModem(from.radio, to.radio)) {
+      links.push({ fromId: from.id, toId: to.id, ...calculateLink(this.scenario, this.core, from, to, this.timeS, `inspection:${from.id}:${to.id}`) });
+    }
     return {
       timeS: this.timeS,
       environment,
-      scenario: deepCopy({ ...this.scenario, devices: [...this.devices.values()].map((device) => {
+      scenario: deepCopy({ ...this.scenario, devices: devices.map((device) => {
         const { runtime, ...plain } = device;
         return plain;
       }) }),
-      devices: [...this.devices.values()].map((device) => ({
+      devices: devices.map((device) => ({
         ...deepCopy(device),
         batteryPct: device.role === 'tracker'
           ? clamp(device.runtime.batteryMah / device.config.batteryCapacityMah * 100, 0, 100)
@@ -729,6 +738,9 @@ export class SimulationEngine {
       })),
       events: deepCopy(this.events.slice(-160)),
       transmissions: deepCopy(this.transmissions.filter((tx) => tx.endS + 1 >= this.timeS)),
+      trackHistory: Object.fromEntries([...this.trackHistory].map(([id, points]) => [id, deepCopy(points)])),
+      archive: deepCopy([...this.archive.values()]),
+      links,
       mqtt: { ...this.scenario.mqtt, archivedPoints: this.archive.size },
       core: { kind: this.core.kind, version: this.core.version },
     };

@@ -74,6 +74,9 @@ h1, h2 { margin: 0; font-size: 1rem; } h1 { font-size: 1.15rem; }
 .waypoint-list button, .remove-entity { padding: .28rem .45rem; font-size: .7rem; }
 .point-location { color: var(--muted); font-size: .72rem; line-height: 1.45; border-top: 1px solid var(--line); padding-top: .65rem; }
 .remove-entity { color: var(--red); border-color: color-mix(in srgb, var(--red) 55%, var(--line)); }
+.local-state { border-top: 1px solid var(--line); padding-top: .65rem; color: var(--muted); font-size: .72rem; }
+.local-state summary { color: var(--text); cursor: pointer; }
+.local-state pre { margin: .55rem 0 0; white-space: pre-wrap; word-break: break-word; font: .67rem/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .empty-state { border: 1px dashed var(--line); border-radius: var(--radius); padding: 1rem; color: var(--muted); font-size: .8rem; line-height: 1.5; }
 #device-form { display: grid; grid-template-columns: 1fr 1fr; gap: .65rem; }
 #device-form h3 { grid-column: 1/-1; margin: .5rem 0 -.15rem; font-size: .75rem; color: var(--green); text-transform: uppercase; letter-spacing: .06em; }
