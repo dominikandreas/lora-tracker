@@ -102,6 +102,14 @@ compiles all five real firmware targets.
 
 ## What remains physical or infrastructural
 
+The global **Range pessimism** slider applies 0–50 dB of additional loss to
+every modeled link. New scenarios start at 20 dB. Use 25–35 dB as an initial
+range for harsh, hilly or obstructed sites with measured links near 200 m, then
+calibrate against repeated measurements in multiple orientations and weather
+conditions. This control represents terrain diffraction, body and antenna
+orientation, multipath and local interference that the geometry does not model;
+it does not change transmit power or Germany regulatory checks.
+
 The Network Lab is an engineering model, not a digital twin calibrated to a
 specific site. It cannot prove:
 

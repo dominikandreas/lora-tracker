@@ -60,10 +60,14 @@ polygon is placed beyond its previous boundary; the geographic anchor remains
 fixed, so existing coordinates do not drift. Each device inspector exposes
 **TX power (dBm conducted)** (2–14 dBm for the German profile), alongside
 antenna gain and cable loss; the resulting installation is still checked
-against the 14 dBm ERP limit. For field calibration, **Site loss dB** adds a
-measured terrain/body/polarization/multipath penalty to every link. It is the
-appropriate control when real range is materially shorter than the simplified
-free-space model; it does not alter regulatory limits.
+against the 14 dBm ERP limit. The global **Range pessimism** slider adds a
+repeatable 0–50 dB terrain/body/orientation/diffraction/multipath penalty to
+every link without altering regulatory limits. New scenarios default to 20 dB.
+For harsh obstructed sites where measured range is around 200 m, start at
+25–35 dB and adjust until simulated link margins match repeated field results.
+An observed hot/cold range difference should be calibrated here rather than
+attributed to dry-air temperature alone; the direct 868 MHz atmospheric and
+receiver-temperature effects are much smaller than typical site variability.
 
 ## Inspection and replay
 

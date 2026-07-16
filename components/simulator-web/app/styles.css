@@ -66,6 +66,8 @@ h1, h2 { margin: 0; font-size: 1rem; } h1 { font-size: 1.15rem; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: .65rem; }
 .form-grid label, #device-form label { color: var(--muted); font-size: .72rem; display: grid; gap: .28rem; }
 .form-grid .wide, #device-form .wide { grid-column: 1 / -1; }
+.range-setting > span { display: flex; justify-content: space-between; gap: .7rem; color: var(--muted); }
+.range-setting output { color: var(--text); font-variant-numeric: tabular-nums; }
 .switch { display: flex !important; align-items: center; gap: .45rem !important; align-self: end; min-height: 36px; }.switch input { accent-color: var(--green); }
 .hint { margin: .7rem 0 0; color: var(--muted); font-size: .69rem; line-height: 1.45; }
 .map-settings { margin-top: .65rem; }

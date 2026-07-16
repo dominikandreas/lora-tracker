@@ -73,12 +73,12 @@
           <label>Day humidity %<input id="day-humidity" type="number" min="0" max="100"></label>
           <label>Night humidity %<input id="night-humidity" type="number" min="0" max="100"></label>
           <label>Foliage wetness<input id="wetness" type="range" min="0" max="1" step="0.05"></label>
-          <label>Site loss dB<input id="site-loss" type="number" min="0" max="80" step="1"></label>
+          <label class="wide range-setting"><span>Global range pessimism <output id="range-pessimism-label" for="range-pessimism">Obstructed · 20 dB</output></span><input id="range-pessimism" type="range" min="0" max="50" step="1"></label>
           <label class="switch"><input id="mqtt-online" type="checkbox"><span>MQTT online</span></label>
           <label>Broker latency ms<input id="mqtt-latency" type="number" min="0" max="60000"></label>
           <label>Archive latency ms<input id="archive-latency" type="number" min="0" max="60000"></label>
         </div>
-        <p class="hint">Humidity mainly changes wet-foliage loss. Add site loss for terrain, body attenuation, polarization and multipath measured at this installation; 15–30 dB can make a sub-kilometre link realistic.</p>
+        <p class="hint">Range pessimism globally accounts for unmodeled terrain, body and antenna orientation, diffraction, multipath and local interference. Start around 25–35 dB for harsh, obstructed links near 200 m, then calibrate against field measurements.</p>
       </section>
 
       <section class="selection-section">

@@ -66,6 +66,11 @@ function notify(message) {
   setTimeout(() => toast.classList.remove('show'), 2200);
 }
 
+function rangePessimismLabel(value) {
+  const level = value < 5 ? 'Idealized' : value < 15 ? 'Light' : value < 25 ? 'Obstructed' : value < 35 ? 'Harsh' : 'Extreme';
+  return `${level} · ${value.toFixed(0)} dB`;
+}
+
 function post(type, payload = {}) { worker.postMessage({ type, ...payload }); }
 
 worker.onmessage = ({ data }) => {
@@ -134,7 +139,8 @@ function updateStatus() {
   const e = snapshot.scenario.environment;
   setValue('#day-temp', e.dayTemperatureC); setValue('#night-temp', e.nightTemperatureC);
   setValue('#day-humidity', e.dayHumidityPct); setValue('#night-humidity', e.nightHumidityPct);
-  setValue('#wetness', e.foliageWetness); setValue('#site-loss', e.siteLossDb ?? 0); $('#mqtt-online').checked = snapshot.mqtt.online;
+  setValue('#wetness', e.foliageWetness); setValue('#range-pessimism', e.siteLossDb ?? 0);
+  $('#range-pessimism-label').textContent = rangePessimismLabel(e.siteLossDb ?? 0); $('#mqtt-online').checked = snapshot.mqtt.online;
   setValue('#mqtt-latency', snapshot.mqtt.latencyMs);
   setValue('#archive-latency', snapshot.mqtt.archiveLatencyMs);
   const map = snapshot.scenario.map;
@@ -415,9 +421,10 @@ for (const [selector, factor] of [['#zoom-in', 1.25], ['#zoom-out', .8]]) $(sele
   const rect = canvas.getBoundingClientRect(); zoomMap(factor, rect.left + rect.width / 2, rect.top + rect.height / 2);
 });
 
-for (const [selector, path] of [['#day-temp', 'dayTemperatureC'], ['#night-temp', 'nightTemperatureC'], ['#day-humidity', 'dayHumidityPct'], ['#night-humidity', 'nightHumidityPct'], ['#wetness', 'foliageWetness'], ['#site-loss', 'siteLossDb']]) {
+for (const [selector, path] of [['#day-temp', 'dayTemperatureC'], ['#night-temp', 'nightTemperatureC'], ['#day-humidity', 'dayHumidityPct'], ['#night-humidity', 'nightHumidityPct'], ['#wetness', 'foliageWetness'], ['#range-pessimism', 'siteLossDb']]) {
   $(selector).addEventListener('change', (event) => post('environment', { patch: { environment: { [path]: Number(event.target.value) } } }));
 }
+$('#range-pessimism').addEventListener('input', (event) => { $('#range-pessimism-label').textContent = rangePessimismLabel(Number(event.target.value)); });
 $('#mqtt-online').addEventListener('change', (event) => post('environment', { patch: { mqtt: { online: event.target.checked } } }));
 $('#mqtt-latency').addEventListener('change', (event) => post('environment', { patch: { mqtt: { latencyMs: Number(event.target.value) } } }));
 $('#archive-latency').addEventListener('change', (event) => post('environment', { patch: { mqtt: { archiveLatencyMs: Number(event.target.value) } } }));
@@ -486,7 +493,7 @@ function renderInspector() {
   if (latestLink) {
     const link = latestLink.link;
     $('#link-detail').hidden = false;
-    $('#link-detail').innerHTML = `<strong>Latest link budget</strong><br>${link.rangeM.toFixed(0)} m · ${link.rxPowerDbm.toFixed(1)} dBm received · ${link.marginDb.toFixed(1)} dB margin<br>Free space ${link.freeSpaceLoss.toFixed(1)} dB · ground ${link.excessGroundLoss.toFixed(1)} dB · height ${link.heightBenefitDb.toFixed(1)} dB benefit · forest ${link.forestLoss.toFixed(1)} dB · buildings ${link.buildingLoss.toFixed(1)} dB · trees ${link.treeLoss.toFixed(1)} dB · site calibration ${link.siteLossDb.toFixed(1)} dB · seeded fading ${link.fadingDb.toFixed(1)} dB · atmosphere ${link.atmosphereLoss.toFixed(4)} dB`;
+    $('#link-detail').innerHTML = `<strong>Latest link budget</strong><br>${link.rangeM.toFixed(0)} m · ${link.rxPowerDbm.toFixed(1)} dBm received · ${link.marginDb.toFixed(1)} dB margin<br>Free space ${link.freeSpaceLoss.toFixed(1)} dB · ground ${link.excessGroundLoss.toFixed(1)} dB · height ${link.heightBenefitDb.toFixed(1)} dB benefit · forest ${link.forestLoss.toFixed(1)} dB · buildings ${link.buildingLoss.toFixed(1)} dB · trees ${link.treeLoss.toFixed(1)} dB · global pessimism ${link.siteLossDb.toFixed(1)} dB · seeded fading ${link.fadingDb.toFixed(1)} dB · atmosphere ${link.atmosphereLoss.toFixed(4)} dB`;
   } else $('#link-detail').hidden = true;
   if (pendingWaypointFocus?.id === entity.id) {
     const row = form.querySelector(`[data-waypoint-index="${pendingWaypointFocus.index}"]`);

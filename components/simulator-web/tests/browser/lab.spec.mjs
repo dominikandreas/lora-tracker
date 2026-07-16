@@ -124,7 +124,7 @@ test('pans, zooms and restores the map scenario after refresh', async ({ page })
   await expect(page.locator('#map-latitude')).toHaveValue('52.520008');
 });
 
-test('grows the editable world beyond the initial crop and calibrates site loss', async ({ page }) => {
+test('grows the editable world beyond the initial crop and calibrates global range pessimism', async ({ page }) => {
   await page.goto('/');
   await page.evaluate(() => localStorage.clear());
   await page.reload();
@@ -139,7 +139,7 @@ test('grows the editable world beyond the initial crop and calibrates site loss'
   await page.waitForTimeout(300);
   const scenario = await page.evaluate(() => JSON.parse(localStorage.getItem('lora-tracker.network-lab.scenario.v2')));
   expect(scenario.world.widthM).toBeGreaterThan(1000);
-  await page.locator('#site-loss').fill('22');
-  await page.locator('#site-loss').press('Enter');
-  await expect(page.locator('#site-loss')).toHaveValue('22');
+  await page.locator('#range-pessimism').fill('32');
+  await expect(page.locator('#range-pessimism-label')).toHaveText('Harsh · 32 dB');
+  await expect(page.locator('#range-pessimism')).toHaveValue('32');
 });

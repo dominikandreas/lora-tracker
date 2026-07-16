@@ -58,7 +58,7 @@ export function createDefaultScenario() {
     environment: {
       dayTemperatureC: 24, nightTemperatureC: 10,
       dayHumidityPct: 48, nightHumidityPct: 88,
-      foliageWetness: 0.35, siteLossDb: 0,
+      foliageWetness: 0.35, siteLossDb: 20,
     },
     mqtt: { online: true, latencyMs: 350, archiveLatencyMs: 500 },
     devices: [
