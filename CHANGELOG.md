@@ -31,6 +31,8 @@
 - Anchored archiver topic parsing to nested configured base topics and documented remaining power-loss queue work.
 - Added the self-contained browser Network Lab with the shared firmware policy core compiled to WASM, deterministic waypoint/environment/RF/repeater/MQTT simulation, scenario import/export and headless browser tests.
 - Added a shared relay-clear ACK guard after simulation exposed collisions between fast archive-backed ACKs and still-airborne repeater HISTORY frames.
+- Added relay link protocol v2 with selected reverse ACK routes, atomic HISTORY+ACK airtime reservations and packet-airtime-sized relay arbitration slots.
+- Fixed the browser simulator accepting ACKs after the tracker timeout; timeout now closes the receive window and puts the virtual radio to sleep.
 
 ## Initial implementation
 

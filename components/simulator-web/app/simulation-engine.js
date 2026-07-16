@@ -188,7 +188,9 @@ export async function validateScenario(scenario, core) {
 }
 
 function initialRuntime(device, core) {
-  const radioCapacity = core.airtimeMs(255, device.radio);
+  const ackAirtimeMs = core.airtimeMs(78, device.radio);
+  const radioCapacity = core.airtimeMs(255, device.radio) +
+    (device.role === 'repeater' ? ackAirtimeMs : 0);
   return {
     nextWakeS: device.role === 'tracker' ? 0 : null,
     waypointIndex: 0,
@@ -207,7 +209,9 @@ function initialRuntime(device, core) {
     airtimeCapacityMs: radioCapacity,
     seen: {},
     pending: {},
+    ackReservations: {},
     inflight: {},
+    rxWindowUntilS: null,
     batteryMah: device.role === 'tracker'
       ? device.config.batteryCapacityMah * (device.batteryPct ?? 100) / 100
       : null,
@@ -353,6 +357,12 @@ export class SimulationEngine {
       for (const [key, expires] of Object.entries(runtime.seen)) {
         if (expires <= this.timeS) delete runtime.seen[key];
       }
+      for (const [key, reservation] of Object.entries(runtime.ackReservations)) {
+        if (reservation.expiresS > this.timeS) continue;
+        runtime.airtimeTokensMs = Math.min(runtime.airtimeCapacityMs,
+          runtime.airtimeTokensMs + reservation.airtimeMs);
+        delete runtime.ackReservations[key];
+      }
     }
   }
 
@@ -442,14 +452,17 @@ export class SimulationEngine {
     }
 
     const retryReady = r.failures === 0 || r.secondsSinceAttempt >= this.core.retrySeconds(tracker.config, r.failures);
+    let transmitted = false;
     if (this.core.batchDue(tracker.config, r.queue.length, r.secondsSinceAck) && retryReady) {
-      this.transmitHistory(tracker);
+      transmitted = this.transmitHistory(tracker);
     }
     const sleepS = this.core.sleepSeconds(tracker.config, fixFound, movementAccepted,
       r.stationaryStreak, r.noFixCycles);
     r.nextWakeS = this.timeS + sleepS;
-    r.status = 'sleeping';
-    this.log('power', `${tracker.name} sleeps for ${sleepS} s`, {
+    if (!transmitted) r.status = 'sleeping';
+    this.log('power', transmitted
+      ? `${tracker.name} will sleep after its ACK window closes`
+      : `${tracker.name} sleeps for ${sleepS} s`, {
       deviceId: tracker.id, sleepS, severity: 'info',
     });
   }
@@ -457,14 +470,14 @@ export class SimulationEngine {
   transmitHistory(tracker) {
     const r = tracker.runtime;
     const points = r.queue.slice(0, 32);
-    const bytes = Math.min(255, 57 + points.length * 5);
+    const bytes = Math.min(255, 79 + points.length * 5);
     const airtimeMs = this.core.airtimeMs(bytes, tracker.radio);
     if (r.airtimeTokensMs < airtimeMs) {
       this.log('duty-cycle', `${tracker.name} deferred transmission by the Germany 1% limiter`, {
         deviceId: tracker.id, neededMs: airtimeMs,
         availableMs: Math.floor(r.airtimeTokensMs), severity: 'warning',
       });
-      return;
+      return false;
     }
     r.airtimeTokensMs -= airtimeMs;
     r.secondsSinceAttempt = 0;
@@ -473,13 +486,19 @@ export class SimulationEngine {
       key: `${tracker.id}:1:${counter}:history`, type: 'history', messageType: 1,
       schemaVersion: 2, deviceId: tracker.id,
       deviceHashHi: tracker.hashHi, deviceHashLo: tracker.hashLo,
-      bootId: r.bootId, counter, hop: 0,
-      hopLimit: tracker.radio.relayHopLimit, points, bytes,
+      bootId: r.bootId, counter, transactionCounter: counter, hop: 0,
+      hopLimit: tracker.radio.relayHopLimit, route: [], routeCursor: 0,
+      points, bytes,
     };
-    r.inflight[counter] = { acked: false, lastSeq: points.at(-1).seq };
+    const deadlineS = this.timeS + tracker.config.ackTimeoutMs / 1000;
+    r.inflight[counter] = {
+      acked: false, active: true, lastSeq: points.at(-1).seq, deadlineS,
+    };
+    r.rxWindowUntilS = deadlineS;
     r.batteryMah = Math.max(0, r.batteryMah - tracker.config.txCurrentMa * airtimeMs / 3_600_000);
     this.startTransmission(tracker, frame, airtimeMs);
     this.schedule(tracker.config.ackTimeoutMs / 1000, 'ack-timeout', { trackerId: tracker.id, counter });
+    return true;
   }
 
   startTransmission(sender, frame, airtimeMs) {
@@ -533,6 +552,17 @@ export class SimulationEngine {
     const tx = this.transmissions.find((item) => item.id === transmissionId);
     const receiver = this.devices.get(receiverId);
     if (!tx || !receiver) return;
+    if (receiver.role === 'tracker' && tx.frame.type === 'ack') {
+      const inflight = receiver.runtime.inflight[tx.frame.transactionCounter];
+      if (!inflight?.active || tx.endS > inflight.deadlineS ||
+          tx.endS > (receiver.runtime.rxWindowUntilS ?? -Infinity)) {
+        this.log('radio-sleep', `${receiver.name} did not receive the late ACK because its radio was asleep`, {
+          deviceId: receiver.id, frameKey: tx.frame.key,
+          deadlineS: inflight?.deadlineS, completedAtS: tx.endS, severity: 'warning',
+        });
+        return;
+      }
+    }
     const ownTransmission = this.transmissions.find((other) =>
       other.senderId === receiver.id && other.startS < tx.endS && other.endS > tx.startS);
     if (ownTransmission) {
@@ -580,6 +610,8 @@ export class SimulationEngine {
   queueRelay(repeater, frame) {
     const r = repeater.runtime;
     if (r.seen[frame.key] > this.timeS || frame.hop >= frame.hopLimit) return;
+    if (frame.type === 'ack' &&
+        frame.route?.[frame.routeCursor - 1] !== repeater.id) return;
     const outgoingHop = frame.hop + 1;
     const existing = r.pending[frame.key];
     if (existing && frame.hop >= existing.outgoingHop) {
@@ -589,7 +621,14 @@ export class SimulationEngine {
       });
       return;
     }
-    const delayMs = this.core.forwardingDelayMs(frame, repeater);
+    const packetAirtimeMs = this.core.airtimeMs(frame.bytes, repeater.radio);
+    const safeRepeater = { ...repeater, config: { ...repeater.config,
+      forwardingSlotWidthMs: Math.max(
+        repeater.config.forwardingSlotWidthMs, packetAirtimeMs + 50),
+    } };
+    const delayMs = frame.type === 'ack'
+      ? repeater.config.forwardingBaseDelayMs
+      : this.core.forwardingDelayMs(frame, safeRepeater);
     const pending = { frame: deepCopy(frame), outgoingHop, cancelled: false };
     r.pending[frame.key] = pending;
     this.schedule(delayMs / 1000, 'relay-forward', { repeaterId: repeater.id, frameKey: frame.key });
@@ -604,19 +643,29 @@ export class SimulationEngine {
     if (!repeater || !pending || pending.cancelled) return;
     delete repeater.runtime.pending[frameKey];
     const frame = { ...pending.frame, hop: pending.outgoingHop };
+    if (frame.type === 'history') frame.route = [...(frame.route ?? []), repeater.id];
+    else frame.routeCursor -= 1;
     const airtimeMs = this.core.airtimeMs(frame.bytes, repeater.radio);
-    if (repeater.runtime.airtimeTokensMs < airtimeMs) {
-      const missing = airtimeMs - repeater.runtime.airtimeTokensMs;
-      const refillPerSecond = (repeater.config.airtimeBudgetMsPerHour - repeater.runtime.airtimeCapacityMs) / 3600;
-      const waitS = Math.max(1, Math.ceil(missing / Math.max(0.001, refillPerSecond)));
-      repeater.runtime.pending[frameKey] = pending;
-      this.schedule(waitS, 'relay-forward', { repeaterId, frameKey });
-      this.log('duty-cycle', `${repeater.name} deferred relay airtime for ${waitS} s`, {
+    const reservationKey = `${frame.deviceId}:${frame.bootId}:${frame.transactionCounter}`;
+    const reservation = repeater.runtime.ackReservations[reservationKey];
+    const ackAirtimeMs = this.core.airtimeMs(78, repeater.radio);
+    const requiredAirtimeMs = frame.type === 'history'
+      ? airtimeMs + ackAirtimeMs
+      : (reservation ? 0 : airtimeMs);
+    if (repeater.runtime.airtimeTokensMs < requiredAirtimeMs) {
+      this.log('duty-cycle', `${repeater.name} dropped the incomplete relay transaction and awaits a tracker retry`, {
         deviceId: repeater.id, frameKey, severity: 'warning',
       });
       return;
     }
-    repeater.runtime.airtimeTokensMs -= airtimeMs;
+    repeater.runtime.airtimeTokensMs -= requiredAirtimeMs;
+    if (frame.type === 'history') {
+      repeater.runtime.ackReservations[reservationKey] = {
+        airtimeMs: ackAirtimeMs, expiresS: this.timeS + 35,
+      };
+    } else if (reservation) {
+      delete repeater.runtime.ackReservations[reservationKey];
+    }
     repeater.runtime.seen[frame.key] = this.timeS +
       (frame.type === 'ack' ? 5 : repeater.config.duplicateCacheTtlS);
     repeater.runtime.stats.relayed += 1;
@@ -674,13 +723,15 @@ export class SimulationEngine {
     const tracker = this.devices.get(frame.deviceId);
     if (!tracker || frame.points.length === 0) return;
     const ackSeq = frame.points.at(-1).seq;
-    const ackCounter = gateway.runtime.stats.tx;
+    const ackCounter = ackSeq;
     const ack = {
       key: `${frame.deviceId}:${frame.bootId}:${ackCounter}:ack`, type: 'ack', messageType: 2,
       schemaVersion: 1, deviceId: frame.deviceId,
       deviceHashHi: frame.deviceHashHi, deviceHashLo: frame.deviceHashLo,
-      bootId: frame.bootId, counter: ackCounter, hop: 0,
-      hopLimit: gateway.radio.relayHopLimit, ackSeq, bytes: 56,
+      bootId: frame.bootId, counter: ackCounter,
+      transactionCounter: frame.transactionCounter, hop: 0,
+      hopLimit: frame.route?.length ?? 0, route: [...(frame.route ?? [])],
+      routeCursor: frame.route?.length ?? 0, ackSeq, bytes: 78,
     };
     const airtimeMs = this.core.airtimeMs(ack.bytes, gateway.radio);
     if (gateway.runtime.airtimeTokensMs < airtimeMs) {
@@ -695,11 +746,23 @@ export class SimulationEngine {
 
   trackerAck(tracker, frame) {
     const r = tracker.runtime;
+    const inflight = r.inflight[frame.transactionCounter];
+    if (!inflight?.active || this.timeS > inflight.deadlineS) {
+      this.log('late-ack', `${tracker.name} ignored an ACK outside its receive window`, {
+        deviceId: tracker.id, frameKey: frame.key, severity: 'warning',
+      });
+      return;
+    }
     const before = r.queue.length;
     r.queue = r.queue.filter((point) => point.seq > frame.ackSeq);
-    for (const inflight of Object.values(r.inflight)) {
-      if (inflight.lastSeq <= frame.ackSeq) inflight.acked = true;
+    for (const entry of Object.values(r.inflight)) {
+      if (entry.lastSeq <= frame.ackSeq) {
+        entry.acked = true;
+        entry.active = false;
+      }
     }
+    r.rxWindowUntilS = null;
+    r.status = 'sleeping';
     r.failures = 0;
     r.secondsSinceAck = 0;
     r.secondsSinceAttempt = 0;
@@ -713,6 +776,9 @@ export class SimulationEngine {
     const tracker = this.devices.get(trackerId);
     const inflight = tracker?.runtime.inflight[counter];
     if (!tracker || !inflight || inflight.acked) return;
+    inflight.active = false;
+    tracker.runtime.rxWindowUntilS = null;
+    tracker.runtime.status = 'sleeping';
     tracker.runtime.failures = Math.min(255, tracker.runtime.failures + 1);
     this.log('ack-timeout', `${tracker.name} did not receive an archive-backed ACK`, {
       deviceId: tracker.id, failures: tracker.runtime.failures,

@@ -32,7 +32,9 @@ and transmits batches when either enough points or enough time has accumulated.
 Missing ACKs retain the queue and trigger exponential retry backoff.
 
 The tracker keeps its radio open for the configured ACK window and ignores its
-own relayed history or unrelated traffic while waiting for a matching ACK.
+own relayed history or unrelated traffic while waiting for a matching ACK. The
+whole ACK packet must complete before the deadline; timeout closes the receive
+window and puts the radio to sleep.
 
 History v2 combines:
 
@@ -61,11 +63,11 @@ schemas are rejected.
 
 ## Repeater
 
-The repeater wraps no new application data and holds no tracker keys. It
-increments a six-byte mutable link header while preserving the authenticated
-secure frame byte-for-byte. Hop limits, deterministic priority jitter, duplicate
-suppression, a bounded queue and a Germany rolling-hour airtime limiter constrain flooding in
-both directions. See [repeaters](REPEATERS.md).
+The repeater wraps no new application data and holds no tracker keys. It advances a 28-byte mutable link-v2 header while preserving the authenticated
+secure frame byte-for-byte. HISTORY records the selected route; ACK follows it
+in reverse. Packet-airtime-sized priority slots, peer suppression, atomic
+HISTORY+ACK airtime reservations, a bounded queue and the Germany rolling-hour
+limiter constrain traffic in both directions. See [repeaters](REPEATERS.md).
 
 ## MQTT and archiver
 

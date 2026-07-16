@@ -2018,7 +2018,7 @@ void loop() {
 
   do {
     // Authenticated envelope + encrypted history, root and batch metadata.
-    if (packetSize < (int)(sizeof(EquineRelay::LinkHeaderV1) +
+    if (packetSize < (int)(sizeof(EquineRelay::LinkHeaderV2) +
                            sizeof(SecureFrameHeader) +
                            sizeof(HistoryPayload) + 8 + 2 +
                            EquineProtocol::AEAD_TAG_SIZE) ||
@@ -2042,7 +2042,7 @@ void loop() {
     DecodedHistoryHeader header{};
     TrackerRuntime* tracker = nullptr;
 
-    EquineRelay::LinkHeaderV1 link_header{};
+    EquineRelay::LinkHeaderV2 link_header{};
     SecureFrameHeader wire_header{};
     if (!EquineRelay::parseLinkedFrame(
           payload_buffer, packetSize, link_header, wire_header)) {
@@ -2054,6 +2054,11 @@ void loop() {
       logPrintf("Unsupported frame: transport=%u type=%u schema=%u flags=0x%02X.\n",
                 frame.transport_version, frame.message_type,
                 frame.schema_version, frame.flags);
+      break;
+    }
+
+    if (link_header.transaction_counter != wire_header.counter) {
+      logPrintln("Ignored HISTORY with inconsistent relay transaction ID.");
       break;
     }
 
@@ -2430,8 +2435,8 @@ void loop() {
         EquineProtocol::MessageType::ACK),
       header.boot_id,
       highest_ackable_seq);
-    const EquineRelay::LinkHeaderV1 ack_link =
-      EquineRelay::makeOriginHeader(LORA_RELAY_HOP_LIMIT);
+    const EquineRelay::LinkHeaderV2 ack_link =
+      EquineRelay::makeAckHeader(link_header);
     uint8_t ack_packet[
       sizeof(ack_link) + sizeof(ack_header) + sizeof(ack) +
       EquineProtocol::AEAD_TAG_SIZE];

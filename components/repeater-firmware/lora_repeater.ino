@@ -21,6 +21,9 @@ constexpr uint32_t CONFIG_HOLD_MS = 1500;
 constexpr uint32_t CONFIG_WINDOW_MS = 10UL * 60UL * 1000UL;
 constexpr size_t FORWARD_QUEUE_SIZE = 8;
 constexpr size_t RECENT_CACHE_SIZE = 48;
+constexpr size_t ACK_RESERVATION_SIZE = 8;
+constexpr uint32_t ACK_RESERVATION_TTL_MS = 35000;
+constexpr uint32_t FORWARD_TURNAROUND_GUARD_MS = 50;
 constexpr size_t ADMIN_PASSWORD_SIZE = 21;
 
 #if defined(BOARD_WIRELESS_TRACKER)
@@ -59,9 +62,19 @@ struct RecentFrame {
   uint32_t expires_ms;
 };
 
+struct AckReservation {
+  bool used;
+  uint64_t device_id_hash;
+  uint32_t boot_id;
+  uint32_t transaction_counter;
+  uint32_t expires_ms;
+  uint32_t airtime_ms;
+};
+
 EquineConfig::RepeaterConfigV1 config{};
 PendingForward queue_entries[FORWARD_QUEUE_SIZE]{};
 RecentFrame recent_frames[RECENT_CACHE_SIZE]{};
+AckReservation ack_reservations[ACK_RESERVATION_SIZE]{};
 Preferences config_preferences;
 WebServer web_server(80);
 
@@ -87,6 +100,7 @@ uint32_t invalid_frames = 0;
 uint32_t queue_drops = 0;
 uint32_t airtime_deferrals = 0;
 uint32_t transmit_failures = 0;
+uint32_t transaction_budget_drops = 0;
 
 bool timeReached(uint32_t now, uint32_t deadline) {
   return static_cast<int32_t>(now - deadline) >= 0;
@@ -517,16 +531,16 @@ void rememberFrame(
 }
 
 void scheduleForward(const uint8_t* packet, size_t packet_size) {
-  EquineRelay::LinkHeaderV1 link{};
+  EquineRelay::LinkHeaderV2 link{};
   EquineProtocol::SecureFrameHeaderV2 secure{};
   if (!EquineRelay::parseLinkedFrame(packet, packet_size, link, secure)) {
     invalid_frames++;
     return;
   }
   received_frames++;
-  const uint8_t effective_limit = min(
-    link.hop_limit, config.lora.relay_hop_limit);
-  if (link.hop_count >= effective_limit) {
+  const uint32_t local_token = EquineRelay::relayToken(repeater_hash);
+  if (!EquineRelay::mayRelay(
+        link, secure, config.lora.relay_hop_limit, local_token)) {
     suppressed_frames++;
     return;
   }
@@ -567,21 +581,80 @@ void scheduleForward(const uint8_t* packet, size_t packet_size) {
   free_entry->packet_size = static_cast<uint8_t>(packet_size);
   memcpy(free_entry->packet, packet, packet_size);
   if (!EquineRelay::advanceHop(
-        free_entry->packet, packet_size, config.lora.relay_hop_limit)) {
+        free_entry->packet, packet_size, config.lora.relay_hop_limit,
+        local_token)) {
     free_entry->used = false;
     suppressed_frames++;
     return;
   }
-  EquineRelay::LinkHeaderV1 outgoing{};
+  EquineRelay::LinkHeaderV2 outgoing{};
   memcpy(&outgoing, free_entry->packet, sizeof(outgoing));
   free_entry->outgoing_hop = outgoing.hop_count;
   free_entry->retry_count = 0;
-  free_entry->due_ms = now + EquineRelay::forwardingDelayMs(
-    identity,
-    repeater_hash,
-    config.forwarding_base_delay_ms,
-    config.forwarding_slot_count,
-    config.forwarding_slot_width_ms);
+  const bool ack = identity.message_type ==
+    static_cast<uint8_t>(EquineProtocol::MessageType::ACK);
+  const uint32_t packet_airtime = EquineRelay::estimateAirtimeMs(
+    packet_size, config.lora.spreading_factor, config.lora.bandwidth_hz,
+    config.lora.coding_rate_denominator, config.lora.preamble_length);
+  const uint32_t requested_slot_width = max(
+    static_cast<uint32_t>(config.forwarding_slot_width_ms),
+    packet_airtime + FORWARD_TURNAROUND_GUARD_MS);
+  const uint16_t safe_slot_width = requested_slot_width > UINT16_MAX
+    ? UINT16_MAX : static_cast<uint16_t>(requested_slot_width);
+  free_entry->due_ms = now + (ack
+    ? config.forwarding_base_delay_ms
+    : EquineRelay::forwardingDelayMs(
+        identity, repeater_hash, config.forwarding_base_delay_ms,
+        config.forwarding_slot_count, safe_slot_width));
+}
+
+uint32_t ackAirtimeMs() {
+  constexpr size_t ACK_PACKET_SIZE = sizeof(EquineRelay::LinkHeaderV2) +
+    sizeof(EquineProtocol::SecureFrameHeaderV2) +
+    sizeof(EquineProtocol::AckPayloadV1) + EquineProtocol::AEAD_TAG_SIZE;
+  return EquineRelay::estimateAirtimeMs(
+    ACK_PACKET_SIZE, config.lora.spreading_factor, config.lora.bandwidth_hz,
+    config.lora.coding_rate_denominator, config.lora.preamble_length);
+}
+
+uint32_t transactionCapacityMs() {
+  return EquineRelay::maxFrameAirtimeMs(
+    config.lora.spreading_factor, config.lora.bandwidth_hz,
+    config.lora.coding_rate_denominator, config.lora.preamble_length) +
+    ackAirtimeMs();
+}
+
+void expireAckReservations(uint32_t now) {
+  for (AckReservation& reservation : ack_reservations) {
+    if (!reservation.used || !timeReached(now, reservation.expires_ms)) continue;
+    airtime_tokens_ms = min(
+      static_cast<double>(transactionCapacityMs()),
+      airtime_tokens_ms + reservation.airtime_ms);
+    reservation.used = false;
+  }
+}
+
+AckReservation* findAckReservation(
+    uint64_t device_id_hash, uint32_t boot_id, uint32_t transaction_counter) {
+  for (AckReservation& reservation : ack_reservations) {
+    if (reservation.used && reservation.device_id_hash == device_id_hash &&
+        reservation.boot_id == boot_id &&
+        reservation.transaction_counter == transaction_counter) return &reservation;
+  }
+  return nullptr;
+}
+
+bool storeAckReservation(
+    const EquineRelay::FrameIdentityV1& identity,
+    uint32_t transaction_counter, uint32_t airtime_ms, uint32_t now) {
+  for (AckReservation& reservation : ack_reservations) {
+    if (!reservation.used) {
+      reservation = {true, identity.device_id_hash, identity.boot_id,
+        transaction_counter, now + ACK_RESERVATION_TTL_MS, airtime_ms};
+      return true;
+    }
+  }
+  return false;
 }
 
 void refillAirtime(uint32_t now) {
@@ -591,11 +664,7 @@ void refillAirtime(uint32_t now) {
   }
   const uint32_t elapsed = now - airtime_refill_ms;
   airtime_refill_ms = now;
-  const uint32_t capacity_ms = EquineRelay::maxFrameAirtimeMs(
-    config.lora.spreading_factor,
-    config.lora.bandwidth_hz,
-    config.lora.coding_rate_denominator,
-    config.lora.preamble_length);
+  const uint32_t capacity_ms = transactionCapacityMs();
   airtime_tokens_ms = EquineRelay::refillRollingHourAirtimeTokens(
     airtime_tokens_ms,
     elapsed,
@@ -606,6 +675,7 @@ void refillAirtime(uint32_t now) {
 void serviceForwardQueue() {
   const uint32_t now = millis();
   refillAirtime(now);
+  expireAckReservations(now);
   PendingForward* due = nullptr;
   for (PendingForward& entry : queue_entries) {
     if (!entry.used || !timeReached(now, entry.due_ms)) continue;
@@ -626,28 +696,38 @@ void serviceForwardQueue() {
     due->used = false;
     return;
   }
+  EquineRelay::LinkHeaderV2 link{};
+  memcpy(&link, due->packet, sizeof(link));
+  const bool ack = due->identity.message_type ==
+    static_cast<uint8_t>(EquineProtocol::MessageType::ACK);
+  AckReservation* reservation = findAckReservation(
+    due->identity.device_id_hash, due->identity.boot_id,
+    link.transaction_counter);
+  const uint32_t reserved_ack_airtime = ackAirtimeMs();
+  const uint32_t required_airtime = ack
+    ? (reservation ? 0 : estimated_airtime)
+    : estimated_airtime + (reservation ? 0 : reserved_ack_airtime);
   if (!EquineRelay::consumeAirtimeTokens(
-        airtime_tokens_ms, estimated_airtime)) {
+        airtime_tokens_ms, required_airtime)) {
     airtime_deferrals++;
-    const uint32_t capacity_ms = EquineRelay::maxFrameAirtimeMs(
-      config.lora.spreading_factor,
-      config.lora.bandwidth_hz,
-      config.lora.coding_rate_denominator,
-      config.lora.preamble_length);
-    const uint32_t refill_budget_ms =
-      config.airtime_budget_ms_per_hour - capacity_ms;
-    const double refill_per_ms =
-      static_cast<double>(refill_budget_ms) / 3600000.0;
-    const double missing_ms = estimated_airtime - airtime_tokens_ms;
-    const uint32_t wait_ms = static_cast<uint32_t>(
-      ceil(missing_ms / refill_per_ms));
-    due->due_ms = now + (wait_ms < 10UL ? 10UL : wait_ms);
+    transaction_budget_drops++;
+    // Deferring one half of a transaction beyond the tracker's RX window is
+    // useless. Drop it and let the tracker's normal retry create a fresh path.
+    due->used = false;
+    return;
+  }
+  if (!ack && !reservation && !storeAckReservation(
+        due->identity, link.transaction_counter, reserved_ack_airtime, now)) {
+    airtime_tokens_ms += required_airtime;
+    transaction_budget_drops++;
+    due->used = false;
     return;
   }
 
   const uint32_t started = millis();
   const bool sent = transmitPacket(due->packet, due->packet_size);
   const uint32_t measured_airtime = millis() - started;
+  if (ack && reservation) reservation->used = false;
   if (measured_airtime > estimated_airtime) {
     airtime_tokens_ms -= min(
       airtime_tokens_ms,
@@ -688,7 +768,7 @@ void logHeartbeat() {
     if (entry.used) depth++;
   }
   Serial.printf(
-    "Heartbeat radio=%s portal=%s queue=%u rx=%lu tx=%lu suppressed=%lu invalid=%lu drops=%lu/%lu rssi=%d snr=%.1f tokens=%lu ms\n",
+    "Heartbeat radio=%s portal=%s queue=%u rx=%lu tx=%lu suppressed=%lu invalid=%lu drops=%lu/%lu/%lu rssi=%d snr=%.1f tokens=%lu ms\n",
     radio_ready ? "up" : "down",
     config_portal_active ? "up" : "down",
     static_cast<unsigned>(depth),
@@ -698,6 +778,7 @@ void logHeartbeat() {
     static_cast<unsigned long>(invalid_frames),
     static_cast<unsigned long>(queue_drops),
     static_cast<unsigned long>(airtime_deferrals),
+    static_cast<unsigned long>(transaction_budget_drops),
     last_rssi,
     last_snr_tenths / 10.0f,
     static_cast<unsigned long>(airtime_tokens_ms));

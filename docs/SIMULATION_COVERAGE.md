@@ -74,7 +74,7 @@ site measurement.
 | Tracker | Waypoint movement, configurable speed, seeded GNSS acquisition, point spacing, adaptive sleep, batching, retry/ACK timeout, legal airtime and a configurable current/capacity battery estimate |
 | Radio | Explainable link budget with frequency, conducted power, antenna gain/loss/height, spreading factor, bandwidth, receiver sensitivity, distance/path loss, wet foliage, trees, buildings and seeded fading |
 | Shared channel | Packet airtime, simultaneous transmissions, capture margin, collisions, modem matching and visible packet paths |
-| Repeater | Opaque history/ACK forwarding, hop limits, deterministic slots, peer suppression, duplicate lifetimes, queue timing and Germany airtime deferral |
+| Repeater | Opaque forwarding, hop limits, packet-airtime priority slots, peer suppression, reverse-route ACKs, transaction airtime reservations, duplicate lifetimes and Germany airtime accounting |
 | Receiver | Current-frame authentication/decode decision, MQTT publication and ACK only after archive receipt |
 | MQTT/archive | One protocol-faithful in-memory service with online/offline state, latency, point deduplication, durable-commit event and QoS semantics shown in the timeline |
 | Reproducibility | Fixed seed, deterministic event ordering, restart, single-step, accelerated time and versioned JSON scenarios |
@@ -89,7 +89,8 @@ loss terms so it does not imply a dramatic generic “night range” effect.
 
 `npm test` covers deterministic traces, movement/environment geometry, Germany
 ERP/radio rejection, wet-foliage versus atmospheric loss, collisions, MQTT
-outage retention, multi-hop archive-backed ACKs and native/WASM golden vectors.
+outage retention, multi-hop archive-backed ACKs, co-hearing relay arbitration,
+reverse-route selection, strict post-timeout radio sleep and native/WASM golden vectors.
 Playwright opens the real WASM application in headless Chromium, steps time,
 adds/configures a tracker and waypoint, exercises an MQTT outage and checks the
 mobile layout. CI builds and uploads the complete static lab artifact.

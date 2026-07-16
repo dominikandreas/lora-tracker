@@ -79,16 +79,17 @@ void testRelayLink() {
   const SecureFrameHeaderV2 secure = makeSecureFrameHeader(
     MessageType::HISTORY, HISTORY_SCHEMA_VERSION, device_hash,
     0x1234ULL, 9, 77, FLAG_HAS_TIMESTAMPS);
-  uint8_t packet[sizeof(LinkHeaderV1) + sizeof(secure) + AEAD_TAG_SIZE]{};
-  const LinkHeaderV1 origin = makeOriginHeader(2);
+  uint8_t packet[sizeof(LinkHeaderV2) + sizeof(secure) + AEAD_TAG_SIZE]{};
+  const LinkHeaderV2 origin = makeOriginHeader(2, 77);
   memcpy(packet, &origin, sizeof(origin));
   memcpy(packet + sizeof(origin), &secure, sizeof(secure));
 
-  LinkHeaderV1 parsed_link{};
+  LinkHeaderV2 parsed_link{};
   SecureFrameHeaderV2 parsed_secure{};
   assert(parseLinkedFrame(
     packet, sizeof(packet), parsed_link, parsed_secure));
   assert(parsed_link.hop_count == 0 && parsed_link.hop_limit == 2);
+  assert(parsed_link.transaction_counter == 77);
   assert(parsed_secure.counter == 77);
 
   const FrameIdentityV1 identity = frameIdentity(parsed_secure);
@@ -105,11 +106,28 @@ void testRelayLink() {
   assert(peerForwardSuppressesPending(1, 1));
   assert(!peerForwardSuppressesPending(0, 1));
 
-  assert(advanceHop(packet, sizeof(packet), 2));
+  const uint32_t first_relay = relayToken(0x55);
+  const uint32_t second_relay = relayToken(0x66);
+  assert(advanceHop(packet, sizeof(packet), 2, first_relay));
   memcpy(&parsed_link, packet, sizeof(parsed_link));
-  assert(parsed_link.hop_count == 1);
-  assert(advanceHop(packet, sizeof(packet), 2));
-  assert(!advanceHop(packet, sizeof(packet), 2));
+  assert(parsed_link.hop_count == 1 && parsed_link.route[0] == first_relay);
+  assert(advanceHop(packet, sizeof(packet), 2, second_relay));
+  memcpy(&parsed_link, packet, sizeof(parsed_link));
+  assert(parsed_link.route_length == 2 && parsed_link.route[1] == second_relay);
+  assert(!advanceHop(packet, sizeof(packet), 2, relayToken(0x77)));
+
+  const LinkHeaderV2 ack_origin = makeAckHeader(parsed_link);
+  assert(ack_origin.route_cursor == 2 && ack_origin.transaction_counter == 77);
+  const SecureFrameHeaderV2 ack_secure = makeSecureFrameHeader(
+    MessageType::ACK, ACK_SCHEMA_VERSION, device_hash,
+    0x5678ULL, 9, 12);
+  memcpy(packet, &ack_origin, sizeof(ack_origin));
+  memcpy(packet + sizeof(ack_origin), &ack_secure, sizeof(ack_secure));
+  assert(!advanceHop(packet, sizeof(packet), 2, first_relay));
+  assert(advanceHop(packet, sizeof(packet), 2, second_relay));
+  assert(advanceHop(packet, sizeof(packet), 2, first_relay));
+  memcpy(&parsed_link, packet, sizeof(parsed_link));
+  assert(isDeliveredAck(parsed_link));
 
   parsed_link.hop_count = 3;
   parsed_link.hop_limit = 2;

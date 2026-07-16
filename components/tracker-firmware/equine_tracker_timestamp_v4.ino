@@ -1730,12 +1730,13 @@ bool transmitLoRaPacket(uint8_t* buffer, size_t len) {
 
 bool isCandidateAckPacket(const uint8_t* buffer, size_t length) {
   const size_t expected_size =
-    sizeof(EquineRelay::LinkHeaderV1) + sizeof(SecureFrameHeader) +
+    sizeof(EquineRelay::LinkHeaderV2) + sizeof(SecureFrameHeader) +
     sizeof(AckPayload) + EquineProtocol::AEAD_TAG_SIZE;
   if (!buffer || length != expected_size) return false;
-  EquineRelay::LinkHeaderV1 link{};
+  EquineRelay::LinkHeaderV2 link{};
   SecureFrameHeader header{};
   return EquineRelay::parseLinkedFrame(buffer, length, link, header) &&
+         EquineRelay::isDeliveredAck(link) &&
          header.frame.message_type == static_cast<uint8_t>(
            EquineProtocol::MessageType::ACK) &&
          header.frame.device_id_hash == TRACKER_DEVICE_HASH &&
@@ -3637,7 +3638,7 @@ void performTrackingCycle() {
       if (history_count == 0) break;
 
       constexpr size_t MAX_SECURE_PLAINTEXT =
-        EquineRelay::MAX_PACKET_SIZE - sizeof(EquineRelay::LinkHeaderV1) -
+        EquineRelay::MAX_PACKET_SIZE - sizeof(EquineRelay::LinkHeaderV2) -
         sizeof(SecureFrameHeader) - EquineProtocol::AEAD_TAG_SIZE;
       uint8_t plaintext_buffer[MAX_SECURE_PLAINTEXT];
       uint16_t points_packed = 0;
@@ -3668,8 +3669,9 @@ void performTrackingCycle() {
         packet_root.unix_time_s > 0 ? EquineProtocol::FLAG_HAS_TIMESTAMPS
                                     : EquineProtocol::FLAG_NONE);
       uint8_t payload_buffer[255];
-      const EquineRelay::LinkHeaderV1 link_header =
-        EquineRelay::makeOriginHeader(LORA_RELAY_HOP_LIMIT);
+      const EquineRelay::LinkHeaderV2 link_header =
+        EquineRelay::makeOriginHeader(
+          LORA_RELAY_HOP_LIMIT, transmit_counter);
       memcpy(payload_buffer, &link_header, sizeof(link_header));
       memcpy(payload_buffer + sizeof(link_header),
              &secure_header, sizeof(secure_header));
@@ -3739,11 +3741,11 @@ void performTrackingCycle() {
       bool ack_received = false;
 
       const size_t expected_ack_size =
-        sizeof(EquineRelay::LinkHeaderV1) + sizeof(SecureFrameHeader) +
+        sizeof(EquineRelay::LinkHeaderV2) + sizeof(SecureFrameHeader) +
         sizeof(AckPayload) +
         EquineProtocol::AEAD_TAG_SIZE;
       if (rx_result == static_cast<int>(expected_ack_size)) {
-        EquineRelay::LinkHeaderV1 ack_link{};
+        EquineRelay::LinkHeaderV2 ack_link{};
         SecureFrameHeader ack_header{};
         if (!EquineRelay::parseLinkedFrame(
               rx_buffer, rx_result, ack_link, ack_header)) {
@@ -3758,10 +3760,11 @@ void performTrackingCycle() {
           EquineProtocol::ACK_SCHEMA_VERSION
         );
 
-        if (!supported_ack) {
+        if (!supported_ack || !EquineRelay::isDeliveredAck(ack_link) ||
+            ack_link.transaction_counter != transmit_counter) {
           last_ack_status = 0;
           logPrintf(
-            "Ignored unsupported ACK: magic=0x%04X transport=%u type=%u schema=%u.\n",
+            "Ignored unsupported, misrouted or stale ACK: magic=0x%04X transport=%u type=%u schema=%u.\n",
             ack_header.frame.magic,
             ack_header.frame.transport_version,
             ack_header.frame.message_type,

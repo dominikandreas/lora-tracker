@@ -32,6 +32,8 @@ hardware support or multiple public interfaces.
 - [ ] Add factory acceptance tests for GNSS, radio, current draw, battery gauge and enclosure seals.
 - [ ] Define queue overflow priorities and explicit data-loss telemetry.
 - [ ] Add multi-gateway ACK collision avoidance and reception-quality analytics.
+- [ ] Add CAD/channel-busy retry and hardware qualification for hidden repeater nodes that cannot hear the selected forwarder.
+- [ ] Persist conservative repeater airtime credit/debt across power loss without creating an NVS wear or reboot-reset loophole.
 
 ## P1 — application
 

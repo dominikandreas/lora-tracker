@@ -142,3 +142,64 @@ test('snapshot exposes bounded local tracks, archive provenance and live link ma
   assert.equal(snapshot.archive.every((point) => point.gatewayId === 'gateway-1' && point.archivedAtS >= 0), true);
   assert.ok(snapshot.links.some((link) => link.fromId === 'tracker-1' && link.toId === 'gateway-1'));
 });
+
+
+test('ACK timeout closes the tracker radio and late ACK cannot clear data', () => {
+  const engine = new SimulationEngine(createDefaultScenario(), new ReferenceCore());
+  const tracker = engine.devices.get('tracker-1');
+  tracker.runtime.queue = [{ seq: 7, x: tracker.x, y: tracker.y, timeS: 0 }];
+  tracker.runtime.inflight[42] = {
+    acked: false, active: true, lastSeq: 7, deadlineS: 1,
+  };
+  tracker.runtime.rxWindowUntilS = 1;
+  engine.timeS = 1;
+  engine.ackTimeout({ trackerId: tracker.id, counter: 42 });
+  engine.timeS = 2;
+  engine.trackerAck(tracker, {
+    key: 'late-ack', transactionCounter: 42, ackSeq: 7,
+  });
+  assert.equal(tracker.runtime.queue.length, 1);
+  assert.equal(tracker.runtime.inflight[42].active, false);
+  assert.equal(tracker.runtime.status, 'sleeping');
+  assert.ok(engine.events.some((event) => event.type === 'late-ack'));
+});
+
+test('co-hearing relays serialize HISTORY and only the selected route accepts ACK', () => {
+  const scenario = createDefaultScenario();
+  const relay2 = structuredClone(scenario.devices.find((device) => device.id === 'relay-1'));
+  relay2.id = 'relay-2';
+  relay2.name = 'Second relay';
+  relay2.x += 5;
+  scenario.devices.push(relay2);
+  const engine = new SimulationEngine(scenario, new ReferenceCore());
+  const tracker = engine.devices.get('tracker-1');
+  const relay1 = engine.devices.get('relay-1');
+  const second = engine.devices.get('relay-2');
+  relay1.runtime.airtimeTokensMs = relay1.runtime.airtimeCapacityMs;
+  second.runtime.airtimeTokensMs = second.runtime.airtimeCapacityMs;
+  const frame = {
+    key: 'tracker-1:1:99:history', type: 'history', messageType: 1,
+    schemaVersion: 2, deviceId: tracker.id, deviceHashHi: tracker.hashHi,
+    deviceHashLo: tracker.hashLo, bootId: 1, counter: 99,
+    transactionCounter: 99, hop: 0, hopLimit: 2, route: [],
+    routeCursor: 0, points: [{ seq: 7 }], bytes: 100,
+  };
+  engine.queueRelay(relay1, frame);
+  engine.queueRelay(second, frame);
+  engine.timeS = 20;
+  engine.processTasks();
+  assert.equal(relay1.runtime.stats.relayed + second.runtime.stats.relayed, 1);
+
+  const selected = relay1.runtime.stats.relayed ? relay1 : second;
+  const unselected = selected.id === relay1.id ? second : relay1;
+  const ack = {
+    key: 'tracker-1:1:7:ack', type: 'ack', messageType: 2,
+    schemaVersion: 1, deviceId: tracker.id, bootId: 1, counter: 7,
+    transactionCounter: 99, hop: 0, hopLimit: 1,
+    route: [selected.id], routeCursor: 1, ackSeq: 7, bytes: 78,
+  };
+  engine.queueRelay(selected, ack);
+  engine.queueRelay(unselected, ack);
+  assert.ok(selected.runtime.pending[ack.key]);
+  assert.equal(unselected.runtime.pending[ack.key], undefined);
+});

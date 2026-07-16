@@ -14,21 +14,30 @@
 namespace EquineRelay {
 
 constexpr uint16_t LINK_MAGIC = 0x524c;  // wire bytes "LR"
-constexpr uint8_t LINK_VERSION = 1;
+constexpr uint8_t LINK_VERSION = 2;
 constexpr uint8_t MAX_HOPS = 4;
 constexpr size_t MAX_PACKET_SIZE = 255;
 constexpr uint32_t ACK_DUPLICATE_CACHE_MS = 5000;
 
 enum LinkFlags : uint8_t {
   LINK_FLAG_NONE = 0,
+  LINK_FLAG_REVERSE_ROUTE = 1,
 };
 
-struct LinkHeaderV1 {
+// HISTORY frames record the repeaters that actually forwarded them. The
+// gateway copies that path into its ACK and only the next repeater on the
+// reverse path accepts it. transaction_counter binds the opaque ACK to the
+// airtime reservation made for the originating encrypted frame.
+struct LinkHeaderV2 {
   uint16_t magic;
   uint8_t version;
   uint8_t hop_count;
   uint8_t hop_limit;
   uint8_t flags;
+  uint8_t route_length;
+  uint8_t route_cursor;
+  uint32_t transaction_counter;
+  uint32_t route[MAX_HOPS];
 } __attribute__((packed));
 
 struct FrameIdentityV1 {
@@ -39,28 +48,38 @@ struct FrameIdentityV1 {
   uint8_t schema_version;
 } __attribute__((packed));
 
-static_assert(sizeof(LinkHeaderV1) == 6, "Unexpected relay link header size");
+static_assert(sizeof(LinkHeaderV2) == 28, "Unexpected relay link header size");
 static_assert(sizeof(FrameIdentityV1) == 18, "Unexpected relay identity size");
-static_assert(sizeof(LinkHeaderV1) + sizeof(EquineProtocol::SecureFrameHeaderV2) +
+static_assert(sizeof(LinkHeaderV2) + sizeof(EquineProtocol::SecureFrameHeaderV2) +
                 EquineProtocol::AEAD_TAG_SIZE <= MAX_PACKET_SIZE,
               "Minimum linked secure frame exceeds LoRa packet limit");
 
-inline LinkHeaderV1 makeOriginHeader(uint8_t hop_limit) {
-  LinkHeaderV1 header{};
+inline LinkHeaderV2 makeOriginHeader(
+    uint8_t hop_limit, uint32_t transaction_counter) {
+  LinkHeaderV2 header{};
   header.magic = LINK_MAGIC;
   header.version = LINK_VERSION;
   header.hop_count = 0;
   header.hop_limit = hop_limit > MAX_HOPS ? MAX_HOPS : hop_limit;
   header.flags = LINK_FLAG_NONE;
+  header.transaction_counter = transaction_counter;
   return header;
 }
 
-inline bool isSupportedLinkHeader(const LinkHeaderV1& header) {
-  return header.magic == LINK_MAGIC &&
-         header.version == LINK_VERSION &&
-         header.flags == LINK_FLAG_NONE &&
-         header.hop_limit <= MAX_HOPS &&
-         header.hop_count <= header.hop_limit;
+inline bool isSupportedLinkHeader(const LinkHeaderV2& header) {
+  if (header.magic != LINK_MAGIC || header.version != LINK_VERSION ||
+      header.hop_limit > MAX_HOPS || header.route_length > MAX_HOPS ||
+      header.route_cursor > header.route_length) return false;
+  if (header.flags == LINK_FLAG_NONE) {
+    return header.route_cursor == 0 &&
+           header.route_length == header.hop_count &&
+           header.hop_count <= header.hop_limit;
+  }
+  if (header.flags == LINK_FLAG_REVERSE_ROUTE) {
+    return header.hop_limit == header.route_length &&
+           header.hop_count == header.route_length - header.route_cursor;
+  }
+  return false;
 }
 
 inline bool isForwardableSecureHeader(
@@ -75,10 +94,10 @@ inline bool isForwardableSecureHeader(
 inline bool parseLinkedFrame(
     const uint8_t* packet,
     size_t packet_size,
-    LinkHeaderV1& link,
+    LinkHeaderV2& link,
     EquineProtocol::SecureFrameHeaderV2& secure) {
   constexpr size_t MIN_SIZE =
-    sizeof(LinkHeaderV1) + sizeof(EquineProtocol::SecureFrameHeaderV2) +
+    sizeof(LinkHeaderV2) + sizeof(EquineProtocol::SecureFrameHeaderV2) +
     EquineProtocol::AEAD_TAG_SIZE;
   if (!packet || packet_size < MIN_SIZE || packet_size > MAX_PACKET_SIZE) {
     return false;
@@ -88,18 +107,67 @@ inline bool parseLinkedFrame(
   return isSupportedLinkHeader(link) && isForwardableSecureHeader(secure);
 }
 
-inline bool advanceHop(uint8_t* packet, size_t packet_size, uint8_t local_hop_cap) {
-  LinkHeaderV1 link{};
+inline LinkHeaderV2 makeAckHeader(const LinkHeaderV2& history) {
+  LinkHeaderV2 ack{};
+  ack.magic = LINK_MAGIC;
+  ack.version = LINK_VERSION;
+  ack.hop_limit = history.route_length;
+  ack.flags = LINK_FLAG_REVERSE_ROUTE;
+  ack.route_length = history.route_length;
+  ack.route_cursor = history.route_length;
+  ack.transaction_counter = history.transaction_counter;
+  memcpy(ack.route, history.route, sizeof(ack.route));
+  return ack;
+}
+
+inline bool isDeliveredAck(const LinkHeaderV2& link) {
+  return link.flags == LINK_FLAG_REVERSE_ROUTE && link.route_cursor == 0 &&
+         link.hop_count == link.route_length;
+}
+
+inline bool advanceHop(
+    uint8_t* packet, size_t packet_size, uint8_t local_hop_cap,
+    uint32_t local_relay_token) {
+  LinkHeaderV2 link{};
   EquineProtocol::SecureFrameHeaderV2 secure{};
   if (!parseLinkedFrame(packet, packet_size, link, secure)) return false;
-  const uint8_t effective_limit =
-    link.hop_limit < local_hop_cap ? link.hop_limit : local_hop_cap;
-  if (link.hop_count >= effective_limit || link.hop_count == UINT8_MAX) {
+  const bool ack = secure.frame.message_type ==
+    static_cast<uint8_t>(EquineProtocol::MessageType::ACK);
+  if (ack) {
+    if (link.flags != LINK_FLAG_REVERSE_ROUTE || link.route_cursor == 0 ||
+        link.route[link.route_cursor - 1] != local_relay_token) return false;
+    link.route_cursor--;
+    link.hop_count++;
+    memcpy(packet, &link, sizeof(link));
+    return true;
+  }
+  if (link.flags != LINK_FLAG_NONE || link.route_length != link.hop_count) {
     return false;
   }
+  const uint8_t effective_limit =
+    link.hop_limit < local_hop_cap ? link.hop_limit : local_hop_cap;
+  if (link.hop_count >= effective_limit || link.route_length >= MAX_HOPS) {
+    return false;
+  }
+  link.route[link.route_length++] = local_relay_token;
   link.hop_count++;
   memcpy(packet, &link, sizeof(link));
   return true;
+}
+
+inline bool mayRelay(
+    const LinkHeaderV2& link,
+    const EquineProtocol::SecureFrameHeaderV2& secure,
+    uint8_t local_hop_cap,
+    uint32_t local_relay_token) {
+  if (secure.frame.message_type ==
+      static_cast<uint8_t>(EquineProtocol::MessageType::ACK)) {
+    return link.flags == LINK_FLAG_REVERSE_ROUTE && link.route_cursor > 0 &&
+           link.route[link.route_cursor - 1] == local_relay_token;
+  }
+  const uint8_t effective_limit =
+    link.hop_limit < local_hop_cap ? link.hop_limit : local_hop_cap;
+  return link.flags == LINK_FLAG_NONE && link.hop_count < effective_limit;
 }
 
 inline FrameIdentityV1 frameIdentity(
@@ -129,6 +197,12 @@ inline uint64_t mix64(uint64_t value) {
   value ^= value >> 27;
   value *= 0x94d049bb133111ebULL;
   return value ^ (value >> 31);
+}
+
+inline uint32_t relayToken(uint64_t repeater_id_hash) {
+  const uint64_t mixed = mix64(repeater_id_hash);
+  const uint32_t token = static_cast<uint32_t>(mixed ^ (mixed >> 32));
+  return token == 0 ? 1 : token;
 }
 
 inline uint64_t identityFingerprint(const FrameIdentityV1& identity) {

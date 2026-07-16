@@ -9,22 +9,29 @@ current link envelope; raw transport-v2 frames without it are rejected.
 ## Repeater link envelope
 
 ```text
-LinkHeaderV1
-  uint16 magic        0x524c (wire bytes "LR")
-  uint8  version      1
-  uint8  hop_count    number of repeaters already traversed
-  uint8  hop_limit    origin-selected maximum, 0..4
-  uint8  flags        zero in link version 1
+LinkHeaderV2
+  uint16 magic                0x524c (wire bytes "LR")
+  uint8  version              2
+  uint8  hop_count            number of repeaters already traversed
+  uint8  hop_limit            origin-selected maximum, 0..4
+  uint8  flags                bit 0 = reverse ACK route
+  uint8  route_length         recorded HISTORY path length, 0..4
+  uint8  route_cursor         next reverse-route position for ACK
+  uint32 transaction_counter  originating HISTORY secure counter
+  uint32 route[4]             compact repeater tokens in forward order
 ```
 
 The link header is mutable and is not AES-GCM associated data. The secure frame
-that follows remains byte-for-byte end-to-end authenticated. Each repeater
-increments `hop_count` only when it is below both `hop_limit` and its configured
-local cap. Lowering a visible hop limit can deny forwarding, but raising it
+that follows remains byte-for-byte end-to-end authenticated. For HISTORY, each repeater
+increments `hop_count` and appends its token only when below both `hop_limit`
+and its configured local cap. The gateway copies that route into its ACK. ACK
+forwarding decrements `route_cursor`, and only the relay named at the cursor may
+forward. The tracker accepts only a reverse route whose cursor reached zero and
+whose transaction counter matches the outstanding transmission. Lowering a visible hop limit can deny forwarding, but raising it
 cannot bypass a repeater's local maximum. LoRa itself remains susceptible to
 jamming and denial of service.
 
-The six-byte header reduces the maximum secure frame to 249 bytes. Tracker
+The 28-byte header reduces the maximum secure frame to 227 bytes. Tracker
 batch packing receives the reduced plaintext capacity and stops cleanly before
 that limit. Repeaters accept only current `HISTORY` and `ACK` secure headers and
 never decrypt either payload.
@@ -129,9 +136,11 @@ at least one queued point. A missing, stale, inconsistent or invalid-tag ACK
 never clears tracker history.
 
 The tracker ignores echoed `HISTORY`, ACKs for other trackers and malformed
-packets while keeping the ACK receive window open. The default window is 15
-seconds for the default two-hop/SF10 profile and is configurable up to 30
-seconds; deployment timing must be measured.
+packets while keeping the ACK receive window open. An ACK is accepted only when
+its complete LoRa packet arrives before the outstanding transaction deadline.
+At timeout the receive window closes and the radio sleeps; a late packet cannot
+clear history. The default window is 15 seconds for the default two-hop/SF10
+profile and is configurable up to 30 seconds; deployment timing must be measured.
 
 ## Key handling limits
 

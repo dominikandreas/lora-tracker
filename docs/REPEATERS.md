@@ -7,8 +7,8 @@ does not interoperate with LoRaWAN gateways.
 
 ## Design
 
-Every radio packet starts with a six-byte link header containing a magic value,
-link version, current hop count, origin-selected hop limit and reserved flags.
+Every radio packet starts with a 28-byte link-v2 header containing hop state, a
+transaction counter and up to four compact repeater route tokens.
 The existing AES-256-GCM frame follows unchanged. A repeater can validate the
 public secure-frame header and increment the link hop, but it has no tracker
 key and cannot read or alter coordinates, timestamps, battery state or ACK
@@ -21,24 +21,35 @@ Forwarding is bounded and opportunistic:
 - a frame identity is the message type, schema, device hash, boot ID and secure
   counter; recent identities are not forwarded twice;
 - each repeater derives a stable priority slot from the frame identity and its
-  own ID, then waits a short deterministic delay;
+  own ID; slots are at least one complete packet airtime plus a turnaround guard,
+  so co-hearing candidates do not start overlapping transmissions;
 - hearing a peer forward the same frame at the planned hop cancels the pending
   copy, reducing duplicate airtime while allowing a more distant repeater that
   heard only the new hop to continue the chain;
 - the queue holds at most eight full packets; overload drops new work rather
   than exhausting memory or blocking radio reception;
-- a rolling-hour limiter charges estimated and measured transmit airtime. It
-  starts empty after reboot and bounds idle bursts plus refill to 36,000 ms in
-  every continuous hour under the supported Germany profile. Frames wait for
-  budget instead of being discarded. See the
+- before forwarding HISTORY, a repeater atomically reserves both the HISTORY
+  airtime and one matching ACK transmission. The reservation is keyed by tracker,
+  boot and transaction and expires after 35 seconds. If the whole transaction
+  cannot be funded, the frame is dropped and the tracker retry selects a fresh
+  path; an already-forwarded half-transaction is never left waiting indefinitely;
+- the rolling-hour limiter starts empty after reboot and sizes its burst capacity
+  for one maximum HISTORY plus ACK transaction, while still bounding refill to
+  36,000 ms in every continuous hour under the supported Germany profile. See the
   [Germany radio profile](RADIO_COMPLIANCE_DE.md) for ERP/EIRP and antenna rules.
+
+A HISTORY appends the token of each repeater that actually forwards it. The
+gateway copies that path into the ACK with a reverse cursor. Only the next named
+repeater may forward the ACK, eliminating ACK flooding by every relay that heard
+the original tracker. Reservations and routes use the public transaction counter;
+the encrypted ACK remains end-to-end authenticated.
 
 A frame enters the recent cache only after a successful transmission. Radio
 failures are retried three times locally; if they still fail, a later source
-retry remains eligible. ACK identities use a five-second duplicate cache
-instead of the ordinary 120-second cache. This suppresses an ACK flood but permits the receiver's ACK
-to be forwarded again after a later tracker retry. The tracker keeps listening
-through echoed history and unrelated radio frames until the ACK deadline.
+retry remains eligible. ACK identities use a five-second duplicate cache. The
+tracker listens through echoed history and unrelated traffic, but accepts a
+matching ACK only if the complete packet arrived before the deadline. At timeout
+the receive window closes and the radio sleeps; late ACKs cannot clear history.
 
 ## Supported hardware and build
 
@@ -79,12 +90,11 @@ reverse limits. The repeater hop value is only a local maximum.
 
 ## Timing and topology
 
-The gateway waits for the received HISTORY airtime plus the default 400 ms
-relay slot window before sending an archive-backed ACK whenever another hop is
-possible. This prevents a fast MQTT/archive round trip from colliding with a
-repeater that is still forwarding the same HISTORY frame. The policy is shared
-between the firmware and WASM simulator. Custom repeater delays above that
-window require measured topology testing and a correspondingly safe ACK plan.
+Co-hearing relays use packet-airtime-sized slots and suppress their pending copy
+when they hear the winner. The gateway retains the relay-clear guard before an
+archive-backed ACK; the ACK then follows only the recorded reverse path. Hidden
+nodes that cannot hear the winner remain a physical shared-channel limitation,
+so installed topology tests are still required.
 
 The default tracker ACK window is 15 seconds for up to two repeater hops at the
 default SF10/125 kHz profile. Larger packets, higher spreading factors, MQTT
