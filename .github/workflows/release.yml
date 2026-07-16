@@ -53,21 +53,21 @@ jobs:
       - name: Test browser application
         working-directory: components/web-app
         run: npm test
-      - name: Build every supported firmware target
-        run: |
-          pio run -d components/tracker-firmware -e heltec_wifi_lora_32_v2
-          pio run -d components/tracker-firmware -e heltec_wireless_tracker
-          pio run -d components/gateway-firmware -e heltec_wifi_lora_32_v2
-          pio run -d components/repeater-firmware -e heltec_wifi_lora_32_v2
-          pio run -d components/repeater-firmware -e heltec_wireless_tracker
-      - name: Package browser-flashable images
+      - name: Build and package every supported firmware target
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}"
-          for TARGET in tracker-v2 tracker-wireless-tracker gateway-v2 repeater-heltec-lora32 repeater-wireless-tracker; do
-            python tools/package_firmware.py --target "$TARGET" --version "$VERSION" --output dist --download-base "$BASE"
-          done
+          pio run -d components/tracker-firmware -e heltec_wifi_lora_32_v2
+          python tools/package_firmware.py --target tracker-v2 --version "$VERSION" --output dist --download-base "$BASE"
+          pio run -d components/tracker-firmware -e heltec_wireless_tracker
+          python tools/package_firmware.py --target tracker-wireless-tracker --version "$VERSION" --output dist --download-base "$BASE"
+          pio run -d components/gateway-firmware -e heltec_wifi_lora_32_v2
+          python tools/package_firmware.py --target gateway-v2 --version "$VERSION" --output dist --download-base "$BASE"
+          pio run -d components/repeater-firmware -e heltec_wifi_lora_32_v2
+          python tools/package_firmware.py --target repeater-heltec-lora32 --version "$VERSION" --output dist --download-base "$BASE"
+          pio run -d components/repeater-firmware -e heltec_wireless_tracker
+          python tools/package_firmware.py --target repeater-wireless-tracker --version "$VERSION" --output dist --download-base "$BASE"
           (cd dist && sha256sum * > SHA256SUMS)
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
