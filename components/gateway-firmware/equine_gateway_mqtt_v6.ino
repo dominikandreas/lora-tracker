@@ -1633,13 +1633,12 @@ void publishAutoDiscoveryForTracker(const TrackerRuntime& tracker) {
            "homeassistant/device_tracker/%s/location/config",
            tracker.config->device_id);
   snprintf(payload, sizeof(payload),
-    "{\"name\":\"%s Location\",\"stat_t\":\"%s\","
+    "{\"name\":\"%s Location\","
     "\"json_attr_t\":\"%s\",\"source_type\":\"gps\","
     "\"uniq_id\":\"%s_loc\",\"avty_t\":\"%s\","
     "\"dev\":{\"ids\":[\"%s\"],\"name\":\"%s Tracker\","
     "\"mdl\":\"LoRa Tracker\"}}",
     escaped_device_name,
-    tracker.state_topic,
     tracker.state_topic,
     tracker.hash_text,
     gateway_availability_topic,
