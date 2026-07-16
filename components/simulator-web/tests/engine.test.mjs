@@ -102,8 +102,17 @@ test('polygon obstacles block links and their vertices are validated', async () 
   assert.equal(pointInPolygon({ x: 500, y: 260 }, forest.points), true);
   const link = calculateLink(scenario, core, scenario.devices[0], scenario.devices[2], 0, 'polygon');
   assert.ok(link.forestLoss > 0);
-  forest.points[0].x = -1;
+  forest.points[0].x = Number.NaN;
   assert.match((await validateScenario(scenario, core)).join(' '), /invalid polygon/);
+});
+
+test('placement coordinates are not constrained by the current render extent', async () => {
+  const core = new ReferenceCore();
+  const scenario = createDefaultScenario();
+  scenario.devices[0].x = -5000;
+  scenario.devices[0].waypoints[0] = { x: 12000, y: -8000 };
+  scenario.obstacles.find((obstacle) => obstacle.type === 'forest').points[0] = { x: 20000, y: 15000 };
+  assert.deepEqual(await validateScenario(scenario, core), []);
 });
 
 test('georeferenced points use great-circle distance and support safe editing removal', () => {

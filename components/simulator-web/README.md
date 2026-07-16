@@ -57,7 +57,11 @@ no secrets and can be cleared with normal browser site-data controls.
 
 The editable metre world grows automatically when an entity, waypoint or
 polygon is placed beyond its previous boundary; the geographic anchor remains
-fixed, so existing coordinates do not drift. Each device inspector exposes
+fixed, so existing coordinates do not drift. The world rectangle is only a
+render extent, never a placement constraint. Stored and imported scenarios are
+expanded around all finite coordinates before validation, including negative
+local coordinates and points far outside the initial crop. Each device
+inspector exposes
 **TX power (dBm conducted)** (2–14 dBm for the German profile), alongside
 antenna gain and cable loss; the resulting installation is still checked
 against the 14 dBm ERP limit. The global **Range pessimism** slider adds a

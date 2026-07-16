@@ -143,3 +143,23 @@ test('grows the editable world beyond the initial crop and calibrates global ran
   await expect(page.locator('#range-pessimism-label')).toHaveText('Harsh · 32 dB');
   await expect(page.locator('#range-pessimism')).toHaveValue('32');
 });
+
+test('repairs stale saved bounds around freely placed entities during startup', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('#core-status')).toContainText('WASM v1');
+  await expect.poll(() => page.evaluate(() => Boolean(localStorage.getItem('lora-tracker.network-lab.scenario.v2')))).toBe(true);
+  await page.evaluate(() => {
+    const key = 'lora-tracker.network-lab.scenario.v2';
+    const scenario = JSON.parse(localStorage.getItem(key));
+    scenario.world = { minXM: 0, minYM: 0, widthM: 1000, heightM: 620, gridM: 50 };
+    scenario.devices.find((device) => device.id === 'tracker-1').x = -4200;
+    scenario.devices.find((device) => device.id === 'tracker-1').waypoints[0] = { x: 7300, y: -5100 };
+    localStorage.setItem(key, JSON.stringify(scenario));
+  });
+  await page.reload();
+  await expect(page.locator('#core-status')).toContainText('WASM v1');
+  await expect.poll(() => page.evaluate(() => {
+    const scenario = JSON.parse(localStorage.getItem('lora-tracker.network-lab.scenario.v2'));
+    return [scenario.world.minXM, scenario.world.minYM, scenario.world.minXM + scenario.world.widthM];
+  })).toEqual([-4200, -5100, 7300]);
+});

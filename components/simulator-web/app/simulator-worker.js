@@ -11,6 +11,12 @@ function send(type, payload = {}) { self.postMessage({ type, ...payload }); }
 function snapshot() { send('snapshot', { snapshot: engine.snapshot() }); }
 
 function normalizeScenario(scenario) {
+  scenario.world ??= { minXM: 0, minYM: 0, widthM: 1000, heightM: 620, gridM: 50 };
+  if (!Number.isFinite(scenario.world.minXM)) scenario.world.minXM = 0;
+  if (!Number.isFinite(scenario.world.minYM)) scenario.world.minYM = 0;
+  if (!Number.isFinite(scenario.world.widthM) || scenario.world.widthM < 100) scenario.world.widthM = 1000;
+  if (!Number.isFinite(scenario.world.heightM) || scenario.world.heightM < 100) scenario.world.heightM = 620;
+  if (!Number.isFinite(scenario.world.gridM) || scenario.world.gridM <= 0) scenario.world.gridM = 50;
   scenario.world.minXM ??= 0; scenario.world.minYM ??= 0;
   scenario.map.anchorX ??= scenario.world.minXM + scenario.world.widthM / 2;
   scenario.map.anchorY ??= scenario.world.minYM + scenario.world.heightM / 2;
@@ -20,9 +26,12 @@ function normalizeScenario(scenario) {
 
 function expandWorldForScenario(scenario) {
   const world = scenario.world;
-  let minX = world.minXM ?? 0; let minY = world.minYM ?? 0;
-  let maxX = minX + world.widthM; let maxY = minY + world.heightM;
+  const originalMinX = world.minXM ?? 0; const originalMinY = world.minYM ?? 0;
+  const originalMaxX = originalMinX + world.widthM; const originalMaxY = originalMinY + world.heightM;
+  let minX = originalMinX; let minY = originalMinY;
+  let maxX = originalMaxX; let maxY = originalMaxY;
   const include = (point, margin = 0) => {
+    if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y) || !Number.isFinite(margin)) return;
     minX = Math.min(minX, point.x - margin); minY = Math.min(minY, point.y - margin);
     maxX = Math.max(maxX, point.x + margin); maxY = Math.max(maxY, point.y + margin);
   };
@@ -32,14 +41,17 @@ function expandWorldForScenario(scenario) {
     else for (const point of obstacle.points ?? []) include(point);
   }
   const grid = Math.max(1, world.gridM ?? 50);
-  world.minXM = Math.floor(minX / grid) * grid;
-  world.minYM = Math.floor(minY / grid) * grid;
-  world.widthM = Math.ceil((maxX - world.minXM) / grid) * grid;
-  world.heightM = Math.ceil((maxY - world.minYM) / grid) * grid;
+  world.minXM = minX < originalMinX ? Math.floor(minX / grid) * grid : originalMinX;
+  world.minYM = minY < originalMinY ? Math.floor(minY / grid) * grid : originalMinY;
+  const expandedMaxX = maxX > originalMaxX ? Math.ceil(maxX / grid) * grid : originalMaxX;
+  const expandedMaxY = maxY > originalMaxY ? Math.ceil(maxY / grid) * grid : originalMaxY;
+  world.widthM = expandedMaxX - world.minXM;
+  world.heightM = expandedMaxY - world.minYM;
 }
 
 async function initialize(scenario = createDefaultScenario()) {
   scenario = normalizeScenario(scenario);
+  expandWorldForScenario(scenario);
   core ??= await FirmwareCore.load();
   const errors = await validateScenario(scenario, core);
   if (errors.length) throw new Error(errors.join('; '));

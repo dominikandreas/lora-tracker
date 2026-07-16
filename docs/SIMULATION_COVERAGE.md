@@ -29,6 +29,12 @@ and small or large buildings; configure every modeled device parameter; change
 day/night temperature, humidity and foliage wetness; pause, single-step or
 accelerate time; and import/export versioned scenario JSON.
 
+The metre-world bounds are render metadata rather than a simulation boundary.
+Devices, waypoints and obstacle polygons may be placed freely at any finite
+local coordinate. The worker expands stale, stored or imported bounds around
+all geometry before validation, so panning away from the initial crop does not
+create an artificial placement limit.
+
 Forests and buildings are editable polygons. Select an area to drag a corner,
 or click an edge midpoint to insert another point. The lab derives geographic
 coordinates from the selected map centre and uses great-circle distances for

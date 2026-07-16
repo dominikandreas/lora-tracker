@@ -102,9 +102,9 @@ export async function validateScenario(scenario, core) {
   const errors = [];
   if (scenario.schemaVersion !== SCENARIO_VERSION) errors.push('Unsupported scenario schema');
   const world = scenario.world ?? {};
-  const minXM = world.minXM ?? 0; const minYM = world.minYM ?? 0;
-  const maxXM = minXM + world.widthM; const maxYM = minYM + world.heightM;
-  if (world.widthM < 100 || world.heightM < 100) {
+  if (!Number.isFinite(world.minXM ?? 0) || !Number.isFinite(world.minYM ?? 0) ||
+      !Number.isFinite(world.widthM) || !Number.isFinite(world.heightM) ||
+      world.widthM < 100 || world.heightM < 100) {
     errors.push('World must be at least 100 m by 100 m');
   }
   const map = scenario.map ?? {};
@@ -132,13 +132,13 @@ export async function validateScenario(scenario, core) {
     const installedEirp = device.radio.txPowerDbm + device.antennaGainDbi - device.cableLossDb;
     if (installedEirp > 16.15 + 1e-6) errors.push(`${device.id} exceeds 14 dBm ERP (16.15 dBm EIRP)`);
     if (device.radio.relayHopLimit < 0 || device.radio.relayHopLimit > 4) errors.push(`${device.id} has an invalid hop limit`);
-    if (!Number.isFinite(device.x) || !Number.isFinite(device.y) || device.x < 0 || device.y < 0 ||
-        device.x > maxXM || device.y > maxYM || device.x < minXM || device.y < minYM) errors.push(`${device.id} is outside the world`);
+    if (!Number.isFinite(device.x) || !Number.isFinite(device.y)) errors.push(`${device.id} has invalid coordinates`);
     if (!(device.antennaHeightM > 0 && device.antennaHeightM <= 100) ||
         !Number.isFinite(device.antennaGainDbi) || !Number.isFinite(device.cableLossDb)) errors.push(`${device.id} has invalid antenna properties`);
     if (device.role === 'tracker') {
       const c = device.config ?? {};
       if (!device.waypoints || device.waypoints.length < 1) errors.push(`${device.id} needs a waypoint`);
+      else if (device.waypoints.some((point) => !Number.isFinite(point.x) || !Number.isFinite(point.y))) errors.push(`${device.id} has invalid waypoint coordinates`);
       if (!(device.speedKmh >= 0 && device.speedKmh <= 100)) errors.push(`${device.id} has an invalid speed`);
       if (!(c.movingSleepS >= 10 && c.movingSleepS <= 86400 &&
             c.stationarySleepS >= c.movingSleepS && c.stationarySleepS <= 86400 &&
@@ -178,9 +178,9 @@ export async function validateScenario(scenario, core) {
     if (!obstacle.id || ids.has(obstacle.id)) errors.push(`Duplicate or missing obstacle ID ${obstacle.id ?? ''}`);
     ids.add(obstacle.id);
     if (!['forest', 'tree', 'building-small', 'building-large'].includes(obstacle.type)) errors.push(`${obstacle.id} has an invalid obstacle type`);
-    if (obstacle.type === 'tree' && !(obstacle.radius > 0 && obstacle.radius <= 100)) errors.push(`${obstacle.id} has an invalid radius`);
+    if (obstacle.type === 'tree' && (!Number.isFinite(obstacle.x) || !Number.isFinite(obstacle.y) || !(obstacle.radius > 0 && obstacle.radius <= 100))) errors.push(`${obstacle.id} has invalid tree geometry`);
     if (obstacle.type !== 'tree' && (!Array.isArray(obstacle.points) || obstacle.points.length < 3 ||
-        obstacle.points.some((point) => !Number.isFinite(point.x) || !Number.isFinite(point.y) || point.x < minXM || point.y < minYM || point.x > maxXM || point.y > maxYM))) errors.push(`${obstacle.id} has an invalid polygon`);
+        obstacle.points.some((point) => !Number.isFinite(point.x) || !Number.isFinite(point.y)))) errors.push(`${obstacle.id} has an invalid polygon`);
     if (obstacle.type === 'forest' && !(obstacle.density >= 0 && obstacle.density <= 1)) errors.push(`${obstacle.id} has invalid density`);
   }
   if (!(scenario.devices ?? []).some((d) => d.role === 'receiver')) errors.push('At least one receiver is required');
