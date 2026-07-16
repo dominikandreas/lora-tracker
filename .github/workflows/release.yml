@@ -48,9 +48,11 @@ jobs:
           cp components/tracker-firmware/secrets.example.h components/tracker-firmware/secrets.h
           cp components/gateway-firmware/secrets.example.h components/gateway-firmware/secrets.h
       - name: Test release source
-        run: |
-          python -m pytest -q components/archiver
-          (cd components/web-app && npm test)
+        working-directory: components/archiver
+        run: python -m pytest -q
+      - name: Test browser application
+        working-directory: components/web-app
+        run: npm test
       - name: Build every supported firmware target
         run: |
           pio run -d components/tracker-firmware -e heltec_wifi_lora_32_v2
