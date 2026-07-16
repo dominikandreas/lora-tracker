@@ -724,7 +724,7 @@ function drawObstacle(obstacle, x, y, sx, sy) {
     context.fillStyle = '#684b32'; context.fillRect(x(obstacle.x) - 1.5, y(obstacle.y), 3, 7);
     return;
   }
-  const colors = { forest: 'rgba(38,103,67,.58)', 'building-small': '#735f4b', 'building-large': '#80654d' };
+  const colors = { forest: 'rgba(38,103,67,.58)', 'building-small': 'rgba(115,95,75,.48)', 'building-large': 'rgba(128,101,77,.62)' };
   const points = obstacle.points;
   context.fillStyle = colors[obstacle.type]; context.beginPath(); points.forEach((point, index) => index ? context.lineTo(x(point.x), y(point.y)) : context.moveTo(x(point.x), y(point.y))); context.closePath(); context.fill();
   context.strokeStyle = selected ? '#edf6f2' : obstacle.type === 'forest' ? 'rgba(92,224,160,.45)' : '#b59778'; context.lineWidth = selected ? 2 : 1;
