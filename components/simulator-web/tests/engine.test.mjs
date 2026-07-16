@@ -4,6 +4,7 @@ import test from 'node:test';
 import { ReferenceCore } from '../app/firmware-core.js';
 import { createDefaultScenario } from '../app/default-scenario.js';
 import { calculateLink, environmentAt, SimulationEngine, validateScenario } from '../app/simulation-engine.js';
+import { exactDistanceM, pointInPolygon } from '../app/geometry.js';
 
 test('Germany profile rejects an illegal frequency and installed ERP', async () => {
   const core = new ReferenceCore();
@@ -81,4 +82,31 @@ test('collision model reports simultaneous equal-power frames', () => {
   const engine = new SimulationEngine(scenario, core);
   engine.advance(1200);
   assert.ok(engine.events.some((event) => event.type === 'collision'));
+});
+
+test('polygon obstacles block links and their vertices are validated', async () => {
+  const core = new ReferenceCore();
+  const scenario = createDefaultScenario();
+  const forest = scenario.obstacles.find((obstacle) => obstacle.type === 'forest');
+  assert.equal(pointInPolygon({ x: 500, y: 260 }, forest.points), true);
+  const link = calculateLink(scenario, core, scenario.devices[0], scenario.devices[2], 0, 'polygon');
+  assert.ok(link.forestLoss > 0);
+  forest.points[0].x = -1;
+  assert.match((await validateScenario(scenario, core)).join(' '), /invalid polygon/);
+});
+
+test('georeferenced points use great-circle distance and support safe editing removal', () => {
+  const core = new ReferenceCore();
+  const scenario = createDefaultScenario();
+  const start = scenario.devices[0].waypoints[0];
+  const end = { x: start.x + 100, y: start.y };
+  assert.ok(Math.abs(exactDistanceM(scenario, start, end) - 100) < 0.1);
+  const engine = new SimulationEngine(scenario, core);
+  engine.updateWaypoint('tracker-1', 1, end);
+  assert.deepEqual(engine.scenario.devices[0].waypoints[1], end);
+  engine.removeWaypoint('tracker-1', 1);
+  assert.equal(engine.scenario.devices[0].waypoints.length, 3);
+  engine.removeEntity('tracker-1');
+  assert.equal(engine.scenario.devices.some((device) => device.id === 'tracker-1'), false);
+  assert.deepEqual(engine.scenario.devices.find((device) => device.role === 'receiver').config.registeredTrackerIds, []);
 });

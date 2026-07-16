@@ -1,4 +1,5 @@
 import { SCENARIO_VERSION } from './default-scenario.js';
+import { exactDistanceM, pointInObstacle } from './geometry.js';
 
 const deepCopy = (value) => JSON.parse(JSON.stringify(value));
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
@@ -11,11 +12,6 @@ function hashText(value) {
     hash = Math.imul(hash, 0x01000193) >>> 0;
   }
   return hash >>> 0;
-}
-
-function pointInRect(point, obstacle) {
-  return point.x >= obstacle.x && point.x <= obstacle.x + obstacle.width &&
-    point.y >= obstacle.y && point.y <= obstacle.y + obstacle.height;
 }
 
 function pointToSegmentDistance(point, start, end) {
@@ -52,7 +48,7 @@ export function obstacleLossDb(scenario, from, to, environment) {
           x: from.x + (to.x - from.x) * index / samples,
           y: from.y + (to.y - from.y) * index / samples,
         };
-        if (pointInRect(point, obstacle)) inside += 1;
+        if (pointInObstacle(point, obstacle)) inside += 1;
       }
       forestSamples += inside * (obstacle.density ?? 0.7);
     } else if (obstacle.type.startsWith('building')) {
@@ -62,7 +58,7 @@ export function obstacleLossDb(scenario, from, to, environment) {
           x: from.x + (to.x - from.x) * index / samples,
           y: from.y + (to.y - from.y) * index / samples,
         };
-        if (pointInRect(point, obstacle)) { intersects = true; break; }
+        if (pointInObstacle(point, obstacle)) { intersects = true; break; }
       }
       if (intersects) buildingLoss += obstacle.type === 'building-large' ? 24 : 12;
     } else if (obstacle.type === 'tree') {
@@ -71,13 +67,13 @@ export function obstacleLossDb(scenario, from, to, environment) {
       }
     }
   }
-  const forestMeters = forestSamples / samples * distance(from, to);
+  const forestMeters = forestSamples / samples * exactDistanceM(scenario, from, to);
   const forestLoss = forestMeters * 0.035 * (0.75 + environment.wetness * 0.9);
   return { total: forestLoss + buildingLoss + treeLoss, forestLoss, buildingLoss, treeLoss };
 }
 
 export function calculateLink(scenario, core, from, to, timeS, frameKey = '') {
-  const rangeM = Math.max(1, distance(from, to));
+  const rangeM = Math.max(1, exactDistanceM(scenario, from, to));
   const frequencyMhz = from.radio.frequencyHz / 1e6;
   const freeSpaceLoss = 32.44 + 20 * Math.log10(rangeM / 1000) + 20 * Math.log10(frequencyMhz);
   const excessGroundLoss = rangeM > 40 ? 7 * Math.log10(rangeM / 40) : 0;
@@ -108,6 +104,9 @@ export async function validateScenario(scenario, core) {
   if (world.widthM < 100 || world.heightM < 100) {
     errors.push('World must be at least 100 m by 100 m');
   }
+  const map = scenario.map ?? {};
+  if (!['grid', 'satellite'].includes(map.mode) || !Number.isFinite(map.centerLat) || Math.abs(map.centerLat) > 85 ||
+      !Number.isFinite(map.centerLng) || Math.abs(map.centerLng) > 180 || !(map.zoom >= 1 && map.zoom <= 20)) errors.push('Map location is invalid');
   const environment = scenario.environment ?? {};
   if (![environment.dayTemperatureC, environment.nightTemperatureC].every((value) => value >= -30 && value <= 60) ||
       ![environment.dayHumidityPct, environment.nightHumidityPct].every((value) => value >= 0 && value <= 100) ||
@@ -177,7 +176,8 @@ export async function validateScenario(scenario, core) {
     ids.add(obstacle.id);
     if (!['forest', 'tree', 'building-small', 'building-large'].includes(obstacle.type)) errors.push(`${obstacle.id} has an invalid obstacle type`);
     if (obstacle.type === 'tree' && !(obstacle.radius > 0 && obstacle.radius <= 100)) errors.push(`${obstacle.id} has an invalid radius`);
-    if (obstacle.type !== 'tree' && !(obstacle.width > 0 && obstacle.height > 0)) errors.push(`${obstacle.id} has invalid dimensions`);
+    if (obstacle.type !== 'tree' && (!Array.isArray(obstacle.points) || obstacle.points.length < 3 ||
+        obstacle.points.some((point) => !Number.isFinite(point.x) || !Number.isFinite(point.y) || point.x < 0 || point.y < 0 || point.x > world.widthM || point.y > world.heightM))) errors.push(`${obstacle.id} has an invalid polygon`);
     if (obstacle.type === 'forest' && !(obstacle.density >= 0 && obstacle.density <= 1)) errors.push(`${obstacle.id} has invalid density`);
   }
   if (!(scenario.devices ?? []).some((d) => d.role === 'receiver')) errors.push('At least one receiver is required');
@@ -225,7 +225,7 @@ export class SimulationEngine {
     this.eventId = 0;
     this.taskId = 0;
     this.devices = new Map(this.scenario.devices.map((device) => {
-      const copy = { ...device, runtime: initialRuntime(device, core) };
+      const copy = { ...deepCopy(device), runtime: initialRuntime(device, core) };
       const hash = hashText(device.id);
       copy.hashHi = hashText(`hi:${device.id}`);
       copy.hashLo = hash;
@@ -249,6 +249,7 @@ export class SimulationEngine {
     if (patch.environment) Object.assign(this.scenario.environment, patch.environment);
     if (patch.mqtt) Object.assign(this.scenario.mqtt, patch.mqtt);
     if (patch.clock) Object.assign(this.scenario.clock, patch.clock);
+    if (patch.map) Object.assign(this.scenario.map, patch.map);
   }
 
   replaceScenario(scenario) {
@@ -259,7 +260,7 @@ export class SimulationEngine {
     if (entity.role) {
       const device = deepCopy(entity);
       this.scenario.devices.push(device);
-      const runtimeDevice = { ...device, runtime: initialRuntime(device, this.core) };
+      const runtimeDevice = { ...deepCopy(device), runtime: initialRuntime(device, this.core) };
       runtimeDevice.hashHi = hashText(`hi:${device.id}`);
       runtimeDevice.hashLo = hashText(device.id);
       this.devices.set(device.id, runtimeDevice);
@@ -288,6 +289,32 @@ export class SimulationEngine {
     const source = this.scenario.devices.find((item) => item.id === id);
     source.waypoints.push(deepCopy(point));
     this.log('configuration', `Waypoint added to ${device.name}`, { deviceId: id });
+  }
+
+  removeEntity(id) {
+    const device = this.devices.get(id);
+    if (device) {
+      this.devices.delete(id);
+      this.scenario.devices = this.scenario.devices.filter((item) => item.id !== id);
+      if (device.role === 'tracker') for (const receiver of this.scenario.devices.filter((item) => item.role === 'receiver')) receiver.config.registeredTrackerIds = receiver.config.registeredTrackerIds.filter((trackerId) => trackerId !== id);
+    } else this.scenario.obstacles = this.scenario.obstacles.filter((item) => item.id !== id);
+    this.log('configuration', `Removed ${id}`, { deviceId: id });
+  }
+
+  updateWaypoint(id, index, point) {
+    const device = this.devices.get(id);
+    if (!device || device.role !== 'tracker' || !device.waypoints[index]) return;
+    device.waypoints[index] = deepCopy(point);
+    const source = this.scenario.devices.find((item) => item.id === id);
+    source.waypoints[index] = deepCopy(point);
+  }
+
+  removeWaypoint(id, index) {
+    const device = this.devices.get(id);
+    if (!device || device.role !== 'tracker') return;
+    device.waypoints.splice(index, 1);
+    const source = this.scenario.devices.find((item) => item.id === id);
+    source.waypoints.splice(index, 1);
   }
 
   advance(seconds = 1) {
@@ -360,8 +387,8 @@ export class SimulationEngine {
   localGnssQuality(tracker) {
     let quality = 0.96;
     for (const obstacle of this.scenario.obstacles) {
-      if (obstacle.type === 'forest' && pointInRect(tracker, obstacle)) quality -= 0.22 * obstacle.density;
-      if (obstacle.type.startsWith('building') && pointInRect(tracker, obstacle)) quality -= 0.55;
+      if (obstacle.type === 'forest' && pointInObstacle(tracker, obstacle)) quality -= 0.22 * obstacle.density;
+      if (obstacle.type.startsWith('building') && pointInObstacle(tracker, obstacle)) quality -= 0.55;
       if (obstacle.type === 'tree' && distance(tracker, obstacle) < obstacle.radius * 2) quality -= 0.05;
     }
     return clamp(quality, 0.08, 0.99);

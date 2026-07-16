@@ -56,6 +56,7 @@ self.onmessage = async ({ data }) => {
         if (data.patch.environment) Object.assign(candidate.environment, data.patch.environment);
         if (data.patch.mqtt) Object.assign(candidate.mqtt, data.patch.mqtt);
         if (data.patch.clock) Object.assign(candidate.clock, data.patch.clock);
+        if (data.patch.map) Object.assign(candidate.map, data.patch.map);
       });
       engine.updateScenario(data.patch); snapshot();
     }
@@ -75,6 +76,16 @@ self.onmessage = async ({ data }) => {
       });
       engine.updateEntity(data.id, data.changes); snapshot();
     }
+    else if (data.type === 'remove-entity') {
+      await requireValidMutation((candidate) => {
+        const device = candidate.devices.find((item) => item.id === data.id);
+        if (device) {
+          candidate.devices = candidate.devices.filter((item) => item.id !== data.id);
+          if (device.role === 'tracker') for (const receiver of candidate.devices.filter((item) => item.role === 'receiver')) receiver.config.registeredTrackerIds = receiver.config.registeredTrackerIds.filter((id) => id !== data.id);
+        } else candidate.obstacles = candidate.obstacles.filter((item) => item.id !== data.id);
+      });
+      engine.removeEntity(data.id); snapshot();
+    }
     else if (data.type === 'add-waypoint') {
       await requireValidMutation((candidate) => {
         const tracker = candidate.devices.find((item) => item.id === data.id && item.role === 'tracker');
@@ -82,6 +93,17 @@ self.onmessage = async ({ data }) => {
         tracker.waypoints.push(data.point);
       });
       engine.addWaypoint(data.id, data.point); snapshot();
+    }
+    else if (data.type === 'update-waypoint' || data.type === 'remove-waypoint') {
+      await requireValidMutation((candidate) => {
+        const tracker = candidate.devices.find((item) => item.id === data.id && item.role === 'tracker');
+        if (!tracker) throw new Error(`Unknown tracker ${data.id}`);
+        if (data.type === 'update-waypoint') tracker.waypoints[data.index] = data.point;
+        else tracker.waypoints.splice(data.index, 1);
+      });
+      if (data.type === 'update-waypoint') engine.updateWaypoint(data.id, data.index, data.point);
+      else engine.removeWaypoint(data.id, data.index);
+      snapshot();
     }
   } catch (error) {
     const fatal = !engine;

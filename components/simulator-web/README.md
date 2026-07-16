@@ -33,3 +33,18 @@ collisions/capture, battery accounting and the in-browser MQTT/archive model.
 
 Scenario files use versioned JSON and contain no secrets. The RF result is an
 explainable engineering estimate, not a range promise or regulatory test.
+
+## Map editor and location
+
+Forests and buildings are polygons. Select one to drag a corner; click an edge
+midpoint to insert a new corner. Tracker waypoints can also be dragged and
+removed from the tracker inspector. Devices and obstacles can be removed from
+their inspector; removing a tracker also removes it from receiver registries.
+
+The default view is a metre grid. Enter latitude/longitude, or grant the
+browser location permission, then select **Satellite** to use Esri World
+Imagery as an optional background. Satellite tiles are requested directly from
+that provider only while satellite mode is selected; no location is sent to the
+simulator service. Geographic positions shown in the inspector and route/link
+lengths use a great-circle (haversine) calculation. The underlying RF/obstacle
+model remains a local engineering model and is not terrain-aware.

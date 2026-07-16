@@ -48,3 +48,26 @@ test('models an MQTT outage and remains usable at mobile width', async ({ page }
   const bodyWidth = await page.evaluate(() => document.body.scrollWidth);
   expect(bodyWidth).toBeLessThanOrEqual(390);
 });
+
+test('edits polygons, removes waypoints and accepts a manual satellite location', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('#core-status')).toContainText('WASM v1');
+  await page.locator('#map-mode').selectOption('satellite');
+  await page.locator('#map-latitude').fill('52.520008');
+  await page.locator('#map-latitude').press('Enter');
+  await expect(page.locator('#map-location')).toContainText('52.520008');
+  const box = await page.locator('#map').boundingBox();
+  // Select the forest, then use its top edge midpoint to insert a polygon point.
+  await page.mouse.click(box.x + box.width * .5, box.y + box.height * .25);
+  await expect(page.locator('#selection-title')).toHaveText('Mixed forest');
+  await page.mouse.move(box.x + box.width * .505, box.y + box.height * (150 / 620));
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width * .506, box.y + box.height * (151 / 620));
+  await page.mouse.up();
+  await expect(page.locator('#device-form')).toContainText('5 corners');
+  // The tracker inspector exposes removal without allowing its final waypoint to disappear.
+  await page.mouse.click(box.x + box.width * .12, box.y + box.height * .69);
+  await expect(page.locator('#selection-title')).toHaveText('Pasture tracker');
+  await page.locator('[data-remove-waypoint="1"]').click();
+  await expect(page.locator('[data-remove-waypoint]')).toHaveCount(3);
+});

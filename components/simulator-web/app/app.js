@@ -1,4 +1,5 @@
 import { createDefaultScenario, radioDefaults, repeaterDefaults, trackerDefaults } from './default-scenario.js';
+import { exactDistanceM, geoPosition, isPolygonObstacle, pointInObstacle, pointInPolygon, polygonCenter } from './geometry.js';
 
 const worker = new Worker(new URL('./simulator-worker.js', import.meta.url), { type: 'module' });
 const canvas = document.querySelector('#map');
@@ -15,15 +16,24 @@ let pendingSelection = null;
 let tool = 'select';
 let playing = false;
 let dragging = false;
+let editTarget = null;
 let knownEventId = 0;
 let visibleAfterEventId = 0;
 let backgroundImage = null;
+const satelliteTiles = new Map();
 const animations = [];
 const txOrigins = new Map();
 
 const $ = (selector) => document.querySelector(selector);
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const copy = (value) => JSON.parse(JSON.stringify(value));
+
+form.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-remove-waypoint]');
+  if (!button || !selectedId) return;
+  event.preventDefault();
+  post('remove-waypoint', { id: selectedId, index: Number(button.dataset.removeWaypoint) });
+});
 
 function notify(message) {
   toast.textContent = message;
@@ -40,7 +50,8 @@ worker.onmessage = ({ data }) => {
     consumeAnimations(snapshot.events);
     updateStatus();
     renderEvents();
-    if (!form.contains(document.activeElement)) renderInspector();
+    const active = document.activeElement;
+    if (!form.contains(active) || active?.tagName === 'BUTTON') renderInspector();
   } else if (data.type === 'ready') {
     $('#core-status').className = 'core-status ready';
     $('#core-status').innerHTML = `<span></span>Firmware core WASM v${data.core.version}`;
@@ -100,6 +111,9 @@ function updateStatus() {
   setValue('#wetness', e.foliageWetness); $('#mqtt-online').checked = snapshot.mqtt.online;
   setValue('#mqtt-latency', snapshot.mqtt.latencyMs);
   setValue('#archive-latency', snapshot.mqtt.archiveLatencyMs);
+  const map = snapshot.scenario.map;
+  setValue('#map-mode', map.mode); setValue('#map-latitude', map.centerLat); setValue('#map-longitude', map.centerLng); setValue('#map-zoom', map.zoom);
+  $('#map-location').textContent = `${map.mode === 'satellite' ? 'Satellite imagery: Esri World Imagery.' : 'Metre grid.'} Centre ${map.centerLat.toFixed(6)}, ${map.centerLng.toFixed(6)} · points use great-circle distances.`;
 }
 
 function setValue(selector, value) {
@@ -136,7 +150,25 @@ function hitTest(point) {
   for (const obstacle of [...snapshot.scenario.obstacles].reverse()) {
     if (obstacle.type === 'tree') {
       if (Math.hypot(obstacle.x - point.x, obstacle.y - point.y) <= obstacle.radius * 1.8) return obstacle.id;
-    } else if (point.x >= obstacle.x && point.x <= obstacle.x + obstacle.width && point.y >= obstacle.y && point.y <= obstacle.y + obstacle.height) return obstacle.id;
+    } else if (pointInObstacle(point, obstacle)) return obstacle.id;
+  }
+  return null;
+}
+
+function pointHit(point, target, radiusPx = 12) {
+  return Math.hypot(point.x - target.x, point.y - target.y) <= radiusPx * snapshot.scenario.world.widthM / canvas.clientWidth;
+}
+
+function polygonEdgeHit(point, points) {
+  const threshold = 12 * snapshot.scenario.world.widthM / canvas.clientWidth;
+  for (let index = 0; index < points.length; index += 1) {
+    const a = points[index]; const b = points[(index + 1) % points.length];
+    const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    if (pointHit(point, mid, 12)) return { index, point: mid };
+    const dx = b.x - a.x; const dy = b.y - a.y;
+    const lengthSq = dx * dx + dy * dy;
+    const t = lengthSq ? clamp(((point.x - a.x) * dx + (point.y - a.y) * dy) / lengthSq, 0, 1) : 0;
+    if (Math.hypot(point.x - (a.x + dx * t), point.y - (a.y + dy * t)) <= threshold) return { index, point: { x: a.x + dx * t, y: a.y + dy * t } };
   }
   return null;
 }
@@ -145,6 +177,23 @@ canvas.addEventListener('pointerdown', (event) => {
   if (!snapshot) return;
   const point = worldPoint(event);
   if (tool === 'select') {
+    const selectedDevice = snapshot.devices.find((item) => item.id === selectedId && item.role === 'tracker');
+    if (selectedDevice) {
+      const waypointIndex = selectedDevice.waypoints.findIndex((waypoint) => pointHit(point, waypoint));
+      if (waypointIndex >= 0) { dragging = true; editTarget = { kind: 'waypoint', id: selectedDevice.id, index: waypointIndex }; canvas.setPointerCapture(event.pointerId); return; }
+    }
+    const selectedObstacle = snapshot.scenario.obstacles.find((item) => item.id === selectedId && isPolygonObstacle(item));
+    if (selectedObstacle) {
+      const pointIndex = selectedObstacle.points.findIndex((corner) => pointHit(point, corner));
+      if (pointIndex >= 0) { dragging = true; editTarget = { kind: 'polygon', id: selectedObstacle.id, index: pointIndex }; canvas.setPointerCapture(event.pointerId); return; }
+      const edge = polygonEdgeHit(point, selectedObstacle.points);
+      if (edge) {
+        const points = copy(selectedObstacle.points); points.splice(edge.index + 1, 0, edge.point);
+        editTarget = { kind: 'polygon', id: selectedObstacle.id, index: edge.index + 1 };
+        dragging = true; canvas.setPointerCapture(event.pointerId);
+        post('update-entity', { id: selectedObstacle.id, changes: { points } }); return;
+      }
+    }
     selectedId = hitTest(point);
     dragging = Boolean(selectedId && snapshot.devices.some((item) => item.id === selectedId));
     canvas.setPointerCapture(event.pointerId);
@@ -161,6 +210,16 @@ canvas.addEventListener('pointerdown', (event) => {
 canvas.addEventListener('pointermove', (event) => {
   if (!dragging || !selectedId || !snapshot) return;
   const point = worldPoint(event);
+  if (editTarget) {
+    if (editTarget.kind === 'waypoint') {
+      const device = snapshot.devices.find((item) => item.id === editTarget.id);
+      if (device) device.waypoints[editTarget.index] = point;
+    } else {
+      const obstacle = snapshot.scenario.obstacles.find((item) => item.id === editTarget.id);
+      if (obstacle) obstacle.points[editTarget.index] = point;
+    }
+    return;
+  }
   const device = snapshot.devices.find((item) => item.id === selectedId);
   if (!device) return;
   device.x = point.x; device.y = point.y;
@@ -168,9 +227,13 @@ canvas.addEventListener('pointermove', (event) => {
 canvas.addEventListener('pointerup', (event) => {
   if (dragging && selectedId) {
     const point = worldPoint(event);
-    post('update-entity', { id: selectedId, changes: point });
+    if (editTarget?.kind === 'waypoint') post('update-waypoint', { id: editTarget.id, index: editTarget.index, point });
+    else if (editTarget?.kind === 'polygon') {
+      const obstacle = snapshot.scenario.obstacles.find((item) => item.id === editTarget.id);
+      post('update-entity', { id: editTarget.id, changes: { points: obstacle.points } });
+    } else post('update-entity', { id: selectedId, changes: point });
   }
-  dragging = false;
+  dragging = false; editTarget = null;
 });
 
 function nextId(prefix) {
@@ -195,11 +258,10 @@ function addAt(kind, point) {
   } else {
     const id = nextId(kind.replace('building-', 'building'));
     if (kind === 'tree') entity = { id, type: kind, ...point, radius: 9, label: 'Tree' };
-    else entity = { id, type: kind, x: point.x - 45, y: point.y - 30,
-      width: kind === 'forest' ? 180 : kind === 'building-large' ? 120 : 70,
-      height: kind === 'forest' ? 130 : kind === 'building-large' ? 90 : 55,
+    else { const halfWidth = kind === 'forest' ? 90 : kind === 'building-large' ? 60 : 35; const halfHeight = kind === 'forest' ? 65 : kind === 'building-large' ? 45 : 27.5; entity = { id, type: kind,
+      points: [{ x: point.x - halfWidth, y: point.y - halfHeight }, { x: point.x + halfWidth, y: point.y - halfHeight }, { x: point.x + halfWidth, y: point.y + halfHeight }, { x: point.x - halfWidth, y: point.y + halfHeight }],
       density: kind === 'forest' ? .7 : undefined,
-      label: kind === 'forest' ? 'Forest' : kind === 'building-large' ? 'Large building' : 'Small building' };
+      label: kind === 'forest' ? 'Forest' : kind === 'building-large' ? 'Large building' : 'Small building' }; }
   }
   pendingSelection = entity.id;
   post('add-entity', { entity });
@@ -225,6 +287,15 @@ for (const [selector, path] of [['#day-temp', 'dayTemperatureC'], ['#night-temp'
 $('#mqtt-online').addEventListener('change', (event) => post('environment', { patch: { mqtt: { online: event.target.checked } } }));
 $('#mqtt-latency').addEventListener('change', (event) => post('environment', { patch: { mqtt: { latencyMs: Number(event.target.value) } } }));
 $('#archive-latency').addEventListener('change', (event) => post('environment', { patch: { mqtt: { archiveLatencyMs: Number(event.target.value) } } }));
+for (const [selector, key] of [['#map-mode', 'mode'], ['#map-latitude', 'centerLat'], ['#map-longitude', 'centerLng'], ['#map-zoom', 'zoom']]) {
+  $(selector).addEventListener('change', (event) => post('environment', { patch: { map: { [key]: key === 'mode' ? event.target.value : Number(event.target.value) } } }));
+}
+$('#locate').addEventListener('click', () => {
+  if (!navigator.geolocation) return notify('This browser does not provide location access');
+  navigator.geolocation.getCurrentPosition((position) => {
+    post('environment', { patch: { map: { centerLat: position.coords.latitude, centerLng: position.coords.longitude, mode: 'satellite' } } });
+  }, (error) => notify(`Location unavailable: ${error.message}`), { enableHighAccuracy: true, timeout: 15000, maximumAge: 300000 });
+});
 
 $('#export').addEventListener('click', () => {
   if (!snapshot) return;
@@ -266,6 +337,13 @@ function renderInspector() {
   $('#selection-status').textContent = entity?.role ?? entity?.type ?? '';
   if (!entity) { form.innerHTML = ''; $('#link-detail').hidden = true; return; }
   if (entity.role) renderDeviceForm(entity); else renderObstacleForm(entity);
+  const locationPoint = entity.role || entity.type === 'tree' ? entity : polygonCenter(entity.points);
+  const location = geoPosition(snapshot.scenario, locationPoint);
+  if (location) form.insertAdjacentHTML('beforeend', `<div class="wide point-location">Map point ${location.latitude.toFixed(6)}, ${location.longitude.toFixed(6)} · ${exactDistanceM(snapshot.scenario, locationPoint, { x: snapshot.scenario.world.widthM / 2, y: snapshot.scenario.world.heightM / 2 }).toFixed(1)} m from map centre</div><button class="remove-entity wide" type="button" id="remove-entity">Remove ${escapeHtml(entity.name ?? entity.label ?? entity.id)}</button>`);
+  $('#remove-entity')?.addEventListener('click', () => {
+    if (entity.role === 'receiver' && snapshot.devices.filter((item) => item.role === 'receiver').length <= 1) return notify('A scenario needs at least one receiver');
+    selectedId = null; post('remove-entity', { id: entity.id });
+  });
   const latestLink = [...snapshot.events].reverse().find((event) => event.deviceId === entity.id && event.link);
   if (latestLink) {
     const link = latestLink.link;
@@ -295,6 +373,8 @@ function renderDeviceForm(device) {
       field('Maximum HDOP', 'config.maxHdop', c.maxHdop, { step: '.1' }) + '<h3>Battery model</h3>' +
       field('Capacity (mAh)', 'config.batteryCapacityMah', c.batteryCapacityMah) + field('Sleep current (mA)', 'config.sleepCurrentMa', c.sleepCurrentMa, { step: '.1' }) +
       field('GNSS current (mA)', 'config.gnssCurrentMa', c.gnssCurrentMa, { step: '.1' }) + field('TX current (mA)', 'config.txCurrentMa', c.txCurrentMa, { step: '.1' });
+    const routeDistance = device.waypoints.reduce((total, waypoint, index) => index ? total + exactDistanceM(snapshot.scenario, device.waypoints[index - 1], waypoint) : total, 0) + (device.pathMode === 'loop' && device.waypoints.length > 1 ? exactDistanceM(snapshot.scenario, device.waypoints.at(-1), device.waypoints[0]) : 0);
+    html += `<h3>Waypoints · ${routeDistance.toFixed(1)} m route</h3><div class="waypoint-list wide">${device.waypoints.map((point, index) => `<span>${index + 1}. ${point.x.toFixed(1)}, ${point.y.toFixed(1)} <button type="button" data-remove-waypoint="${index}" ${device.waypoints.length <= 1 ? 'disabled' : ''}>Remove</button></span>`).join('')}</div>`;
     $('#selection-status').textContent = `${device.batteryPct.toFixed(1)}% · queue ${device.runtime.queue.length}`;
   } else if (device.role === 'repeater') {
     const c = device.config;
@@ -310,9 +390,12 @@ function renderDeviceForm(device) {
 }
 
 function renderObstacleForm(obstacle) {
-  let html = field('Label', 'label', obstacle.label, { type: 'text', wide: true }) + field('X (m)', 'x', obstacle.x, { step: '.1' }) + field('Y (m)', 'y', obstacle.y, { step: '.1' });
+  let html = field('Label', 'label', obstacle.label, { type: 'text', wide: true });
   if (obstacle.type === 'tree') html += field('Canopy radius (m)', 'radius', obstacle.radius, { step: '.1' });
-  else html += field('Width (m)', 'width', obstacle.width, { step: '.1' }) + field('Height (m)', 'height', obstacle.height, { step: '.1' });
+  else {
+    const center = polygonCenter(obstacle.points);
+    html += `<div class="wide hint">${obstacle.points.length} corners · centre ${center.x.toFixed(1)}, ${center.y.toFixed(1)} m. Drag corners on the map; click an edge to insert a corner.</div>`;
+  }
   if (obstacle.type === 'forest') html += field('Density 0–1', 'density', obstacle.density, { step: '.05' });
   form.innerHTML = html;
   bindForm(obstacle);
@@ -345,6 +428,43 @@ function resizeCanvas() {
 }
 new ResizeObserver(resizeCanvas).observe(mapWrap);
 
+function mercatorPixel(latitude, longitude, zoom) {
+  const scale = 256 * 2 ** zoom;
+  const sin = Math.sin(clamp(latitude, -85.05112878, 85.05112878) * Math.PI / 180);
+  return { x: (longitude + 180) / 360 * scale, y: (0.5 - Math.log((1 + sin) / (1 - sin)) / (4 * Math.PI)) * scale };
+}
+
+function satelliteTile(xTile, yTile, zoom) {
+  const max = 2 ** zoom;
+  if (yTile < 0 || yTile >= max) return null;
+  const x = ((xTile % max) + max) % max;
+  const key = `${zoom}/${x}/${yTile}`;
+  if (!satelliteTiles.has(key)) {
+    const image = new Image();
+    image.crossOrigin = 'anonymous';
+    image.src = `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${zoom}/${yTile}/${x}`;
+    satelliteTiles.set(key, image);
+  }
+  return satelliteTiles.get(key);
+}
+
+function drawSatelliteBackground(width, height, sx) {
+  const map = snapshot.scenario.map;
+  if (map.mode !== 'satellite') return false;
+  const centre = mercatorPixel(map.centerLat, map.centerLng, map.zoom);
+  const metersPerPixel = 156543.03392 * Math.cos(map.centerLat * Math.PI / 180) / 2 ** map.zoom;
+  const scale = sx * metersPerPixel;
+  const tileX = Math.floor(centre.x / 256); const tileY = Math.floor(centre.y / 256);
+  const radiusX = Math.ceil(width / (256 * scale) / 2) + 1;
+  const radiusY = Math.ceil(height / (256 * scale) / 2) + 1;
+  context.fillStyle = '#12251d'; context.fillRect(0, 0, width, height);
+  for (let ty = tileY - radiusY; ty <= tileY + radiusY; ty += 1) for (let tx = tileX - radiusX; tx <= tileX + radiusX; tx += 1) {
+    const image = satelliteTile(tx, ty, map.zoom);
+    if (image?.complete && image.naturalWidth) context.drawImage(image, width / 2 + (tx * 256 - centre.x) * scale, height / 2 + (ty * 256 - centre.y) * scale, 256 * scale, 256 * scale);
+  }
+  return true;
+}
+
 function draw() {
   requestAnimationFrame(draw);
   if (!snapshot) return;
@@ -353,9 +473,10 @@ function draw() {
   const sx = width / world.widthM; const sy = height / world.heightM;
   const x = (value) => value * sx; const y = (value) => value * sy;
   context.clearRect(0, 0, width, height);
-  context.fillStyle = '#0c1b16'; context.fillRect(0, 0, width, height);
+  const satellite = drawSatelliteBackground(width, height, sx);
+  if (!satellite) { context.fillStyle = '#0c1b16'; context.fillRect(0, 0, width, height); }
   if (backgroundImage) { context.globalAlpha = .28; context.drawImage(backgroundImage, 0, 0, width, height); context.globalAlpha = 1; }
-  context.strokeStyle = 'rgba(116,153,139,.12)'; context.lineWidth = 1;
+  context.strokeStyle = satellite ? 'rgba(237,246,242,.16)' : 'rgba(116,153,139,.12)'; context.lineWidth = 1;
   for (let gx = 0; gx <= world.widthM; gx += world.gridM) { context.beginPath(); context.moveTo(x(gx), 0); context.lineTo(x(gx), height); context.stroke(); }
   for (let gy = 0; gy <= world.heightM; gy += world.gridM) { context.beginPath(); context.moveTo(0, y(gy)); context.lineTo(width, y(gy)); context.stroke(); }
 
@@ -380,15 +501,18 @@ function drawObstacle(obstacle, x, y, sx, sy) {
     return;
   }
   const colors = { forest: 'rgba(38,103,67,.58)', 'building-small': '#735f4b', 'building-large': '#80654d' };
-  context.fillStyle = colors[obstacle.type]; context.fillRect(x(obstacle.x), y(obstacle.y), obstacle.width * sx, obstacle.height * sy);
+  const points = obstacle.points;
+  context.fillStyle = colors[obstacle.type]; context.beginPath(); points.forEach((point, index) => index ? context.lineTo(x(point.x), y(point.y)) : context.moveTo(x(point.x), y(point.y))); context.closePath(); context.fill();
   context.strokeStyle = selected ? '#edf6f2' : obstacle.type === 'forest' ? 'rgba(92,224,160,.45)' : '#b59778'; context.lineWidth = selected ? 2 : 1;
-  context.strokeRect(x(obstacle.x), y(obstacle.y), obstacle.width * sx, obstacle.height * sy);
+  context.stroke();
   if (obstacle.type === 'forest') {
     context.fillStyle = 'rgba(92,224,160,.22)';
     const count = Math.round(12 + obstacle.density * 20);
-    for (let i = 0; i < count; i += 1) { const px = x(obstacle.x) + ((i * 47) % 97) / 97 * obstacle.width * sx; const py = y(obstacle.y) + ((i * 31) % 89) / 89 * obstacle.height * sy; context.beginPath(); context.arc(px, py, 2, 0, Math.PI * 2); context.fill(); }
+    const minX = Math.min(...points.map((point) => point.x)); const maxX = Math.max(...points.map((point) => point.x)); const minY = Math.min(...points.map((point) => point.y)); const maxY = Math.max(...points.map((point) => point.y));
+    for (let i = 0; i < count; i += 1) { const candidate = { x: minX + ((i * 47) % 97) / 97 * (maxX - minX), y: minY + ((i * 31) % 89) / 89 * (maxY - minY) }; if (pointInPolygon(candidate, points)) { context.beginPath(); context.arc(x(candidate.x), y(candidate.y), 2, 0, Math.PI * 2); context.fill(); } }
   }
-  context.fillStyle = 'rgba(237,246,242,.72)'; context.font = '11px system-ui'; context.fillText(obstacle.label, x(obstacle.x) + 6, y(obstacle.y) + 15);
+  if (selected) for (let index = 0; index < points.length; index += 1) { const point = points[index]; const next = points[(index + 1) % points.length]; context.fillStyle = '#edf6f2'; context.fillRect(x(point.x) - 4, y(point.y) - 4, 8, 8); context.fillStyle = '#5ce0a0'; context.beginPath(); context.arc(x((point.x + next.x) / 2), y((point.y + next.y) / 2), 3.5, 0, Math.PI * 2); context.fill(); }
+  const center = polygonCenter(points); context.fillStyle = 'rgba(237,246,242,.82)'; context.font = '11px system-ui'; context.fillText(obstacle.label, x(center.x) + 6, y(center.y) + 4);
 }
 
 function drawDevice(device, x, y) {

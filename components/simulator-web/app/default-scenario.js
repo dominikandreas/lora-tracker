@@ -1,4 +1,4 @@
-export const SCENARIO_VERSION = 1;
+export const SCENARIO_VERSION = 2;
 
 export const radioDefaults = () => ({
   frequencyHz: 868_100_000,
@@ -53,6 +53,7 @@ export function createDefaultScenario() {
     name: 'Forest edge relay',
     seed: 0x51a7c0de,
     world: { widthM: 1000, heightM: 620, gridM: 50 },
+    map: { mode: 'grid', centerLat: 51.1657, centerLng: 10.4515, zoom: 17 },
     clock: { startHour: 7, speed: 60 },
     environment: {
       dayTemperatureC: 24, nightTemperatureC: 10,
@@ -75,9 +76,9 @@ export function createDefaultScenario() {
       }),
     ],
     obstacles: [
-      { id: 'forest-1', type: 'forest', x: 330, y: 150, width: 350, height: 250, density: 0.75, label: 'Mixed forest' },
-      { id: 'building-1', type: 'building-large', x: 730, y: 235, width: 120, height: 90, label: 'Barn' },
-      { id: 'building-2', type: 'building-small', x: 90, y: 90, width: 70, height: 55, label: 'Shed' },
+      { id: 'forest-1', type: 'forest', points: [{ x: 330, y: 150 }, { x: 680, y: 150 }, { x: 660, y: 400 }, { x: 350, y: 380 }], density: 0.75, label: 'Mixed forest' },
+      { id: 'building-1', type: 'building-large', points: [{ x: 730, y: 235 }, { x: 850, y: 235 }, { x: 850, y: 325 }, { x: 730, y: 325 }], label: 'Barn' },
+      { id: 'building-2', type: 'building-small', points: [{ x: 90, y: 90 }, { x: 160, y: 90 }, { x: 160, y: 145 }, { x: 90, y: 145 }], label: 'Shed' },
       { id: 'tree-1', type: 'tree', x: 710, y: 180, radius: 9, label: 'Oak' },
       { id: 'tree-2', type: 'tree', x: 705, y: 205, radius: 8, label: 'Oak' },
     ],

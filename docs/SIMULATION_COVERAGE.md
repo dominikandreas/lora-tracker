@@ -21,11 +21,21 @@ Then open `http://localhost:8080`. The published copy is available from the
 GitHub Pages **Run Network Lab** link. It needs no account, map service, broker
 or network API after the static files have loaded.
 
-The map uses metres rather than a geographic tile provider. Add and drag
-trackers, repeaters and receivers; draw waypoint routes; place forests, trees
+The map defaults to metres, but can be georeferenced with a user-entered
+latitude/longitude or browser location permission. Optional satellite imagery
+uses Esri World Imagery only when selected. Add, drag and remove trackers,
+repeaters and receivers; drag or remove waypoint routes; place forests, trees
 and small or large buildings; configure every modeled device parameter; change
 day/night temperature, humidity and foliage wetness; pause, single-step or
 accelerate time; and import/export versioned scenario JSON.
+
+Forests and buildings are editable polygons. Select an area to drag a corner,
+or click an edge midpoint to insert another point. The lab derives geographic
+coordinates from the selected map centre and uses great-circle distances for
+displayed route lengths and RF link distance. Satellite imagery is a visual
+reference only: terrain, elevation and imagery-derived objects are not
+automatically modeled. Scenario schema 2 intentionally requires polygon
+obstacles; old rectangular exports are rejected rather than silently changed.
 
 ## Browser model
 

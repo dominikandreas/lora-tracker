@@ -68,6 +68,12 @@ h1, h2 { margin: 0; font-size: 1rem; } h1 { font-size: 1.15rem; }
 .form-grid .wide, #device-form .wide { grid-column: 1 / -1; }
 .switch { display: flex !important; align-items: center; gap: .45rem !important; align-self: end; min-height: 36px; }.switch input { accent-color: var(--green); }
 .hint { margin: .7rem 0 0; color: var(--muted); font-size: .69rem; line-height: 1.45; }
+.map-settings { margin-top: .65rem; }
+.waypoint-list { display: grid; gap: .35rem; font-size: .72rem; color: var(--muted); }
+.waypoint-list span { display: flex; align-items: center; justify-content: space-between; gap: .45rem; }
+.waypoint-list button, .remove-entity { padding: .28rem .45rem; font-size: .7rem; }
+.point-location { color: var(--muted); font-size: .72rem; line-height: 1.45; border-top: 1px solid var(--line); padding-top: .65rem; }
+.remove-entity { color: var(--red); border-color: color-mix(in srgb, var(--red) 55%, var(--line)); }
 .empty-state { border: 1px dashed var(--line); border-radius: var(--radius); padding: 1rem; color: var(--muted); font-size: .8rem; line-height: 1.5; }
 #device-form { display: grid; grid-template-columns: 1fr 1fr; gap: .65rem; }
 #device-form h3 { grid-column: 1/-1; margin: .5rem 0 -.15rem; font-size: .75rem; color: var(--green); text-transform: uppercase; letter-spacing: .06em; }
