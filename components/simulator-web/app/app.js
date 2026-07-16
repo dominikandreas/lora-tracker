@@ -14,6 +14,8 @@ const toast = document.querySelector('#toast');
 let snapshot;
 let initialScenario = loadStoredScenario() ?? createDefaultScenario();
 let selectedId = null;
+let selectedWaypoint = null;
+let pendingWaypointFocus = null;
 let pendingSelection = null;
 let tool = 'select';
 let playing = false;
@@ -211,6 +213,34 @@ function pointHit(point, target, radiusPx = 12) {
   return Math.hypot(point.x - target.x, point.y - target.y) <= radiusPx / (canvas.clientWidth / snapshot.scenario.world.widthM * view.zoom);
 }
 
+function waypointHit(point) {
+  for (const device of [...snapshot.devices].reverse()) {
+    if (device.role !== 'tracker') continue;
+    const index = device.waypoints.findIndex((waypoint) => pointHit(point, waypoint, 15));
+    if (index >= 0) return { id: device.id, index };
+  }
+  return null;
+}
+
+function removeSelectedEntity() {
+  const entity = snapshot?.devices.find((item) => item.id === selectedId) ?? snapshot?.scenario.obstacles.find((item) => item.id === selectedId);
+  if (!entity) return;
+  if (entity.role === 'receiver' && snapshot.devices.filter((item) => item.role === 'receiver').length <= 1) return notify('A scenario needs at least one receiver');
+  selectedId = null;
+  selectedWaypoint = null;
+  post('remove-entity', { id: entity.id });
+}
+
+function removeSelectedWaypoint() {
+  if (!selectedWaypoint) return false;
+  const device = snapshot?.devices.find((item) => item.id === selectedWaypoint.id && item.role === 'tracker');
+  if (!device || device.waypoints.length <= 1) return notify('A tracker needs at least one waypoint'), true;
+  const { id, index } = selectedWaypoint;
+  selectedWaypoint = null;
+  post('remove-waypoint', { id, index });
+  return true;
+}
+
 function polygonEdgeHit(point, points) {
   const threshold = 12 / (canvas.clientWidth / snapshot.scenario.world.widthM * view.zoom);
   for (let index = 0; index < points.length; index += 1) {
@@ -232,10 +262,16 @@ canvas.addEventListener('pointerdown', (event) => {
   }
   const point = worldPoint(event);
   if (tool === 'select') {
-    const selectedDevice = snapshot.devices.find((item) => item.id === selectedId && item.role === 'tracker');
-    if (selectedDevice) {
-      const waypointIndex = selectedDevice.waypoints.findIndex((waypoint) => pointHit(point, waypoint));
-      if (waypointIndex >= 0) { dragging = true; editTarget = { kind: 'waypoint', id: selectedDevice.id, index: waypointIndex }; canvas.setPointerCapture(event.pointerId); return; }
+    const waypoint = waypointHit(point);
+    if (waypoint) {
+      selectedId = waypoint.id;
+      selectedWaypoint = waypoint;
+      pendingWaypointFocus = waypoint;
+      dragging = true;
+      editTarget = { kind: 'waypoint', ...waypoint };
+      canvas.setPointerCapture(event.pointerId);
+      renderInspector();
+      return;
     }
     const selectedObstacle = snapshot.scenario.obstacles.find((item) => item.id === selectedId && isPolygonObstacle(item));
     if (selectedObstacle) {
@@ -250,6 +286,7 @@ canvas.addEventListener('pointerdown', (event) => {
       }
     }
     selectedId = hitTest(point);
+    selectedWaypoint = null;
     dragging = Boolean(selectedId && snapshot.devices.some((item) => item.id === selectedId));
     canvas.setPointerCapture(event.pointerId);
     renderInspector();
@@ -282,19 +319,34 @@ canvas.addEventListener('pointermove', (event) => {
   if (!device) return;
   device.x = point.x; device.y = point.y;
 });
-canvas.addEventListener('pointerup', (event) => {
+function finishPointerEdit(event) {
   if (panning) { panning = false; panOrigin = null; persistView(); return; }
   if (dragging && selectedId) {
     const point = worldPoint(event);
-    if (editTarget?.kind === 'waypoint') post('update-waypoint', { id: editTarget.id, index: editTarget.index, point });
+    if (editTarget?.kind === 'waypoint') {
+      selectedWaypoint = { id: editTarget.id, index: editTarget.index };
+      pendingWaypointFocus = selectedWaypoint;
+      post('update-waypoint', { id: editTarget.id, index: editTarget.index, point });
+      renderInspector();
+    }
     else if (editTarget?.kind === 'polygon') {
       const obstacle = snapshot.scenario.obstacles.find((item) => item.id === editTarget.id);
       post('update-entity', { id: editTarget.id, changes: { points: obstacle.points } });
     } else post('update-entity', { id: selectedId, changes: point });
   }
   dragging = false; editTarget = null;
-});
+}
+window.addEventListener('pointerup', finishPointerEdit);
 canvas.addEventListener('contextmenu', (event) => event.preventDefault());
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Delete' && event.key !== 'Backspace') return;
+  const active = document.activeElement;
+  if (active instanceof HTMLElement && (active.matches('input, textarea, select') || active.isContentEditable)) return;
+  if (removeSelectedWaypoint()) { event.preventDefault(); return; }
+  if (!selectedId) return;
+  event.preventDefault();
+  removeSelectedEntity();
+});
 function zoomMap(factor, clientX, clientY) {
   if (!snapshot) return;
   const rect = canvas.getBoundingClientRect();
@@ -356,7 +408,7 @@ function setTool(value) {
 $('#play').addEventListener('click', () => post(playing ? 'pause' : 'play'));
 $('#step').addEventListener('click', () => post('step', { seconds: 60 }));
 $('#speed').addEventListener('change', (event) => post('speed', { speed: Number(event.target.value) }));
-$('#reset').addEventListener('click', () => { knownEventId = 0; selectedId = null; post('reset', { scenario: initialScenario }); });
+$('#reset').addEventListener('click', () => { knownEventId = 0; selectedId = null; selectedWaypoint = null; post('reset', { scenario: initialScenario }); });
 $('#clear-log').addEventListener('click', () => { visibleAfterEventId = knownEventId; renderEvents(); });
 $('#reset-view').addEventListener('click', () => { view = { zoom: 1, panX: 0, panY: 0 }; persistView(); });
 for (const [selector, factor] of [['#zoom-in', 1.25], ['#zoom-out', .8]]) $(selector).addEventListener('click', () => {
@@ -394,7 +446,7 @@ $('#import').addEventListener('change', async (event) => {
   const file = event.target.files[0]; if (!file) return;
   try {
     const scenario = JSON.parse(await file.text());
-    initialScenario = copy(scenario); selectedId = null; knownEventId = 0;
+    initialScenario = copy(scenario); selectedId = null; selectedWaypoint = null; knownEventId = 0;
     post('replace-scenario', { scenario });
   } catch (error) { notify(`Invalid scenario: ${error.message}`); }
   event.target.value = '';
@@ -428,8 +480,7 @@ function renderInspector() {
   const location = geoPosition(snapshot.scenario, locationPoint);
   if (location) form.insertAdjacentHTML('beforeend', `<div class="wide point-location">Map point ${location.latitude.toFixed(6)}, ${location.longitude.toFixed(6)} · ${exactDistanceM(snapshot.scenario, locationPoint, { x: snapshot.scenario.map.anchorX, y: snapshot.scenario.map.anchorY }).toFixed(1)} m from map centre</div><button class="remove-entity wide" type="button" id="remove-entity">Remove ${escapeHtml(entity.name ?? entity.label ?? entity.id)}</button>`);
   $('#remove-entity')?.addEventListener('click', () => {
-    if (entity.role === 'receiver' && snapshot.devices.filter((item) => item.role === 'receiver').length <= 1) return notify('A scenario needs at least one receiver');
-    selectedId = null; post('remove-entity', { id: entity.id });
+    removeSelectedEntity();
   });
   const latestLink = [...snapshot.events].reverse().find((event) => event.deviceId === entity.id && event.link);
   if (latestLink) {
@@ -437,6 +488,16 @@ function renderInspector() {
     $('#link-detail').hidden = false;
     $('#link-detail').innerHTML = `<strong>Latest link budget</strong><br>${link.rangeM.toFixed(0)} m · ${link.rxPowerDbm.toFixed(1)} dBm received · ${link.marginDb.toFixed(1)} dB margin<br>Free space ${link.freeSpaceLoss.toFixed(1)} dB · ground ${link.excessGroundLoss.toFixed(1)} dB · height ${link.heightBenefitDb.toFixed(1)} dB benefit · forest ${link.forestLoss.toFixed(1)} dB · buildings ${link.buildingLoss.toFixed(1)} dB · trees ${link.treeLoss.toFixed(1)} dB · site calibration ${link.siteLossDb.toFixed(1)} dB · seeded fading ${link.fadingDb.toFixed(1)} dB · atmosphere ${link.atmosphereLoss.toFixed(4)} dB`;
   } else $('#link-detail').hidden = true;
+  if (pendingWaypointFocus?.id === entity.id) {
+    const row = form.querySelector(`[data-waypoint-index="${pendingWaypointFocus.index}"]`);
+    pendingWaypointFocus = null;
+    if (row) requestAnimationFrame(() => {
+      const inspector = row.closest('.inspector');
+      if (!inspector) return;
+      const rowRect = row.getBoundingClientRect(); const inspectorRect = inspector.getBoundingClientRect();
+      inspector.scrollTo({ top: inspector.scrollTop + rowRect.top - inspectorRect.top - inspector.clientHeight / 2 + rowRect.height / 2, behavior: 'smooth' });
+    });
+  }
 }
 
 function renderLocalState(device) {
@@ -481,7 +542,7 @@ function renderDeviceForm(device) {
       field('Capacity (mAh)', 'config.batteryCapacityMah', c.batteryCapacityMah) + field('Sleep current (mA)', 'config.sleepCurrentMa', c.sleepCurrentMa, { step: '.1' }) +
       field('GNSS current (mA)', 'config.gnssCurrentMa', c.gnssCurrentMa, { step: '.1' }) + field('TX current (mA)', 'config.txCurrentMa', c.txCurrentMa, { step: '.1' });
     const routeDistance = device.waypoints.reduce((total, waypoint, index) => index ? total + exactDistanceM(snapshot.scenario, device.waypoints[index - 1], waypoint) : total, 0) + (device.pathMode === 'loop' && device.waypoints.length > 1 ? exactDistanceM(snapshot.scenario, device.waypoints.at(-1), device.waypoints[0]) : 0);
-    html += `<h3>Waypoints · ${routeDistance.toFixed(1)} m route</h3><div class="waypoint-list wide">${device.waypoints.map((point, index) => `<span>${index + 1}. ${point.x.toFixed(1)}, ${point.y.toFixed(1)} <button type="button" data-remove-waypoint="${index}" aria-label="Remove waypoint ${index + 1}" ${device.waypoints.length <= 1 ? 'disabled' : ''}>Remove waypoint</button></span>`).join('')}</div>`;
+    html += `<h3>Waypoints · ${routeDistance.toFixed(1)} m route</h3><div class="hint wide">Click a numbered map marker to select it, then drag it to edit. Press Delete to remove the selected marker.</div><div class="waypoint-list wide">${device.waypoints.map((point, index) => `<span data-waypoint-index="${index}" class="${selectedWaypoint?.id === device.id && selectedWaypoint.index === index ? 'selected' : ''}"><button type="button" class="waypoint-jump" data-select-waypoint="${index}">${index + 1}. ${point.x.toFixed(1)}, ${point.y.toFixed(1)}</button><button type="button" data-remove-waypoint="${index}" aria-label="Remove waypoint ${index + 1}" ${device.waypoints.length <= 1 ? 'disabled' : ''}>Remove waypoint</button></span>`).join('')}</div>`;
     $('#selection-status').textContent = `${device.batteryPct.toFixed(1)}% · queue ${device.runtime.queue.length}`;
   } else if (device.role === 'repeater') {
     const c = device.config;
@@ -496,7 +557,14 @@ function renderDeviceForm(device) {
   bindForm(device);
   form.querySelectorAll('[data-remove-waypoint]').forEach((button) => button.addEventListener('click', (event) => {
     event.preventDefault(); event.stopPropagation();
+    selectedWaypoint = null;
     post('remove-waypoint', { id: device.id, index: Number(button.dataset.removeWaypoint) });
+  }));
+  form.querySelectorAll('[data-select-waypoint]').forEach((button) => button.addEventListener('click', () => {
+    const index = Number(button.dataset.selectWaypoint);
+    selectedWaypoint = { id: device.id, index };
+    pendingWaypointFocus = { id: device.id, index };
+    renderInspector();
   }));
 }
 
@@ -598,10 +666,16 @@ function draw() {
   drawHistoryOverlays(x, y);
   drawOutOfRangeLinks(x, y);
   for (const device of snapshot.devices.filter((item) => item.role === 'tracker')) {
-    context.strokeStyle = 'rgba(92,224,160,.35)'; context.lineWidth = 1.5; context.setLineDash([5, 5]); context.beginPath();
+    context.save(); context.strokeStyle = 'rgba(92,224,160,.92)'; context.lineWidth = 3; context.setLineDash([10, 6]); context.shadowColor = 'rgba(8,19,14,.9)'; context.shadowBlur = 3; context.beginPath();
     device.waypoints.forEach((point, index) => index ? context.lineTo(x(point.x), y(point.y)) : context.moveTo(x(point.x), y(point.y)));
-    if (device.pathMode === 'loop' && device.waypoints.length > 1) context.closePath(); context.stroke(); context.setLineDash([]);
-    for (const point of device.waypoints) { context.fillStyle = '#5ce0a0'; context.beginPath(); context.arc(x(point.x), y(point.y), 2.5, 0, Math.PI * 2); context.fill(); }
+    if (device.pathMode === 'loop' && device.waypoints.length > 1) context.closePath(); context.stroke(); context.setLineDash([]); context.shadowBlur = 0;
+    device.waypoints.forEach((point, index) => {
+      const selectedWaypointMarker = selectedWaypoint?.id === device.id && selectedWaypoint.index === index;
+      context.fillStyle = selectedWaypointMarker ? '#ffd36f' : '#5ce0a0'; context.strokeStyle = selectedWaypointMarker ? '#fff4c9' : '#0a1712'; context.lineWidth = selectedWaypointMarker ? 4 : 2;
+      context.beginPath(); context.arc(x(point.x), y(point.y), selectedWaypointMarker ? 10 : 8, 0, Math.PI * 2); context.fill(); context.stroke();
+      context.fillStyle = '#07110d'; context.font = 'bold 10px system-ui'; context.textAlign = 'center'; context.textBaseline = 'middle'; context.fillText(String(index + 1), x(point.x), y(point.y) + .5);
+    });
+    context.restore();
   }
   drawAnimations(x, y, sx, sy);
   for (const device of snapshot.devices) drawDevice(device, x, y);

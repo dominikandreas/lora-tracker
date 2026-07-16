@@ -70,7 +70,10 @@ h1, h2 { margin: 0; font-size: 1rem; } h1 { font-size: 1.15rem; }
 .hint { margin: .7rem 0 0; color: var(--muted); font-size: .69rem; line-height: 1.45; }
 .map-settings { margin-top: .65rem; }
 .waypoint-list { display: grid; gap: .35rem; font-size: .72rem; color: var(--muted); }
-.waypoint-list span { display: flex; align-items: center; justify-content: space-between; gap: .45rem; }
+.waypoint-list span { display: flex; align-items: center; justify-content: space-between; gap: .45rem; padding: .2rem; border: 1px solid transparent; border-radius: 6px; }
+.waypoint-list span.selected { background: rgba(255,211,111,.14); border-color: rgba(255,211,111,.8); color: var(--text); }
+.waypoint-jump { flex: 1; text-align: left; color: inherit; background: transparent; border-color: transparent; padding: .28rem .2rem; }
+.waypoint-jump:hover, .waypoint-jump:focus-visible { border-color: var(--green); background: rgba(92,224,160,.1); }
 .waypoint-list button, .remove-entity { padding: .28rem .45rem; font-size: .7rem; }
 .point-location { color: var(--muted); font-size: .72rem; line-height: 1.45; border-top: 1px solid var(--line); padding-top: .65rem; }
 .remove-entity { color: var(--red); border-color: color-mix(in srgb, var(--red) 55%, var(--line)); }

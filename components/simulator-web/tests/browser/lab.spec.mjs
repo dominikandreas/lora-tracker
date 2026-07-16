@@ -72,6 +72,23 @@ test('edits polygons, removes waypoints and accepts a manual satellite location'
   await expect(page.locator('[data-remove-waypoint]')).toHaveCount(3);
 });
 
+test('selects a numbered waypoint and entities on the map and deletes them with Delete', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('#core-status')).toContainText('WASM v1');
+  const box = await page.locator('#map').boundingBox();
+  // The initial tracker starts at waypoint 1 (120 m, 430 m).
+  await page.mouse.click(box.x + box.width * .12, box.y + box.height * (430 / 620));
+  await expect(page.locator('.waypoint-list span.selected')).toContainText('1. 120.0, 430.0');
+  await page.keyboard.press('Delete');
+  await expect(page.locator('[data-remove-waypoint]')).toHaveCount(3);
+  await expect(page.locator('.waypoint-list span.selected')).toHaveCount(0);
+  await page.getByRole('button', { name: '+ Tree' }).click();
+  await page.mouse.click(box.x + box.width * .82, box.y + box.height * .78);
+  await expect(page.locator('#selection-title')).toHaveText('Tree');
+  await page.keyboard.press('Delete');
+  await expect(page.locator('#selection-title')).toHaveText('Nothing selected');
+});
+
 test('shows local device state and timeline/archive viewers', async ({ page }) => {
   await page.goto('/');
   const box = await page.locator('#map').boundingBox();
