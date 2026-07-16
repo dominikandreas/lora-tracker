@@ -47,6 +47,21 @@ def test_point_and_topic_validation():
     assert normalized["timestamp_valid"] is True
 
 
+def test_topic_parser_anchors_to_nested_configured_base():
+    topic = f"site/v1/farm/v1/trackers/{HASH}/events/point"
+    assert tracker_hash_from_topic(topic, "events/point", "site/v1/farm") == HASH
+    try:
+        tracker_hash_from_topic(
+            f"foreign/site/v1/farm/v1/trackers/{HASH}/events/point",
+            "events/point",
+            "site/v1/farm",
+        )
+    except ProtocolError as exc:
+        assert exc.code == "invalid_topic"
+    else:
+        raise AssertionError("topic outside configured base accepted")
+
+
 def test_old_point_schema_is_rejected():
     try:
         validate_point(point(schema=1), HASH)

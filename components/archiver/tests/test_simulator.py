@@ -59,6 +59,7 @@ def test_archiver_service_simulation_covers_mqtt_lifecycle_and_errors(tmp_path: 
         "points_inserted": 4,
         "history_chunks": 2,
         "history_error_responses": 1,
+        "archive_confirmations": 5,
     }
 
 

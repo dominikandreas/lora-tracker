@@ -27,12 +27,16 @@ Forwarding is bounded and opportunistic:
   heard only the new hop to continue the chain;
 - the queue holds at most eight full packets; overload drops new work rather
   than exhausting memory or blocking radio reception;
-- a token bucket charges the estimated and measured transmit airtime. The
-  shipped ceiling is 36,000 ms per hour (one percent), but the legal limit must
-  be configured for the region, sub-band, EIRP and installation.
+- a rolling-hour limiter charges estimated and measured transmit airtime. It
+  starts empty after reboot and bounds idle bursts plus refill to 36,000 ms in
+  every continuous hour under the supported Germany profile. Frames wait for
+  budget instead of being discarded. See the
+  [Germany radio profile](RADIO_COMPLIANCE_DE.md) for ERP/EIRP and antenna rules.
 
-ACK identities use a five-second duplicate cache instead of the ordinary
-120-second cache. This suppresses an ACK flood but permits the receiver's ACK
+A frame enters the recent cache only after a successful transmission. Radio
+failures are retried three times locally; if they still fail, a later source
+retry remains eligible. ACK identities use a five-second duplicate cache
+instead of the ordinary 120-second cache. This suppresses an ACK flood but permits the receiver's ACK
 to be forwarded again after a later tracker retry. The tracker keeps listening
 through echoed history and unrelated radio frames until the ACK deadline.
 
@@ -96,7 +100,7 @@ Before field use:
    has insufficient margin; with it on, confirm history delivery and queue
    clearing through an authenticated ACK.
 3. Observe serial counters for forwarded, suppressed, invalid, queue-dropped
-   and airtime-dropped frames under simultaneous tracker traffic.
+   and airtime-deferred frames under simultaneous tracker traffic.
 4. Test every intended hop, then remove one repeater at a time to document the
    actual fault tolerance.
 5. Measure duty cycle, packet error rate and tracker energy at the worst radio

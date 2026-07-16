@@ -109,9 +109,10 @@ in [repeaters](REPEATERS.md).
 - Tracker and gateway have identical frequency, bandwidth, spreading factor,
   coding rate, preamble and sync word; every repeater matches them.
 - Relay hop limits are the minimum needed, the tracker ACK window covers the
-  measured round trip, and repeater queue/airtime-drop counters remain acceptable.
+  measured round trip, and repeater queue-drop/airtime-deferral counters remain acceptable.
 - Only registered tracker hashes with matching per-device AEAD keys are accepted.
 - `timestamp_valid`, location, battery and sequence values are plausible.
-- Archiver availability is online and a history request ends with `final=true`.
+- Archiver availability is online, gateway archive-confirmation ACLs are correct,
+  and a history request ends with `final=true`.
 - Factory-reset and rollback procedure has been tested on a spare unit.
 - Provisioning record, recovery credentials and firmware commit are stored securely.

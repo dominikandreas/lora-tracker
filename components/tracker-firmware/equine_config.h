@@ -11,7 +11,7 @@
 namespace EquineConfig {
 
 constexpr uint32_t CONFIG_MAGIC = 0x45434647UL;  // "ECFG"
-constexpr uint16_t CONFIG_SCHEMA_VERSION = 4;
+constexpr uint16_t CONFIG_SCHEMA_VERSION = 5;
 constexpr uint8_t MAX_GATEWAY_TRACKERS = 12;
 constexpr size_t DEVICE_ID_SIZE = 25;       // 24 chars + NUL
 constexpr size_t DEVICE_NAME_SIZE = 33;     // 32 chars + NUL
@@ -25,6 +25,13 @@ constexpr size_t MQTT_BASE_TOPIC_SIZE = 33;
 constexpr const char* CONFIG_NAMESPACE = "eqcfg";
 constexpr const char* ACTIVE_CONFIG_KEY = "active";
 constexpr const char* BACKUP_CONFIG_KEY = "backup";
+
+// Germany profile: BNetzA Vfg 91/2025, band 48. The firmware uses the
+// alternative 1% duty-cycle condition and does not claim LBT/AFA compliance.
+constexpr uint32_t GERMANY_FREQUENCY_MIN_HZ = 868000000UL;
+constexpr uint32_t GERMANY_FREQUENCY_MAX_HZ = 868600000UL;
+constexpr int8_t GERMANY_MAX_CONDUCTED_POWER_DBM = 14;
+constexpr uint32_t GERMANY_AIRTIME_BUDGET_MS_PER_HOUR = 36000UL;
 
 enum class DeviceRole : uint8_t {
   TRACKER = 1,
@@ -224,15 +231,25 @@ inline bool isSupportedBandwidth(uint32_t bandwidth_hz) {
 }
 
 inline bool validateLoRa(const LoRaConfigV1& config) {
-  return config.frequency_hz >= 863000000UL &&
-         config.frequency_hz <= 870000000UL &&
-         isSupportedBandwidth(config.bandwidth_hz) &&
-         config.tx_power_dbm >= 2 && config.tx_power_dbm <= 22 &&
+  if (!isSupportedBandwidth(config.bandwidth_hz)) return false;
+  const uint32_t half_bandwidth_hz = config.bandwidth_hz / 2UL;
+  return config.frequency_hz >=
+           GERMANY_FREQUENCY_MIN_HZ + half_bandwidth_hz &&
+         config.frequency_hz <=
+           GERMANY_FREQUENCY_MAX_HZ - half_bandwidth_hz &&
+         config.tx_power_dbm >= 2 &&
+         config.tx_power_dbm <= GERMANY_MAX_CONDUCTED_POWER_DBM &&
          config.spreading_factor >= 7 && config.spreading_factor <= 12 &&
          config.coding_rate_denominator >= 5 &&
          config.coding_rate_denominator <= 8 &&
          config.preamble_length >= 6 && config.preamble_length <= 32 &&
-         config.relay_hop_limit <= EquineRelay::MAX_HOPS;
+         config.relay_hop_limit <= EquineRelay::MAX_HOPS &&
+         EquineRelay::maxFrameAirtimeMs(
+           config.spreading_factor,
+           config.bandwidth_hz,
+           config.coding_rate_denominator,
+           config.preamble_length) <
+           GERMANY_AIRTIME_BUDGET_MS_PER_HOUR;
 }
 
 template <typename T>
@@ -394,14 +411,21 @@ inline bool validateRepeaterConfig(const RepeaterConfigV1& config) {
          config.heartbeat_interval_s >= 10 &&
          config.heartbeat_interval_s <= 3600 &&
          config.airtime_budget_ms_per_hour >= 1000 &&
-         config.airtime_budget_ms_per_hour <= 36000;
+         config.airtime_budget_ms_per_hour <=
+           GERMANY_AIRTIME_BUDGET_MS_PER_HOUR &&
+         EquineRelay::maxFrameAirtimeMs(
+           config.lora.spreading_factor,
+           config.lora.bandwidth_hz,
+           config.lora.coding_rate_denominator,
+           config.lora.preamble_length) <
+           config.airtime_budget_ms_per_hour;
 }
 
 inline void setDefaultLoRa(LoRaConfigV1& config) {
   memset(&config, 0, sizeof(config));
-  config.frequency_hz = 868000000UL;
+  config.frequency_hz = 868100000UL;
   config.bandwidth_hz = 125000UL;
-  config.tx_power_dbm = 20;
+  config.tx_power_dbm = GERMANY_MAX_CONDUCTED_POWER_DBM;
   config.spreading_factor = 10;
   config.coding_rate_denominator = 5;
   config.preamble_length = 8;
@@ -517,16 +541,12 @@ inline void makeDefaultRepeaterConfig(
   strlcpy(config.repeater_id, repeater_id, sizeof(config.repeater_id));
   strlcpy(config.repeater_name, repeater_name, sizeof(config.repeater_name));
   setDefaultLoRa(config.lora);
-  // Repeaters are infrastructure devices; conservative 14 dBm is a safer EU
-  // default than the battery tracker profile. Deployment-specific EIRP and
-  // duty-cycle limits still need to be checked by the operator.
-  config.lora.tx_power_dbm = 14;
   config.forwarding_base_delay_ms = 40;
   config.forwarding_slot_width_ms = 45;
   config.forwarding_slot_count = 8;
   config.duplicate_cache_ttl_s = 120;
   config.heartbeat_interval_s = 60;
-  config.airtime_budget_ms_per_hour = 36000;
+  config.airtime_budget_ms_per_hour = GERMANY_AIRTIME_BUDGET_MS_PER_HOUR;
   finalize(config, DeviceRole::REPEATER, 1);
 }
 

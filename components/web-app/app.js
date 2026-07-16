@@ -149,7 +149,24 @@ async function renderSelectedTracker() {
   els.eventTable.innerHTML = '';
   for (const point of points.slice(-30).reverse()) {
     const row = document.createElement('tr');
-    row.innerHTML = `<td>${formatTime(point.effective_time_unix_ms)}</td><td><code>${point.latitude.toFixed(6)}, ${point.longitude.toFixed(6)}</code></td><td>${point.battery_level}%</td><td>${point.rssi} dBm</td><td>${point.gateway_id || point.gateway_hash || '—'}</td>`;
+    const values = [
+      formatTime(point.effective_time_unix_ms),
+      `${point.latitude.toFixed(6)}, ${point.longitude.toFixed(6)}`,
+      `${point.battery_level}%`,
+      `${point.rssi} dBm`,
+      point.gateway_id || point.gateway_hash || '—',
+    ];
+    for (const [index, value] of values.entries()) {
+      const cell = document.createElement('td');
+      if (index === 1) {
+        const code = document.createElement('code');
+        code.textContent = value;
+        cell.append(code);
+      } else {
+        cell.textContent = value;
+      }
+      row.append(cell);
+    }
     els.eventTable.append(row);
   }
 }
@@ -191,10 +208,18 @@ mqtt.addEventListener('message', async event => {
     for (const raw of data.points) {
       try { await ingestPoint(raw); } catch (error) { console.warn(error); }
     }
-    if (data.final && pendingHistoryRequest === data.request_id) {
-      pendingHistoryRequest = null;
-      els.connectionMessage.textContent = `History received for ${tail[2]}.`;
-      if (data.has_more) els.connectionMessage.textContent += ' More data is available; request pagination is retained for the next app iteration.';
+    if (data.final && pendingHistoryRequest?.requestId === data.request_id &&
+        pendingHistoryRequest.deviceHash === tail[2]) {
+      const request = pendingHistoryRequest;
+      if (data.has_more && Number.isSafeInteger(data.next_cursor) &&
+          data.next_cursor > request.cursor && request.page < 100) {
+        requestHistoryPage({ ...request, cursor: data.next_cursor, page: request.page + 1 });
+      } else {
+        pendingHistoryRequest = null;
+        els.connectionMessage.textContent = data.has_more
+          ? 'History pagination stopped because the server cursor was invalid.'
+          : `History received for ${tail[2]} (${request.page + 1} page${request.page ? 's' : ''}).`;
+      }
     }
   }
 });
@@ -220,25 +245,35 @@ els.connectButton.addEventListener('click', () => {
   });
 });
 
+function requestHistoryPage(request) {
+  const base = els.baseTopic.value.trim() || 'lora-tracker';
+  const requestId = `web-${Date.now().toString(36)}-${request.page.toString(36)}`;
+  pendingHistoryRequest = { ...request, requestId };
+  mqtt.publish(`${base}/v1/trackers/${request.deviceHash}/history/request`, JSON.stringify({
+    api_version: 1,
+    schema_version: 2,
+    request_id: requestId,
+    from_unix_ms: request.fromUnixMs,
+    to_unix_ms: request.toUnixMs,
+    limit: 500,
+    cursor: request.cursor,
+  }));
+  els.connectionMessage.textContent = `Requesting history page ${request.page + 1}…`;
+}
+
 els.historyButton.addEventListener('click', () => {
   if (!selectedHash || !connected) {
     els.connectionMessage.textContent = 'Connect to MQTT and select a tracker first.';
     return;
   }
-  const base = els.baseTopic.value.trim() || 'lora-tracker';
   const hours = Number(els.historyRange.value || 24);
-  const requestId = `web-${Date.now().toString(36)}`;
-  pendingHistoryRequest = requestId;
-  mqtt.publish(`${base}/v1/trackers/${selectedHash}/history/request`, JSON.stringify({
-    api_version: 1,
-    schema_version: 2,
-    request_id: requestId,
-    from_unix_ms: Date.now() - hours * 3600_000,
-    to_unix_ms: Date.now() + 60_000,
-    limit: 500,
+  requestHistoryPage({
+    deviceHash: selectedHash,
+    fromUnixMs: Date.now() - hours * 3600_000,
+    toUnixMs: Date.now() + 60_000,
     cursor: 0,
-  }));
-  els.connectionMessage.textContent = `Requested ${hours} hours of history…`;
+    page: 0,
+  });
 });
 
 els.historyRange.addEventListener('change', renderSelectedTracker);

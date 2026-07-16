@@ -7,7 +7,10 @@ transmits a batch, and returns to deep sleep. The moving interval, stationary
 intervals, quality thresholds and LoRa policy are configuration values.
 
 A missing ACK does not delete data. Retries use exponential backoff and the
-queued sequence remains available for later delivery.
+queued sequence remains available for later delivery. Daily distance rollover
+never clears telemetry, and a full RTC queue rejects new samples instead of
+overwriting unacknowledged points. The queue is still RTC-only and is not
+preserved across power loss or a hard reset; this remains a release blocker.
 
 ## Useful MQTT topics
 
@@ -58,12 +61,27 @@ repeated no-fix cycles. Typical causes include indoor storage, metal roofs,
 antenna orientation or insufficient sky view. A full acquisition is retried
 periodically.
 
+## MQTT TLS waits for time
+
+The gateway deliberately refuses certificate-validated MQTT until its UTC clock
+is at least 2024-01-01. Allow DNS and outbound NTP (UDP 123) to
+`pool.ntp.org` or `time.cloudflare.com`, then check for the log message that the
+MQTT connection follows NTP synchronization. A CA chain without a trusted clock
+is not treated as sufficient TLS validation.
+
 ## Missing LoRa ACKs
 
-Confirm tracker and gateway share frequency, bandwidth, spreading factor,
-coding rate, sync word and preamble; repeaters must match as well. Check gateway
-RSSI/logs and repeater forwarded/suppressed/drop counters. Failed ACKs retain
-the queue and use 1/2/5/10-minute retry backoff by default.
+Confirm tracker, gateway and repeaters use the same supported Germany radio
+profile. Check gateway RSSI/logs and repeater forwarded, suppressed, queue-drop
+and airtime-deferral counters. Failed ACKs retain the queue and use
+1/2/5/10-minute retry backoff by default.
+
+A gateway sends a radio ACK only after the archiver confirms every new point on
+its `archive/ack` topic. If the archiver, broker, ACL or confirmation route is
+unavailable, the gateway deliberately withholds the ACK and the tracker retries.
+Broker ACLs must allow only the archiver to publish gateway archive-confirmation
+topics. This converts QoS-0 point publication into application-confirmed durable
+SQLite delivery; duplicate events and confirmations are expected and idempotent.
 
 The link uses deterministic repeater priority slots and peer suppression, but
 hidden repeaters and multiple receivers can still produce duplicate ACKs or
@@ -80,5 +98,7 @@ time otherwise.
 ## Web application
 
 The app needs an MQTT WebSocket listener. Browser mixed-content rules block
-`ws://` from an `https://` page, so use `wss://` in production. Clear site data
-to reset IndexedDB and saved broker preferences.
+`ws://` from an `https://` page, so use `wss://` in production. History pages
+are requested automatically with a 100-page safety bound. Local history is
+pruned after 180 days and capped at 250,000 points. Clear site data to reset
+IndexedDB and saved broker preferences.

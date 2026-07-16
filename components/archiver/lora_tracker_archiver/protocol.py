@@ -58,6 +58,10 @@ def history_response_topic(base_topic: str, device_hash: str, request_id: str) -
     )
 
 
+def gateway_archive_ack_topic(base_topic: str, gateway_hash: str) -> str:
+    return f"{base_topic}/v{API_VERSION}/gateways/{validate_device_hash(gateway_hash)}/archive/ack"
+
+
 def archiver_availability_topic(base_topic: str, archiver_id: str) -> str:
     return f"{base_topic}/v{API_VERSION}/archivers/{archiver_id}/availability"
 
@@ -66,17 +70,23 @@ def archiver_status_topic(base_topic: str, archiver_id: str) -> str:
     return f"{base_topic}/v{API_VERSION}/archivers/{archiver_id}/status"
 
 
-def tracker_hash_from_topic(topic: str, expected_suffix: str) -> str:
+def tracker_hash_from_topic(
+    topic: str, expected_suffix: str, base_topic: str = "lora-tracker"
+) -> str:
     parts = topic.split("/")
-    try:
-        version_index = parts.index(f"v{API_VERSION}")
-    except ValueError as exc:
+    base_parts = base_topic.strip("/").split("/")
+    if not base_parts or parts[: len(base_parts)] != base_parts:
         raise ProtocolError(
-            "invalid_topic", "topic has no supported API version"
-        ) from exc
-    tail = parts[version_index:]
+            "invalid_topic", "topic is outside the configured base topic"
+        )
+    tail = parts[len(base_parts) :]
     expected = [f"v{API_VERSION}", "trackers", "<hash>"] + expected_suffix.split("/")
-    if len(tail) != len(expected) or tail[1] != "trackers" or tail[3:] != expected[3:]:
+    if (
+        len(tail) != len(expected)
+        or tail[0] != f"v{API_VERSION}"
+        or tail[1] != "trackers"
+        or tail[3:] != expected[3:]
+    ):
         raise ProtocolError(
             "invalid_topic", "topic does not match the expected tracker route"
         )

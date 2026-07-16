@@ -20,6 +20,7 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <string.h>
+#include <sys/time.h>
 #include <WebServer.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -219,11 +220,13 @@ struct RtcHistoryMetadata {
   uint32_t next_tx_counter;
   uint32_t boot_id;
   uint64_t nonce_prefix;
+  double airtime_tokens_ms;
+  uint64_t airtime_refill_time_us;
   uint32_t crc32;
 } __attribute__((packed));
 
 constexpr uint32_t RTC_HISTORY_MAGIC = 0x4c545248UL;  // "LTRH"
-constexpr uint16_t RTC_HISTORY_SCHEMA = 2;
+constexpr uint16_t RTC_HISTORY_SCHEMA = 3;
 RTC_DATA_ATTR RtcHistoryMetadata rtc_history_metadata{};
 
 RTC_DATA_ATTR uint32_t seconds_since_last_fix = 0;
@@ -234,6 +237,8 @@ RTC_DATA_ATTR uint32_t seconds_since_daily_reset = 0;
 RTC_DATA_ATTR uint32_t next_point_seq = 0; // survives deep sleep
 RTC_DATA_ATTR uint32_t next_tx_counter = 0; // unique per encryption epoch
 RTC_DATA_ATTR uint64_t tx_nonce_prefix = 0;
+RTC_DATA_ATTR double tracker_airtime_tokens_ms = 0.0;
+RTC_DATA_ATTR uint64_t tracker_airtime_refill_time_us = 0;
 RTC_DATA_ATTR uint64_t target_wakeup_time_us = 0;
 RTC_DATA_ATTR uint64_t session_start_time_us = 0; // wall-clock uptime across deep sleep
 RTC_DATA_ATTR uint16_t stationary_fix_streak = 0;
@@ -295,6 +300,8 @@ void sealRtcHistory() {
   rtc_history_metadata.next_tx_counter = next_tx_counter;
   rtc_history_metadata.boot_id = boot_id;
   rtc_history_metadata.nonce_prefix = tx_nonce_prefix;
+  rtc_history_metadata.airtime_tokens_ms = tracker_airtime_tokens_ms;
+  rtc_history_metadata.airtime_refill_time_us = tracker_airtime_refill_time_us;
   rtc_history_metadata.crc32 = calculateRtcHistoryCrc(rtc_history_metadata);
 }
 
@@ -310,7 +317,39 @@ bool validateRtcHistory() {
     rtc_history_metadata.next_tx_counter == next_tx_counter &&
     rtc_history_metadata.boot_id == boot_id &&
     rtc_history_metadata.nonce_prefix == tx_nonce_prefix &&
+    rtc_history_metadata.airtime_tokens_ms == tracker_airtime_tokens_ms &&
+    rtc_history_metadata.airtime_refill_time_us == tracker_airtime_refill_time_us &&
+    tracker_airtime_tokens_ms >= 0.0 &&
+    tracker_airtime_tokens_ms <= EquineConfig::GERMANY_AIRTIME_BUDGET_MS_PER_HOUR &&
     rtc_history_metadata.crc32 == calculateRtcHistoryCrc(rtc_history_metadata);
+}
+
+uint64_t trackerWallClockUs() {
+  struct timeval tv{};
+  gettimeofday(&tv, nullptr);
+  return static_cast<uint64_t>(tv.tv_sec) * 1000000ULL +
+         static_cast<uint64_t>(tv.tv_usec);
+}
+
+void refillTrackerAirtime() {
+  const uint64_t now_us = trackerWallClockUs();
+  if (tracker_airtime_refill_time_us == 0 ||
+      now_us < tracker_airtime_refill_time_us) {
+    tracker_airtime_tokens_ms = 0.0;
+    tracker_airtime_refill_time_us = now_us;
+    return;
+  }
+  const uint32_t capacity_ms = EquineRelay::maxFrameAirtimeMs(
+    tracker_config.lora.spreading_factor,
+    tracker_config.lora.bandwidth_hz,
+    tracker_config.lora.coding_rate_denominator,
+    tracker_config.lora.preamble_length);
+  tracker_airtime_tokens_ms = EquineRelay::refillRollingHourAirtimeTokens(
+    tracker_airtime_tokens_ms,
+    (now_us - tracker_airtime_refill_time_us) / 1000ULL,
+    EquineConfig::GERMANY_AIRTIME_BUDGET_MS_PER_HOUR,
+    capacity_ms);
+  tracker_airtime_refill_time_us = now_us;
 }
 
 // =====================================================
@@ -706,42 +745,46 @@ void makeTrackerFactoryConfig() {
 }
 
 
-bool readTrackerProvisionedFlag(bool default_value) {
-  if (!configPrefs.begin(EquineConfig::CONFIG_NAMESPACE, true)) {
-    return default_value;
+bool readTrackerProvisionedFlag(bool& provisioned) {
+  provisioned = false;
+  if (!configPrefs.begin(EquineConfig::CONFIG_NAMESPACE, true)) return false;
+  const bool present = configPrefs.isKey(EquineConfigApi::PROVISIONED_KEY);
+  if (present) {
+    provisioned = configPrefs.getBool(EquineConfigApi::PROVISIONED_KEY, false);
   }
-  const bool result = configPrefs.getBool(
-    EquineConfigApi::PROVISIONED_KEY, default_value);
   configPrefs.end();
-  return result;
+  return present;
 }
 
-void writeTrackerProvisionedFlag(bool provisioned) {
-  if (!configPrefs.begin(EquineConfig::CONFIG_NAMESPACE, false)) return;
-  configPrefs.putBool(EquineConfigApi::PROVISIONED_KEY, provisioned);
+bool writeTrackerProvisionedFlag(bool provisioned) {
+  if (!configPrefs.begin(EquineConfig::CONFIG_NAMESPACE, false)) return false;
+  const size_t written = configPrefs.putBool(
+    EquineConfigApi::PROVISIONED_KEY, provisioned);
   configPrefs.end();
+  return written == sizeof(uint8_t);
 }
 
 bool loadTrackerConfig() {
   const char* source = "active";
-  bool created_factory = false;
   if (!readTrackerConfigBlob(
         EquineConfig::ACTIVE_CONFIG_KEY, tracker_config)) {
     source = "backup";
     if (!readTrackerConfigBlob(
           EquineConfig::BACKUP_CONFIG_KEY, tracker_config)) {
       source = "factory/migrated";
-      created_factory = true;
       makeTrackerFactoryConfig();
-      if (!saveTrackerConfig(false)) return false;
-      writeTrackerProvisionedFlag(false);
+      if (!saveTrackerConfig(false) || !writeTrackerProvisionedFlag(false)) {
+        return false;
+      }
     } else {
       // Repair the active slot from the valid rollback copy.
       writeTrackerConfigBlob(EquineConfig::ACTIVE_CONFIG_KEY, tracker_config);
     }
   }
 
-  tracker_onboarding_required = !readTrackerProvisionedFlag(!created_factory);
+  bool provisioned = false;
+  const bool has_provisioned_marker = readTrackerProvisionedFlag(provisioned);
+  tracker_onboarding_required = !has_provisioned_marker || !provisioned;
   applyTrackerConfigRuntimeState();
   logPrintf("Loaded tracker config from %s: schema=%u revision=%lu id=%s name=%s onboarding=%s.\n",
             source,
@@ -788,7 +831,11 @@ bool commitTrackerConfigCandidate(
   }
 
   if (mark_provisioned) {
-    writeTrackerProvisionedFlag(true);
+    if (!writeTrackerProvisionedFlag(true)) {
+      snprintf(error, error_size, "failed to persist onboarding completion");
+      tracker_onboarding_required = true;
+      return false;
+    }
     tracker_onboarding_required = false;
   }
   return true;
@@ -1034,7 +1081,11 @@ bool applyTrackerWebPatch(EquineConfigApi::PatchStatus& status,
   }
   if (!status.changed) {
     if (tracker_onboarding_required) {
-      writeTrackerProvisionedFlag(true);
+      if (!writeTrackerProvisionedFlag(true)) {
+        snprintf(status.error, sizeof(status.error),
+                 "failed to persist onboarding completion");
+        return false;
+      }
       tracker_onboarding_required = false;
     }
     return true;
@@ -1119,7 +1170,10 @@ void processBleConfigCommand(const char* command) {
         return;
       }
     } else if (tracker_onboarding_required) {
-      writeTrackerProvisionedFlag(true);
+      if (!writeTrackerProvisionedFlag(true)) {
+        sendBleConfigError("commit_failed", "failed to persist onboarding completion");
+        return;
+      }
       tracker_onboarding_required = false;
     }
     const bool needs_reboot = status.reboot_required || reboot;
@@ -2156,17 +2210,20 @@ void clearHistory() {
 }
 
 void resetDailyDistanceAndHistory() {
-  logPrintln("Daily reset: clearing distance accumulator and history chain.");
+  logPrintln("Daily reset: clearing distance accumulator; queued history is retained until ACKed.");
   total_distance_meters = 0.0;
   last_saved_dist = 0.0;
-  clearHistory();
   seconds_since_daily_reset = 0;
   prefs.putDouble("dist", 0.0);
   prefs.putUInt("daily_age", 0);
   seconds_since_last_nvs_save = 0;
 }
 
-void appendHistoryPointAbsolute(int32_t lat_micro, int32_t lon_micro, uint32_t unix_time_s) {
+bool appendHistoryPointAbsolute(int32_t lat_micro, int32_t lon_micro, uint32_t unix_time_s) {
+  if (history_count >= HISTORY_SIZE) {
+    logPrintln("History queue full; preserving all unacknowledged points and rejecting the new sample.");
+    return false;
+  }
   StoredHistoryPoint p;
   p.lat = lat_micro;
   p.lon = lon_micro;
@@ -2175,15 +2232,12 @@ void appendHistoryPointAbsolute(int32_t lat_micro, int32_t lon_micro, uint32_t u
 
   history_points[history_head] = p;
   history_head = (history_head + 1) % HISTORY_SIZE;
-  if (history_count < HISTORY_SIZE) {
-    history_count++;
-  } else {
-    logPrintln("Warning: History buffer is full! Oldest unacknowledged point will be overwritten.");
-  }
+  history_count++;
 
   logPrintf("History append -> seq=%lu lat=%ld lon=%ld utc=%lu count=%u\n",
                 (unsigned long)p.seq, (long)p.lat, (long)p.lon,
                 (unsigned long)p.unix_time_s, history_count);
+  return true;
 }
 
 int32_t quantizeMicrodegToStepGrid(int32_t value_micro) {
@@ -2273,6 +2327,10 @@ uint16_t buildDynamicPayload(uint8_t* buffer, size_t max_len, uint16_t& points_p
       // at the first point that again has a trustworthy monotonic UTC value.
       if (p.unix_time_s == 0 || p.unix_time_s < previous_time_s) break;
       delta_time_s = p.unix_time_s - previous_time_s;
+    } else if (p.unix_time_s > 0) {
+      // Preserve later GNSS time: send the untimed prefix first, then re-root a
+      // subsequent timestamped frame at this point after the prefix is ACKed.
+      break;
     }
     const size_t timestamp_bytes =
       EquineProtocol::uleb128SizeU32(delta_time_s);
@@ -3202,15 +3260,20 @@ void setup() {
       esp_fill_random(
         tracker_config.lora_aead_key,
         sizeof(tracker_config.lora_aead_key));
-      saveTrackerConfig(true);
-      writeTrackerProvisionedFlag(false);
+      if (!saveTrackerConfig(true) || !writeTrackerProvisionedFlag(false)) {
+        logPrintln("Fatal: failed to persist rotated LoRa key/onboarding state.");
+        while (true) delay(1000);
+      }
       tracker_onboarding_required = true;
       logPrintln("LoRa key rotated because the monotonic boot counter was unavailable; re-register this tracker.");
       boot_id = 1;
     } else {
       boot_id = previous_boot_id + 1;
     }
-    prefs.putUInt("boot_id", boot_id);
+    if (prefs.putUInt("boot_id", boot_id) != sizeof(uint32_t)) {
+      logPrintln("Fatal: failed to persist monotonic boot counter.");
+      while (true) delay(1000);
+    }
     esp_fill_random(&tx_nonce_prefix, sizeof(tx_nonce_prefix));
     if (tx_nonce_prefix == 0) tx_nonce_prefix = 1;
     next_tx_counter = 0;
@@ -3241,6 +3304,9 @@ void setup() {
     gettimeofday(&tv, NULL);
     session_start_time_us =
       (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;
+    // Cold-start empty so rebooting cannot reset the regulatory limiter.
+    tracker_airtime_tokens_ms = 0.0;
+    tracker_airtime_refill_time_us = session_start_time_us;
   } else {
     wakeup_counter++;
     boot_id = prefs.getUInt("boot_id", 1);
@@ -3250,15 +3316,20 @@ void setup() {
         esp_fill_random(
           tracker_config.lora_aead_key,
           sizeof(tracker_config.lora_aead_key));
-        saveTrackerConfig(true);
-        writeTrackerProvisionedFlag(false);
+        if (!saveTrackerConfig(true) || !writeTrackerProvisionedFlag(false)) {
+          logPrintln("Fatal: failed to persist rotated LoRa key/onboarding state.");
+          while (true) delay(1000);
+        }
         tracker_onboarding_required = true;
         boot_id = 1;
         logPrintln("LoRa key rotated after boot epoch exhaustion; re-register this tracker.");
       } else {
         boot_id++;
       }
-      prefs.putUInt("boot_id", boot_id);
+      if (prefs.putUInt("boot_id", boot_id) != sizeof(uint32_t)) {
+        logPrintln("Fatal: failed to persist recovered boot counter.");
+        while (true) delay(1000);
+      }
       esp_fill_random(&tx_nonce_prefix, sizeof(tx_nonce_prefix));
       if (tx_nonce_prefix == 0) tx_nonce_prefix = 1;
       next_tx_counter = 0;
@@ -3267,6 +3338,8 @@ void setup() {
       next_point_seq = 0;
       memset(history_points, 0, sizeof(history_points));
       memset(&rtc_history_metadata, 0, sizeof(rtc_history_metadata));
+      tracker_airtime_tokens_ms = 0.0;
+      tracker_airtime_refill_time_us = trackerWallClockUs();
     }
   }
 
@@ -3614,11 +3687,34 @@ void performTrackingCycle() {
       const size_t payload_len =
         sizeof(link_header) + sizeof(secure_header) + plaintext_len +
         EquineProtocol::AEAD_TAG_SIZE;
+      const uint32_t estimated_airtime_ms = EquineRelay::estimateAirtimeMs(
+        payload_len,
+        tracker_config.lora.spreading_factor,
+        tracker_config.lora.bandwidth_hz,
+        tracker_config.lora.coding_rate_denominator,
+        tracker_config.lora.preamble_length);
+      refillTrackerAirtime();
+      if (!EquineRelay::consumeAirtimeTokens(
+            tracker_airtime_tokens_ms, estimated_airtime_ms)) {
+        logPrintf(
+          "LoRa transmission deferred by Germany 1%% airtime limiter "
+          "(need %lu ms, have %lu ms).\n",
+          static_cast<unsigned long>(estimated_airtime_ms),
+          static_cast<unsigned long>(tracker_airtime_tokens_ms));
+        break;
+      }
 
       last_tx_bytes = payload_len;
       last_tx_points = points_packed;
       last_ack_status = -1;
+      const uint32_t tx_started_ms = millis();
       const bool tx_result = transmitLoRaPacket(payload_buffer, payload_len);
+      const uint32_t measured_airtime_ms = millis() - tx_started_ms;
+      if (measured_airtime_ms > estimated_airtime_ms) {
+        tracker_airtime_tokens_ms -= min(
+          tracker_airtime_tokens_ms,
+          static_cast<double>(measured_airtime_ms - estimated_airtime_ms));
+      }
       last_tx_status = tx_result ? 1 : 0;
       serviceDisplayAndButton(true);
 

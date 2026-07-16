@@ -84,7 +84,7 @@ Configuration is rejected unless, among other constraints:
 
 - canonical IDs contain lowercase letters, digits, `_` or `-`
 - device hashes are unique in the gateway registry
-- LoRa values are within the supported EU-band and modem ranges
+- the complete LoRa channel fits Germany band 48 (868.0–868.6 MHz), requested conducted power is no more than 14 dBm and the modem supports rolling-hour airtime enforcement
 - timeout, sleep and retry sequences are internally consistent
 - strings are terminated and all floating-point thresholds are finite
 - CRC, role, schema and structure size match

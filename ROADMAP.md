@@ -13,12 +13,13 @@ hardware support or multiple public interfaces.
 - [x] Require BLE Secure Connections/MITM and an authenticated application session.
 - [ ] Add a supported BLE onboarding client, QR bootstrap and recovery/rotation policy.
 - [ ] Replace password-only ArduinoOTA with signed images, Secure Boot v2, flash/NVS encryption and documented eFuse/key custody.
-- [ ] Replace QoS-0-only gateway publishing with durable local buffering and broker-confirmed delivery.
+- [x] Require an application-level archiver receipt before gateway dedup advancement and tracker ACK; retries remain idempotent across QoS-0 loss.
 - [ ] Port the gateway to a current ESP32-S3/SX1262 board and share its RadioLib driver with the tracker.
 - [ ] Add broker/browser integration tests and hardware-in-the-loop tests for both boards.
 - [ ] Run multi-day battery, GNSS, deep-sleep, RF-loss, queue-overflow and reconnect qualification.
-- [ ] Enforce regional airtime/duty-cycle budgets across retries and document supported regions.
+- [x] Enforce the Germany band-48 frequency, conducted-power and rolling-hour airtime profile across tracker, gateway and repeater transmissions.
 - [x] Add RTC history metadata with magic, schema, bounds and CRC recovery.
+- [ ] Move the tracker unacknowledged queue to a wear-levelled, power-loss-safe flash journal with atomic ACK checkpoints and boot-epoch continuity.
 - [ ] Add fault-injection/HIL coverage for retained-memory corruption and brownouts.
 - [ ] Select a software/hardware license and publish a vulnerability-response policy.
 
@@ -35,7 +36,7 @@ hardware support or multiple public interfaces.
 ## P1 — application
 
 - [ ] Build an authenticated onboarding UI for BLE and Wi-Fi.
-- [ ] Add automatic history pagination, background synchronization and export.
+- [x] Add automatic bounded history pagination; background synchronization and export remain future work.
 - [ ] Add a geographical map with selectable offline/local tiles.
 - [ ] Add encrypted local secret storage protected by platform biometrics or PIN.
 - [ ] Add alerts for stale trackers, low battery, missing gateways and unusual movement.

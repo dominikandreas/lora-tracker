@@ -48,6 +48,7 @@ struct PendingForward {
   EquineRelay::FrameIdentityV1 identity;
   uint32_t due_ms;
   uint8_t outgoing_hop;
+  uint8_t retry_count;
   uint8_t packet_size;
   uint8_t packet[EquineRelay::MAX_PACKET_SIZE];
 };
@@ -84,7 +85,7 @@ uint32_t forwarded_frames = 0;
 uint32_t suppressed_frames = 0;
 uint32_t invalid_frames = 0;
 uint32_t queue_drops = 0;
-uint32_t airtime_drops = 0;
+uint32_t airtime_deferrals = 0;
 uint32_t transmit_failures = 0;
 
 bool timeReached(uint32_t now, uint32_t deadline) {
@@ -133,6 +134,14 @@ void generateDefaultIdentity(char* output, size_t output_size) {
   const uint64_t chip = ESP.getEfuseMac();
   snprintf(output, output_size, "repeater-%04lx",
            static_cast<unsigned long>(chip & 0xffffUL));
+}
+
+void clearAdminPassword() {
+  Preferences credentials;
+  if (credentials.begin("ltrepcred", false)) {
+    credentials.clear();
+    credentials.end();
+  }
 }
 
 void initializeAdminPassword() {
@@ -236,7 +245,7 @@ String statusJson() {
     ",\"suppressed\":" + String(suppressed_frames) +
     ",\"invalid\":" + String(invalid_frames) +
     ",\"queue_drops\":" + String(queue_drops) +
-    ",\"airtime_drops\":" + String(airtime_drops) +
+    ",\"airtime_deferrals\":" + String(airtime_deferrals) +
     ",\"tx_failures\":" + String(transmit_failures) + "}}";
   return out;
 }
@@ -302,9 +311,13 @@ void setupWebPortal() {
     uint32_t cache_ttl = 0, heartbeat = 0, airtime_budget = 0;
     int32_t tx_power = 0;
     const bool parsed =
-      parseUnsignedArg("frequency_hz", 863000000UL, 870000000UL, frequency) &&
+      parseUnsignedArg(
+        "frequency_hz", EquineConfig::GERMANY_FREQUENCY_MIN_HZ,
+        EquineConfig::GERMANY_FREQUENCY_MAX_HZ, frequency) &&
       parseUnsignedArg("bandwidth_hz", 62500, 500000, bandwidth) &&
-      parseSignedArg("tx_power_dbm", 2, 22, tx_power) &&
+      parseSignedArg(
+        "tx_power_dbm", 2,
+        EquineConfig::GERMANY_MAX_CONDUCTED_POWER_DBM, tx_power) &&
       parseUnsignedArg("sf", 7, 12, sf) &&
       parseUnsignedArg("coding_rate", 5, 8, coding) &&
       parseUnsignedArg("preamble", 6, 32, preamble) &&
@@ -349,6 +362,7 @@ void setupWebPortal() {
       return;
     }
     config_preferences.clear();
+    clearAdminPassword();
     web_server.send(200, "text/plain", "Factory reset; rebooting");
     restart_requested = true;
   });
@@ -561,13 +575,13 @@ void scheduleForward(const uint8_t* packet, size_t packet_size) {
   EquineRelay::LinkHeaderV1 outgoing{};
   memcpy(&outgoing, free_entry->packet, sizeof(outgoing));
   free_entry->outgoing_hop = outgoing.hop_count;
+  free_entry->retry_count = 0;
   free_entry->due_ms = now + EquineRelay::forwardingDelayMs(
     identity,
     repeater_hash,
     config.forwarding_base_delay_ms,
     config.forwarding_slot_count,
     config.forwarding_slot_width_ms);
-  rememberFrame(identity, now);
 }
 
 void refillAirtime(uint32_t now) {
@@ -577,12 +591,16 @@ void refillAirtime(uint32_t now) {
   }
   const uint32_t elapsed = now - airtime_refill_ms;
   airtime_refill_ms = now;
-  airtime_tokens_ms +=
-    static_cast<double>(elapsed) * config.airtime_budget_ms_per_hour /
-    3600000.0;
-  if (airtime_tokens_ms > config.airtime_budget_ms_per_hour) {
-    airtime_tokens_ms = config.airtime_budget_ms_per_hour;
-  }
+  const uint32_t capacity_ms = EquineRelay::maxFrameAirtimeMs(
+    config.lora.spreading_factor,
+    config.lora.bandwidth_hz,
+    config.lora.coding_rate_denominator,
+    config.lora.preamble_length);
+  airtime_tokens_ms = EquineRelay::refillRollingHourAirtimeTokens(
+    airtime_tokens_ms,
+    elapsed,
+    config.airtime_budget_ms_per_hour,
+    capacity_ms);
 }
 
 void serviceForwardQueue() {
@@ -603,13 +621,30 @@ void serviceForwardQueue() {
     config.lora.bandwidth_hz,
     config.lora.coding_rate_denominator,
     config.lora.preamble_length);
-  if (estimated_airtime == 0 || airtime_tokens_ms < estimated_airtime) {
-    airtime_drops++;
+  if (estimated_airtime == 0) {
+    invalid_frames++;
     due->used = false;
     return;
   }
+  if (!EquineRelay::consumeAirtimeTokens(
+        airtime_tokens_ms, estimated_airtime)) {
+    airtime_deferrals++;
+    const uint32_t capacity_ms = EquineRelay::maxFrameAirtimeMs(
+      config.lora.spreading_factor,
+      config.lora.bandwidth_hz,
+      config.lora.coding_rate_denominator,
+      config.lora.preamble_length);
+    const uint32_t refill_budget_ms =
+      config.airtime_budget_ms_per_hour - capacity_ms;
+    const double refill_per_ms =
+      static_cast<double>(refill_budget_ms) / 3600000.0;
+    const double missing_ms = estimated_airtime - airtime_tokens_ms;
+    const uint32_t wait_ms = static_cast<uint32_t>(
+      ceil(missing_ms / refill_per_ms));
+    due->due_ms = now + (wait_ms < 10UL ? 10UL : wait_ms);
+    return;
+  }
 
-  airtime_tokens_ms -= estimated_airtime;
   const uint32_t started = millis();
   const bool sent = transmitPacket(due->packet, due->packet_size);
   const uint32_t measured_airtime = millis() - started;
@@ -619,6 +654,7 @@ void serviceForwardQueue() {
       static_cast<double>(measured_airtime - estimated_airtime));
   }
   if (sent) {
+    rememberFrame(due->identity, millis());
     forwarded_frames++;
     Serial.printf("Forwarded type=%u boot=%lu counter=%lu hop=%u bytes=%u airtime=%lu ms\n",
       due->identity.message_type,
@@ -629,6 +665,12 @@ void serviceForwardQueue() {
       static_cast<unsigned long>(measured_airtime));
   } else {
     transmit_failures++;
+    if (due->retry_count < 3) {
+      due->retry_count++;
+      due->due_ms = millis() +
+        (200UL << static_cast<uint32_t>(due->retry_count - 1));
+      return;
+    }
   }
   due->used = false;
 }
@@ -655,7 +697,7 @@ void logHeartbeat() {
     static_cast<unsigned long>(suppressed_frames),
     static_cast<unsigned long>(invalid_frames),
     static_cast<unsigned long>(queue_drops),
-    static_cast<unsigned long>(airtime_drops),
+    static_cast<unsigned long>(airtime_deferrals),
     last_rssi,
     last_snr_tenths / 10.0f,
     static_cast<unsigned long>(airtime_tokens_ms));
@@ -672,7 +714,8 @@ void setup() {
   repeater_hash = EquineProtocol::deviceIdHash(config.repeater_id);
   EquineProtocol::formatDeviceHash(
     repeater_hash, repeater_hash_text, sizeof(repeater_hash_text));
-  airtime_tokens_ms = config.airtime_budget_ms_per_hour;
+  // Start empty so rebooting cannot reset the regulatory limiter to a full burst.
+  airtime_tokens_ms = 0.0;
   airtime_refill_ms = millis();
 
   Serial.printf("LoRa Tracker repeater %s (%s), config schema=%u revision=%lu\n",

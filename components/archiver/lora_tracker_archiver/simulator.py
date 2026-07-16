@@ -223,7 +223,7 @@ def run_simulation(
                     event = _gateway_event(point, gateway_index)
                     # This is the same validation the service performs after a
                     # broker delivers a MQTT point event.
-                    topic_hash = tracker_hash_from_topic(topic, "events/point")
+                    topic_hash = tracker_hash_from_topic(topic, "events/point", base_topic)
                     normalized = validate_point(event, topic_hash)
                     gateway_events += 1
                     received_at_ms = start_unix_ms + int(point["seq"]) * 60_000 + gateway_index
@@ -331,6 +331,11 @@ def run_service_simulation(*, database: Path | str) -> dict[str, object]:
             "api_version": 1, "schema_version": 2, "request_id": "bad-range",
             "from_unix_ms": 2, "to_unix_ms": 1,
         })
+        archive_confirmations = [
+            message for message in client.published if message.topic.endswith("/archive/ack")
+        ]
+        assert len(archive_confirmations) == 5
+        assert all(message.qos == 1 and not message.retain for message in archive_confirmations)
         responses = [json.loads(message.payload) for message in client.published if "/history/response/" in message.topic]
         successful = [response for response in responses if response["ok"]]
         errors = [response for response in responses if not response["ok"]]
@@ -344,6 +349,7 @@ def run_service_simulation(*, database: Path | str) -> dict[str, object]:
             "points_inserted": service.points_inserted,
             "history_chunks": len(successful),
             "history_error_responses": len(errors),
+            "archive_confirmations": len(archive_confirmations),
         }
     finally:
         service.store.close()

@@ -203,4 +203,33 @@ inline uint32_t estimateAirtimeMs(
   return static_cast<uint32_t>(ceil(total_s * 1000.0));
 }
 
+inline double refillRollingHourAirtimeTokens(
+    double tokens_ms,
+    uint64_t elapsed_ms,
+    uint32_t legal_budget_ms_per_hour,
+    uint32_t capacity_ms) {
+  if (capacity_ms == 0 || capacity_ms >= legal_budget_ms_per_hour) return 0.0;
+  const uint32_t refill_ms_per_hour =
+    legal_budget_ms_per_hour - capacity_ms;
+  tokens_ms += static_cast<double>(elapsed_ms) * refill_ms_per_hour /
+               3600000.0;
+  return tokens_ms > capacity_ms ? capacity_ms : tokens_ms;
+}
+
+inline uint32_t maxFrameAirtimeMs(
+    uint8_t spreading_factor,
+    uint32_t bandwidth_hz,
+    uint8_t coding_rate_denominator,
+    uint8_t preamble_symbols) {
+  return estimateAirtimeMs(
+    MAX_PACKET_SIZE, spreading_factor, bandwidth_hz,
+    coding_rate_denominator, preamble_symbols);
+}
+
+inline bool consumeAirtimeTokens(double& tokens_ms, uint32_t airtime_ms) {
+  if (airtime_ms == 0 || tokens_ms < airtime_ms) return false;
+  tokens_ms -= airtime_ms;
+  return true;
+}
+
 }  // namespace EquineRelay

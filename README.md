@@ -10,9 +10,10 @@ encrypted history traffic and receiver ACKs across bounded multi-hop paths.
 The repository is suitable for development and controlled field trials, but
 is not approved for unattended production deployment. LoRa telemetry/ACKs now
 use per-tracker AES-256-GCM and tracker BLE configuration requires an encrypted,
-authenticated session. The remaining release blockers include signed firmware
-with ESP32 secure boot, durable gateway delivery, key custody/rotation and
-hardware-in-the-loop qualification. See [production readiness](https://dominikandreas.github.io/lora-tracker-docs/reference/production-readiness.html)
+authenticated session. Gateway ACKs now require a durable archiver receipt,
+and all transmitters enforce the supported Germany radio profile. Remaining
+release blockers include signed firmware with ESP32 secure boot, a power-loss-safe
+tracker queue, key custody/rotation and hardware-in-the-loop qualification. See [production readiness](https://dominikandreas.github.io/lora-tracker-docs/reference/production-readiness.html)
 and [security](https://dominikandreas.github.io/lora-tracker-docs/reference/security.html).
 
 ## Components
@@ -65,6 +66,7 @@ The complete reader-facing documentation is rendered on [GitHub Pages](https://d
 - [Build and deployment](https://dominikandreas.github.io/lora-tracker-docs/reference/build-and-deploy.html)
 - [Browser flashing](https://dominikandreas.github.io/lora-tracker-docs/reference/flashing.html)
 - [Hardware recommendations](https://dominikandreas.github.io/lora-tracker-docs/reference/hardware.html)
+- [Germany radio compliance](https://dominikandreas.github.io/lora-tracker-docs/reference/radio-compliance-de.html)
 - [Repeaters](https://dominikandreas.github.io/lora-tracker-docs/reference/repeaters.html)
 - [Operations](https://dominikandreas.github.io/lora-tracker-docs/reference/operations.html)
 - [Simulation coverage](https://dominikandreas.github.io/lora-tracker-docs/reference/simulation-coverage.html)

@@ -31,6 +31,22 @@ void testProtocol() {
     0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
     0x2a, 0x00, 0x00, 0x00};
   assert(memcmp(nonce, expected_nonce, sizeof(nonce)) == 0);
+  const uint64_t ack_prefix_boot_7 = deriveNoncePrefix(
+    0x1122334455667788ULL, hash, 7, MessageType::ACK);
+  const uint64_t ack_prefix_boot_8 = deriveNoncePrefix(
+    0x1122334455667788ULL, hash, 8, MessageType::ACK);
+  assert(ack_prefix_boot_7 != ack_prefix_boot_8);
+  const SecureFrameHeaderV2 ack_7 = makeSecureFrameHeader(
+    MessageType::ACK, ACK_SCHEMA_VERSION, hash,
+    ack_prefix_boot_7, 7, 42);
+  const SecureFrameHeaderV2 ack_8 = makeSecureFrameHeader(
+    MessageType::ACK, ACK_SCHEMA_VERSION, hash,
+    ack_prefix_boot_8, 8, 42);
+  uint8_t ack_nonce_7[AEAD_NONCE_SIZE]{};
+  uint8_t ack_nonce_8[AEAD_NONCE_SIZE]{};
+  makeAeadNonce(ack_7, ack_nonce_7);
+  makeAeadNonce(ack_8, ack_nonce_8);
+  assert(memcmp(ack_nonce_7, ack_nonce_8, AEAD_NONCE_SIZE) != 0);
   HistoryPayloadV2 payload{};
   payload.first_seq = 123;
   assert(payload.first_seq == 123 && sizeof(payload) == 11);
@@ -104,6 +120,11 @@ void testRelayLink() {
   const uint32_t airtime = estimateAirtimeMs(255, 10, 125000, 5, 8);
   assert(airtime > 1000 && airtime < 3000);
   assert(estimateAirtimeMs(0, 10, 125000, 5, 8) == 0);
+  const uint32_t capacity = maxFrameAirtimeMs(10, 125000, 5, 8);
+  const double rolling = refillRollingHourAirtimeTokens(
+    0.0, 3600000ULL, 36000, capacity);
+  assert(rolling == capacity);
+  assert(capacity + (36000 - capacity) == 36000);
 }
 
 void testConfiguration() {
@@ -115,6 +136,15 @@ void testConfiguration() {
   makeDefaultTrackerConfig(
       tracker, "horse-1", "Horse 1", "stable", "secret", key);
   assert(validateTrackerConfig(tracker));
+  assert(tracker.lora.frequency_hz == 868100000UL);
+  tracker.lora.tx_power_dbm = 15;
+  finalize(tracker, DeviceRole::TRACKER, tracker.header.revision);
+  assert(!validateTrackerConfig(tracker));
+  tracker.lora.tx_power_dbm = GERMANY_MAX_CONDUCTED_POWER_DBM;
+  tracker.lora.frequency_hz = 869525000UL;
+  finalize(tracker, DeviceRole::TRACKER, tracker.header.revision);
+  assert(!validateTrackerConfig(tracker));
+  tracker.lora.frequency_hz = 868100000UL;
   tracker.min_satellites = 2;
   assert(!validateTrackerConfig(tracker));
   tracker.min_satellites = 6;

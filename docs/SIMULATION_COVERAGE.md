@@ -22,12 +22,12 @@ Use the pinned PlatformIO environments in `components/tracker-firmware` and
 | Tracker telemetry contract | Transport-v2 multi-tracker routes, stable IDs, sequence/boot IDs, battery, RSSI, valid GNSS time and explicit current-schema untimed points |
 | Embedded tracker and gateway shared code | Native C++17 compilation and execution of each firmware copy of the protocol/configuration headers: frame layout, device hashes, ULEB128 boundaries/malformed data, CRC validation and tracker registry rules |
 | Repeater link policy | All three header copies: link parsing, hop advancement/caps, deterministic priority delay, peer suppression, ACK/history cache lifetimes, LoRa time-on-air calculation and repeater configuration validation |
-| Gateway to MQTT contract | Two independent gateway receptions, gateway metadata, duplicate delivery and archiver deduplication |
-| Topic and payload validation | Canonical point topics, device-hash consistency, production JSON/protocol validation |
+| Gateway to MQTT contract | Two independent gateway receptions, gateway metadata, duplicate delivery, archiver deduplication and QoS-1 archive confirmations after SQLite commit |
+| Topic and payload validation | Configured-base-anchored topics including nested `v1`, device-hash consistency and production JSON/protocol validation |
 | Archiver storage | SQLite insertion, per-gateway reception aggregation, timestamp fallback, history filtering and chunking |
 | Archiver MQTT service | Last will, credentials/TLS setup, subscriptions, retained availability/status, allowlist rejection, successful and invalid history requests |
 | History API | Chunked responses, `final`, `has_more`, cursor output and structured error response |
-| Browser point contract | Strict schema-2 normalization, GNSS time preference, receive-time fallback and incompatible-schema rejection |
+| Browser point contract | Strict schema-2 identity/range/timestamp validation, GNSS time preference, receive-time fallback and malicious-field rejection |
 | MQTT Web codec | Packet encoding/decoding tests in `components/web-app/tests` |
 
 ## Required physical/infrastructure validation
@@ -40,12 +40,14 @@ pinned ESP32 build and, where applicable, real devices and a broker:
   policy and battery/power measurements;
 - LoRa RF range, interference, capture/hidden-node effects, packet loss, ACK
   collisions, real multi-hop timing, retry backoff, repeater queue/airtime
-  behaviour, AES-GCM adversarial/fuzz vectors and the complete binary
+  behaviour, calibrated verification of the Germany rolling-hour airtime and
+  installed ERP limits, AES-GCM adversarial/fuzz vectors and the complete binary
   history-frame decoder behaviour;
 - a real MQTT broker's TLS certificates, authentication, ACLs, retained-message
   persistence, reconnect behaviour and QoS delivery guarantees;
-- browser rendering, IndexedDB quota/upgrade behaviour, service-worker caching
-  and WebSocket behaviour in supported browsers.
+- browser rendering/XSS checks, automatic multi-page history, IndexedDB
+  quota/upgrade/pruning behaviour, service-worker updates and WebSocket reconnects
+  in supported browsers.
 
 Those checks should be automated in a hardware-in-the-loop and broker/browser
 test environment before field deployment. The simulator makes all deterministic

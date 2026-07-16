@@ -16,7 +16,8 @@ name, URL and generated administrator password to serial at 115200 baud. To
 reopen configuration later, hold USER for at least 1.5 seconds during boot.
 Radio settings must exactly match the trackers and gateways.
 
-The default two-hop cap, deterministic priority slots, duplicate cache, bounded
-eight-frame queue and one-percent airtime token bucket are safety mechanisms,
-not a substitute for checking the legal frequency, EIRP and duty-cycle rules
-for the deployment country and antenna.
+The default two-hop cap, deterministic priority slots, post-success duplicate
+cache, bounded eight-frame queue and rolling-hour airtime limiter are safety
+mechanisms. This build accepts only the Germany band-48 profile; installed ERP
+and product compliance still require hardware verification. See
+[`docs/RADIO_COMPLIANCE_DE.md`](../../docs/RADIO_COMPLIANCE_DE.md).

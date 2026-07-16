@@ -142,6 +142,25 @@ inline void makeAeadNonce(
          &header.counter, sizeof(header.counter));
 }
 
+// Derive an independent nonce-prefix domain for a sender, peer boot epoch and
+// message direction. The returned prefix is public; its only purpose is to
+// prevent AES-GCM nonce reuse when counters restart in another peer epoch.
+inline uint64_t deriveNoncePrefix(
+    uint64_t sender_prefix,
+    uint64_t peer_device_hash,
+    uint32_t peer_boot_id,
+    MessageType type) {
+  uint64_t value = sender_prefix ^ peer_device_hash;
+  value ^= static_cast<uint64_t>(peer_boot_id) << 32;
+  value ^= static_cast<uint64_t>(static_cast<uint8_t>(type)) << 56;
+  value ^= value >> 30;
+  value *= 0xbf58476d1ce4e5b9ULL;
+  value ^= value >> 27;
+  value *= 0x94d049bb133111ebULL;
+  value ^= value >> 31;
+  return value == 0 ? 1 : value;
+}
+
 inline bool hasValidMagic(const FrameHeaderV1& header) {
   return header.magic == FRAME_MAGIC;
 }

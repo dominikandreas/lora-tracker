@@ -304,7 +304,7 @@ inline FieldResult applyLoRaField(EquineConfig::LoRaConfigV1& lora,
   return FieldResult::APPLIED; \
 } while (0)
   if (strcmp(key, "lora_frequency_hz") == 0) {
-    EQ_LORA_U32(frequency_hz, 863000000UL, 870000000UL);
+    EQ_LORA_U32(frequency_hz, EquineConfig::GERMANY_FREQUENCY_MIN_HZ, EquineConfig::GERMANY_FREQUENCY_MAX_HZ);
   }
   if (strcmp(key, "lora_bandwidth_hz") == 0) {
     uint32_t parsed = 0;
@@ -322,7 +322,7 @@ inline FieldResult applyLoRaField(EquineConfig::LoRaConfigV1& lora,
   }
   if (strcmp(key, "lora_tx_power_dbm") == 0) {
     int32_t parsed = 0;
-    if (!parseSigned(value, 2, 22, parsed)) {
+    if (!parseSigned(value, 2, EquineConfig::GERMANY_MAX_CONDUCTED_POWER_DBM, parsed)) {
       setError(status, key, "expected an integer in range");
       return FieldResult::INVALID;
     }
@@ -483,6 +483,7 @@ inline bool decodeUrlInPlace(char* value) {
       *write++ = ' ';
       read++;
     } else if (*read == '%') {
+      if (read[1] == 0 || read[2] == 0) return false;
       const int high = fromHex(read[1]);
       const int low = fromHex(read[2]);
       if (high < 0 || low < 0) return false;

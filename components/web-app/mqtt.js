@@ -125,6 +125,7 @@ export class MqttWebSocketClient extends EventTarget {
 
   #open() {
     if (!this.options) return;
+    this.buffer = new Uint8Array();
     this.#emit('status', { state: 'connecting' });
     const socket = new WebSocket(this.options.url, ['mqtt']);
     socket.binaryType = 'arraybuffer';
@@ -140,6 +141,7 @@ export class MqttWebSocketClient extends EventTarget {
     socket.onmessage = event => this.#onBytes(new Uint8Array(event.data));
     socket.onerror = () => this.#emit('error', { message: 'WebSocket transport error' });
     socket.onclose = () => {
+      this.buffer = new Uint8Array();
       clearInterval(this.keepAliveTimer);
       this.keepAliveTimer = null;
       this.#emit('status', { state: 'offline' });
@@ -203,6 +205,7 @@ export class MqttWebSocketClient extends EventTarget {
 
   disconnect() {
     this.manualClose = true;
+    this.buffer = new Uint8Array();
     clearTimeout(this.reconnectTimer);
     clearInterval(this.keepAliveTimer);
     if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(new Uint8Array([0xe0, 0x00]));

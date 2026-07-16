@@ -49,8 +49,9 @@ model.
 
 The gateway accepts only the current versioned LoRa history packet. Frames are
 routed by a public 64-bit device hash. It maintains independent
-per-tracker deduplication state, publishes point events and retained latest
-state, and ACKs only after successful packet processing.
+per-tracker deduplication state and publishes point events plus retained latest
+state. It advances deduplication and sends a radio ACK only after the archiver
+returns a durable SQLite receipt for every new point in the batch.
 
 The gateway can register up to 12 trackers. Unknown identities and unsupported
 schemas are rejected.
@@ -60,7 +61,7 @@ schemas are rejected.
 The repeater wraps no new application data and holds no tracker keys. It
 increments a six-byte mutable link header while preserving the authenticated
 secure frame byte-for-byte. Hop limits, deterministic priority jitter, duplicate
-suppression, a bounded queue and an airtime token bucket constrain flooding in
+suppression, a bounded queue and a Germany rolling-hour airtime limiter constrain flooding in
 both directions. See [repeaters](REPEATERS.md).
 
 ## MQTT and archiver
@@ -73,8 +74,9 @@ latest state and availability are retained. The stable point identifier is:
 ```
 
 The archiver deduplicates on that ID, records receptions from multiple gateways,
-and stores GNSS fix time separately from broker receive time. History responses
-are paginated and chunked over MQTT.
+and stores GNSS fix time separately from broker receive time. After commit it
+publishes a gateway-specific archive receipt at QoS 1. History responses are
+paginated and chunked over MQTT.
 
 ## Web application
 
@@ -96,7 +98,7 @@ The routing hash must never be treated as a password or encryption key.
 
 ## Persistence
 
-- Tracker: RTC history/state plus selected NVS checkpoints and configuration.
+- Tracker: unacknowledged history/state in RTC plus selected NVS checkpoints and configuration. Power-loss-safe history journalling remains a release blocker.
 - Gateway: NVS configuration and per-tracker deduplication cursors.
 - Repeater: CRC-protected NVS forwarding/radio configuration and admin credential.
 - Archiver: SQLite point and reception tables.

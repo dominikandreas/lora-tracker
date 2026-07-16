@@ -17,11 +17,14 @@ identifies its ESP32-S3, SX1262 and integrated GNSS. The current
 describes the ESP32-S3/SX1262 V3 and V4 generations. Do not flash the V2 target
 onto V3/V4: radio type and GPIO mappings differ.
 
-Choose the radio variant and antenna for the legal band at the deployment
-location. The checked-in configuration currently accepts only 863–870 MHz and
-must be treated as an EU-region build. Supporting another region requires a
-deliberate firmware validation-range change, a matching radio/antenna variant,
-and a new regional compliance review; changing only the frequency is not enough.
+Choose the 868 MHz radio variant and antenna for the deployment. Firmware
+currently accepts only the Germany band-48 profile: the complete LoRa channel
+must fit within 868.0–868.6 MHz, requested conducted power is capped at 14 dBm,
+and airtime is capped at 1% per rolling hour. See the
+[Germany radio profile](RADIO_COMPLIANCE_DE.md) for the installed ERP/EIRP
+calculation. Supporting another region requires a deliberate validation and
+limiter change, matching radio/antenna hardware and a new compliance review;
+changing only the frequency is not enough.
 
 ### Checked-in pin assignments
 

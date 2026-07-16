@@ -20,6 +20,7 @@ from .protocol import (
     decode_json,
     history_request_subscription,
     history_response_topic,
+    gateway_archive_ack_topic,
     iter_history_responses,
     make_error_response,
     parse_history_request,
@@ -82,7 +83,7 @@ class ArchiverService:
             LOG.exception("Unhandled message failure for topic %s", message.topic)
 
     def _handle_point(self, topic: str, payload: bytes) -> None:
-        device_hash = tracker_hash_from_topic(topic, "events/point")
+        device_hash = tracker_hash_from_topic(topic, "events/point", self.config.base_topic)
         if not self._tracker_allowed(device_hash):
             return
         self.points_received += 1
@@ -93,6 +94,17 @@ class ArchiverService:
             LOG.debug("Stored point %s", point["point_id"])
         else:
             LOG.debug("Ignored duplicate point %s", point["point_id"])
+        ack_topic = gateway_archive_ack_topic(
+            self.config.base_topic, point["gateway_hash"]
+        )
+        result = self.client.publish(
+            ack_topic, point["point_id"], qos=1, retain=False
+        )
+        if hasattr(result, "rc") and result.rc != 0:
+            LOG.error(
+                "Archive confirmation publish failed for %s with rc=%s",
+                point["point_id"], result.rc,
+            )
 
     def _publish_history_payload(self, topic: str, payload: dict[str, Any]) -> None:
         encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
@@ -101,7 +113,7 @@ class ArchiverService:
             LOG.error("MQTT history response publish failed with rc=%s", result.rc)
 
     def _handle_history_request(self, topic: str, payload: bytes) -> None:
-        device_hash = tracker_hash_from_topic(topic, "history/request")
+        device_hash = tracker_hash_from_topic(topic, "history/request", self.config.base_topic)
         request_id: str | None = None
         try:
             data = decode_json(payload)

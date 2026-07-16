@@ -16,11 +16,18 @@ gateway registry entry must contain the same key; zero, missing and malformed
 keys fail configuration validation. A key change requires an attended
 tracker/gateway maintenance window and creates a new cryptographic trust state.
 
-The factory radio profile is 868.0 MHz, 125 kHz bandwidth, spreading factor 10,
-coding rate 4/5, preamble 8, sync word `0x12`, and 20 dBm requested TX power.
-This is a development profile, not a declaration of legal operation. Set the
-frequency, conducted power, antenna gain and airtime policy for the applicable
-region and hardware. Tracker, gateway and repeater values must match exactly.
+The factory radio profile is 868.1 MHz, 125 kHz bandwidth, spreading factor 10,
+coding rate 4/5, preamble 8, sync word `0x12`, and 14 dBm requested conducted
+TX power. Firmware currently accepts only the Germany band-48 profile: the
+complete channel must fit within 868.0–868.6 MHz, conducted power is capped at
+14 dBm, and every transmitting role enforces at most 36 seconds per rolling
+hour. Installed ERP still depends on antenna gain and feed-line loss. See the
+[Germany radio profile](RADIO_COMPLIANCE_DE.md) before configuring hardware.
+Tracker, gateway and repeater radio values must match exactly.
+
+This policy is configuration schema 5. Upgrading from an earlier schema rejects
+the old blob and requires attended re-onboarding; values are not silently
+migrated into the Germany profile.
 `lora_relay_hop_limit` is zero to four on trackers and gateways and one to four
 on repeaters. The shipped origin limit is two.
 
@@ -61,15 +68,15 @@ The PEM broker root CA, broker host, port, credentials, namespace and registry
 are transactional runtime configuration. The read API exposes only
 `ca_certificate_set`; updates use `mqtt_ca_certificate` with a PEM value or
 `__KEEP__`. `secrets.h` can seed a per-device factory certificate. The
-plaintext-test opt-in remains build-time only, and TLS without a valid CA fails
-closed.
+plaintext-test opt-in remains build-time only. TLS without a valid CA or a
+trusted NTP-synchronized clock fails closed.
 
 ## Repeater defaults
 
 - Unique MAC-derived ID and generated 20-character administrator credential.
 - Two-hop local forwarding cap; 40 ms base delay and eight deterministic 45 ms priority slots.
 - Eight queued frames and a 120-second history duplicate cache; ACKs use five seconds.
-- 36,000 ms/hour airtime token bucket and 14 dBm requested TX power.
+- Rolling-hour 36,000 ms airtime ceiling with fail-safe cold start and 14 dBm maximum requested conducted TX power.
 - Repeating disabled until the first valid configuration is saved.
 
 The 15-second tracker ACK window is an energy/coverage tradeoff, not a universal

@@ -9,6 +9,7 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <stdarg.h>
+#include <time.h>
 #include <WebServer.h>
 #include "secrets.h"
 #include "equine_protocol.h"
@@ -80,6 +81,7 @@ char gateway_hash_text[17];
 char gateway_availability_topic[96];
 char gateway_status_topic[112];
 char gateway_command_topic[112];
+char gateway_archive_ack_topic[112];
 char gateway_response_prefix[112];
 char ota_hostname[64];
 
@@ -136,10 +138,75 @@ unsigned long lastWiFiReconnectAttemptMs = 0;
 unsigned long lastMqttReconnectAttemptMs = 0;
 unsigned long lastGatewayStatusPublishMs = 0;
 uint64_t gateway_tx_nonce_prefix = 0;
+double gateway_airtime_tokens_ms = 0.0;
+uint32_t gateway_airtime_refill_ms = 0;
+uint32_t gateway_airtime_deferrals = 0;
+bool ntp_sync_started = false;
 wl_status_t lastWiFiStatus = WL_IDLE_STATUS;
 
 constexpr uint32_t GATEWAY_STATUS_INTERVAL_MS = 60000;
 constexpr size_t MQTT_COMMAND_PAYLOAD_SIZE = 512;
+constexpr size_t MAX_PENDING_ARCHIVE_ACKS = 80;
+constexpr size_t POINT_ID_SIZE = 64;
+constexpr uint32_t ARCHIVE_ACK_TIMEOUT_MS = 5000;
+char pending_archive_point_ids[MAX_PENDING_ARCHIVE_ACKS][POINT_ID_SIZE]{};
+bool pending_archive_confirmed[MAX_PENDING_ARCHIVE_ACKS]{};
+size_t pending_archive_count = 0;
+
+void resetPendingArchiveConfirmations() {
+  pending_archive_count = 0;
+  memset(pending_archive_point_ids, 0, sizeof(pending_archive_point_ids));
+  memset(pending_archive_confirmed, 0, sizeof(pending_archive_confirmed));
+}
+
+bool addPendingArchiveConfirmation(const char* point_id) {
+  if (!point_id || pending_archive_count >= MAX_PENDING_ARCHIVE_ACKS) {
+    return false;
+  }
+  strlcpy(pending_archive_point_ids[pending_archive_count], point_id,
+          POINT_ID_SIZE);
+  pending_archive_confirmed[pending_archive_count] = false;
+  pending_archive_count++;
+  return true;
+}
+
+bool allArchiveConfirmationsReceived() {
+  for (size_t index = 0; index < pending_archive_count; index++) {
+    if (!pending_archive_confirmed[index]) return false;
+  }
+  return true;
+}
+
+void refillGatewayAirtime() {
+  const uint32_t now = millis();
+  if (gateway_airtime_refill_ms == 0) {
+    gateway_airtime_refill_ms = now;
+    return;
+  }
+  const uint32_t capacity_ms = EquineRelay::maxFrameAirtimeMs(
+    gateway_config.lora.spreading_factor,
+    gateway_config.lora.bandwidth_hz,
+    gateway_config.lora.coding_rate_denominator,
+    gateway_config.lora.preamble_length);
+  gateway_airtime_tokens_ms = EquineRelay::refillRollingHourAirtimeTokens(
+    gateway_airtime_tokens_ms,
+    now - gateway_airtime_refill_ms,
+    EquineConfig::GERMANY_AIRTIME_BUDGET_MS_PER_HOUR,
+    capacity_ms);
+  gateway_airtime_refill_ms = now;
+}
+
+bool reserveGatewayAirtime(size_t packet_size, uint32_t& estimated_ms) {
+  estimated_ms = EquineRelay::estimateAirtimeMs(
+    packet_size,
+    gateway_config.lora.spreading_factor,
+    gateway_config.lora.bandwidth_hz,
+    gateway_config.lora.coding_rate_denominator,
+    gateway_config.lora.preamble_length);
+  refillGatewayAirtime();
+  return EquineRelay::consumeAirtimeTokens(
+    gateway_airtime_tokens_ms, estimated_ms);
+}
 
 bool isValidSha256Hex(const char* value) {
   if (!value || strlen(value) != 64) return false;
@@ -446,41 +513,45 @@ bool saveGatewayConfig(bool increment_revision = true) {
 }
 
 
-bool readGatewayProvisionedFlag(bool default_value) {
-  if (!configPrefs.begin(EquineConfig::CONFIG_NAMESPACE, true)) {
-    return default_value;
+bool readGatewayProvisionedFlag(bool& provisioned) {
+  provisioned = false;
+  if (!configPrefs.begin(EquineConfig::CONFIG_NAMESPACE, true)) return false;
+  const bool present = configPrefs.isKey(EquineConfigApi::PROVISIONED_KEY);
+  if (present) {
+    provisioned = configPrefs.getBool(EquineConfigApi::PROVISIONED_KEY, false);
   }
-  const bool result = configPrefs.getBool(
-    EquineConfigApi::PROVISIONED_KEY, default_value);
   configPrefs.end();
-  return result;
+  return present;
 }
 
-void writeGatewayProvisionedFlag(bool provisioned) {
-  if (!configPrefs.begin(EquineConfig::CONFIG_NAMESPACE, false)) return;
-  configPrefs.putBool(EquineConfigApi::PROVISIONED_KEY, provisioned);
+bool writeGatewayProvisionedFlag(bool provisioned) {
+  if (!configPrefs.begin(EquineConfig::CONFIG_NAMESPACE, false)) return false;
+  const size_t written = configPrefs.putBool(
+    EquineConfigApi::PROVISIONED_KEY, provisioned);
   configPrefs.end();
+  return written == sizeof(uint8_t);
 }
 
 bool loadGatewayConfig() {
   const char* source = "active";
-  bool created_factory = false;
   if (!readGatewayConfigBlob(
         EquineConfig::ACTIVE_CONFIG_KEY, gateway_config)) {
     source = "backup";
     if (!readGatewayConfigBlob(
           EquineConfig::BACKUP_CONFIG_KEY, gateway_config)) {
       source = "factory";
-      created_factory = true;
       makeGatewayFactoryConfig();
-      if (!saveGatewayConfig(false)) return false;
-      writeGatewayProvisionedFlag(false);
+      if (!saveGatewayConfig(false) || !writeGatewayProvisionedFlag(false)) {
+        return false;
+      }
     } else {
       writeGatewayConfigBlob(EquineConfig::ACTIVE_CONFIG_KEY, gateway_config);
     }
   }
 
-  gateway_onboarding_required = !readGatewayProvisionedFlag(!created_factory);
+  bool provisioned = false;
+  const bool has_provisioned_marker = readGatewayProvisionedFlag(provisioned);
+  gateway_onboarding_required = !has_provisioned_marker || !provisioned;
   logPrintf("Loaded gateway config from %s: schema=%u revision=%lu id=%s trackers=%u onboarding=%s.\n",
             source,
             gateway_config.header.schema_version,
@@ -541,7 +612,11 @@ bool commitGatewayConfigCandidate(
     return false;
   }
   if (mark_provisioned) {
-    writeGatewayProvisionedFlag(true);
+    if (!writeGatewayProvisionedFlag(true)) {
+      snprintf(error, error_size, "failed to persist onboarding completion");
+      gateway_onboarding_required = true;
+      return false;
+    }
     gateway_onboarding_required = false;
   }
   return true;
@@ -698,7 +773,11 @@ bool applyGatewayWebPatch(EquineConfigApi::PatchStatus& status,
   }
   if (!status.changed) {
     if (gateway_onboarding_required) {
-      writeGatewayProvisionedFlag(true);
+      if (!writeGatewayProvisionedFlag(true)) {
+        snprintf(status.error, sizeof(status.error),
+                 "failed to persist onboarding completion");
+        return false;
+      }
       gateway_onboarding_required = false;
     }
     return true;
@@ -752,6 +831,9 @@ bool initializeTrackerRegistry() {
   EquineMqttApi::formatGatewayTopic(
     gateway_response_prefix, sizeof(gateway_response_prefix),
     gateway_config.mqtt_base_topic, gateway_hash_text, "commands/response");
+  EquineMqttApi::formatGatewayTopic(
+    gateway_archive_ack_topic, sizeof(gateway_archive_ack_topic),
+    gateway_config.mqtt_base_topic, gateway_hash_text, "archive/ack");
   snprintf(ota_hostname, sizeof(ota_hostname), "lora-gateway-%s", GATEWAY_ID);
 
   for (uint8_t config_index = 0;
@@ -926,10 +1008,9 @@ void publishRegistryResponses(const char* request_id) {
 
   for (size_t i = 0; i < GATEWAY_TRACKER_COUNT; i++) {
     const TrackerRuntime& tracker = tracker_runtime[i];
-    const uint32_t last_seen_age_s =
-      (!tracker.has_been_seen || millis() < tracker.last_seen_ms)
-        ? 0
-        : (millis() - tracker.last_seen_ms) / 1000UL;
+    const uint32_t last_seen_age_s = tracker.has_been_seen
+      ? (millis() - tracker.last_seen_ms) / 1000UL
+      : 0;
     char escaped_device_id[EquineConfig::DEVICE_ID_SIZE * 2]{};
     char escaped_device_name[EquineConfig::DEVICE_NAME_SIZE * 2]{};
     escapeJsonText(tracker.config->device_id, escaped_device_id, sizeof(escaped_device_id));
@@ -964,7 +1045,20 @@ void publishRegistryResponses(const char* request_id) {
 }
 
 void mqttMessageCallback(char* topic, byte* payload_bytes, unsigned int length) {
-  if (!topic || strcmp(topic, gateway_command_topic) != 0) return;
+  if (!topic) return;
+  if (strcmp(topic, gateway_archive_ack_topic) == 0) {
+    if (!payload_bytes || length == 0 || length >= POINT_ID_SIZE) return;
+    char point_id[POINT_ID_SIZE]{};
+    memcpy(point_id, payload_bytes, length);
+    for (size_t index = 0; index < pending_archive_count; index++) {
+      if (strcmp(point_id, pending_archive_point_ids[index]) == 0) {
+        pending_archive_confirmed[index] = true;
+        break;
+      }
+    }
+    return;
+  }
+  if (strcmp(topic, gateway_command_topic) != 0) return;
   if (!payload_bytes || length == 0 || length >= MQTT_COMMAND_PAYLOAD_SIZE) {
     logPrintln("Rejected oversized or empty MQTT command.");
     return;
@@ -1036,7 +1130,13 @@ bool subscribeMqttTopics() {
               gateway_command_topic);
     return false;
   }
-  logPrintf("Subscribed to MQTT commands: %s\n", gateway_command_topic);
+  if (!client.subscribe(gateway_archive_ack_topic, 1)) {
+    logPrintf("Failed to subscribe to archive confirmation topic %s.\n",
+              gateway_archive_ack_topic);
+    return false;
+  }
+  logPrintf("Subscribed to MQTT commands and archive confirmations: %s, %s\n",
+            gateway_command_topic, gateway_archive_ack_topic);
   return true;
 }
 
@@ -1382,9 +1482,13 @@ void setupWebInterface() {
     const uint32_t now = millis();
     for (size_t i = 0; i < GATEWAY_TRACKER_COUNT; i++) {
       const TrackerRuntime& tracker = tracker_runtime[i];
+      char escaped_id[EquineConfig::DEVICE_ID_SIZE * 2]{};
+      char escaped_name[EquineConfig::DEVICE_NAME_SIZE * 2]{};
+      escapeJsonText(tracker.config->device_id, escaped_id, sizeof(escaped_id));
+      escapeJsonText(tracker.config->device_name, escaped_name, sizeof(escaped_name));
       if (i > 0) out += ',';
-      out += "{\"id\":\"" + String(tracker.config->device_id) +
-             "\",\"name\":\"" + String(tracker.config->device_name) +
+      out += "{\"id\":\"" + String(escaped_id) +
+             "\",\"name\":\"" + String(escaped_name) +
              "\",\"device_hash\":\"" + String(tracker.hash_text) +
              "\",\"state_topic\":\"" + String(tracker.state_topic) +
              "\",\"seen\":" + String(tracker.has_been_seen ? "true" : "false") +
@@ -1503,6 +1607,9 @@ void publishAutoDiscoveryForTracker(const TrackerRuntime& tracker) {
   char topic[160];
   char payload[768];
   char device_registry_id[48];
+  char escaped_device_name[EquineConfig::DEVICE_NAME_SIZE * 2]{};
+  escapeJsonText(tracker.config->device_name,
+                 escaped_device_name, sizeof(escaped_device_name));
   snprintf(device_registry_id, sizeof(device_registry_id),
            "lora_tracker_%s", tracker.hash_text);
 
@@ -1516,7 +1623,7 @@ void publishAutoDiscoveryForTracker(const TrackerRuntime& tracker) {
     "\"uniq_id\":\"%s_loc\",\"avty_t\":\"%s\","
     "\"dev\":{\"ids\":[\"%s\"],\"name\":\"%s Tracker\","
     "\"mdl\":\"LoRa Tracker\"}}",
-    tracker.config->device_name,
+    escaped_device_name,
     tracker.state_topic,
     tracker.state_topic,
     tracker.hash_text,
@@ -1534,7 +1641,7 @@ void publishAutoDiscoveryForTracker(const TrackerRuntime& tracker) {
     "\"unit_of_meas\":\"km\",\"ic\":\"mdi:horse\","
     "\"stat_cla\":\"measurement\",\"uniq_id\":\"%s_dist\","
     "\"avty_t\":\"%s\",\"dev\":{\"ids\":[\"%s\"]}}",
-    tracker.config->device_name,
+    escaped_device_name,
     tracker.state_topic,
     tracker.hash_text,
     gateway_availability_topic,
@@ -1550,7 +1657,7 @@ void publishAutoDiscoveryForTracker(const TrackerRuntime& tracker) {
     "\"unit_of_meas\":\"%%\",\"dev_cla\":\"battery\","
     "\"stat_cla\":\"measurement\",\"uniq_id\":\"%s_batt\","
     "\"avty_t\":\"%s\",\"dev\":{\"ids\":[\"%s\"]}}",
-    tracker.config->device_name,
+    escaped_device_name,
     tracker.state_topic,
     tracker.hash_text,
     gateway_availability_topic,
@@ -1566,7 +1673,7 @@ void publishAutoDiscoveryForTracker(const TrackerRuntime& tracker) {
     "\"dev_cla\":\"signal_strength\",\"stat_cla\":\"measurement\","
     "\"uniq_id\":\"%s_rssi\",\"avty_t\":\"%s\","
     "\"dev\":{\"ids\":[\"%s\"]}}",
-    tracker.config->device_name,
+    escaped_device_name,
     tracker.state_topic,
     tracker.hash_text,
     gateway_availability_topic,
@@ -1717,6 +1824,18 @@ void handleWiFiConnection() {
   WiFi.reconnect();
 }
 
+bool ensureTlsClockReady() {
+  if (!gateway_config.mqtt_tls_enabled) return true;
+  constexpr time_t MIN_VALID_TLS_TIME = 1704067200;  // 2024-01-01 UTC
+  if (time(nullptr) >= MIN_VALID_TLS_TIME) return true;
+  if (!ntp_sync_started) {
+    configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+    ntp_sync_started = true;
+    logPrintln("Waiting for NTP before certificate-validated MQTT TLS.");
+  }
+  return false;
+}
+
 void reconnectMqttIfNeeded() {
   if (WiFi.status() != WL_CONNECTED || client.connected()) {
     return;
@@ -1730,6 +1849,7 @@ void reconnectMqttIfNeeded() {
 
   lastMqttReconnectAttemptMs = now;
 
+  if (!ensureTlsClockReady()) return;
   if (gateway_config.mqtt_tls_enabled && runtime_mqtt_ca_certificate.isEmpty()) {
     logPrintln("MQTT disabled: TLS is enabled but no CA certificate is configured.");
     return;
@@ -1772,6 +1892,9 @@ void setup() {
   }
   esp_fill_random(&gateway_tx_nonce_prefix, sizeof(gateway_tx_nonce_prefix));
   if (gateway_tx_nonce_prefix == 0) gateway_tx_nonce_prefix = 1;
+  // Cold-start empty: rebooting must not restore a full regulatory burst.
+  gateway_airtime_tokens_ms = 0.0;
+  gateway_airtime_refill_ms = millis();
   initializeAdminCredential();
   initializeMqttCaCertificate();
 
@@ -2038,6 +2161,7 @@ void loop() {
     bool packet_valid = true;
     bool publish_success = true;
     bool processed_any_point = false;
+    resetPendingArchiveConfirmations();
     uint32_t current_seq = header.first_seq;
     uint32_t highest_ackable_seq = header.first_seq;
 
@@ -2133,7 +2257,11 @@ void loop() {
           return;
         }
 
-        updateDedupState(*tracker, header.boot_id, p_seq);
+        if (!addPendingArchiveConfirmation(point_id)) {
+          logPrintln("Archive confirmation set overflow; packet retained for retry.");
+          publish_success = false;
+          return;
+        }
       } else {
         logPrintf("  -> Duplicate already published [%s] boot=%lu seq=%lu\n",
                   tracker->config->device_id,
@@ -2222,6 +2350,24 @@ void loop() {
       packet_valid = false;
     }
 
+    if (packet_valid && publish_success && pending_archive_count > 0) {
+      const uint32_t deadline_ms = millis() + ARCHIVE_ACK_TIMEOUT_MS;
+      while (client.connected() && !allArchiveConfirmationsReceived() &&
+             static_cast<int32_t>(millis() - deadline_ms) < 0) {
+        client.loop();
+        delay(1);
+      }
+      if (!allArchiveConfirmationsReceived()) {
+        logPrintf(
+          "Archive confirmation timed out (%u points); ACK withheld and "
+          "tracker data retained.\n",
+          static_cast<unsigned>(pending_archive_count));
+        publish_success = false;
+      } else {
+        updateDedupState(*tracker, header.boot_id, highest_ackable_seq);
+      }
+    }
+
     if (!packet_valid || !publish_success || !processed_any_point) {
       logPrintf("ACK withheld for tracker %s (valid=%s publish=%s points=%s).\n",
                 tracker->config->device_id,
@@ -2239,7 +2385,11 @@ void loop() {
       EquineProtocol::MessageType::ACK,
       EquineProtocol::ACK_SCHEMA_VERSION,
       tracker->device_id_hash,
-      gateway_tx_nonce_prefix,
+      EquineProtocol::deriveNoncePrefix(
+        gateway_tx_nonce_prefix,
+        tracker->device_id_hash,
+        header.boot_id,
+        EquineProtocol::MessageType::ACK),
       header.boot_id,
       highest_ackable_seq);
     const EquineRelay::LinkHeaderV1 ack_link =
@@ -2263,10 +2413,26 @@ void loop() {
                 tracker->config->device_id);
       break;
     }
+    uint32_t estimated_airtime_ms = 0;
+    if (!reserveGatewayAirtime(sizeof(ack_packet), estimated_airtime_ms)) {
+      gateway_airtime_deferrals++;
+      logPrintf(
+        "ACK deferred by Germany 1%% airtime limiter for tracker %s; "
+        "the tracker will retry.\n",
+        tracker->config->device_id);
+      break;
+    }
     LoRa.beginPacket();
     LoRa.write(ack_packet, sizeof(ack_packet));
 
+    const uint32_t tx_started_ms = millis();
     const int txResult = LoRa.endPacket();
+    const uint32_t measured_airtime_ms = millis() - tx_started_ms;
+    if (measured_airtime_ms > estimated_airtime_ms) {
+      gateway_airtime_tokens_ms -= min(
+        gateway_airtime_tokens_ms,
+        static_cast<double>(measured_airtime_ms - estimated_airtime_ms));
+    }
     if (txResult) {
       logPrintf("Sent ACK [%s] boot=%lu seq=%lu\n",
                 tracker->config->device_id,
