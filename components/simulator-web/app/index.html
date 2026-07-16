@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="Deterministic browser lab for LoRa Tracker networks.">
+  <title>LoRa Tracker Network Lab</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark">LT</span><div><strong>Network Lab</strong><span>LoRa Tracker simulator</span></div></div>
+    <div class="simulation-controls" aria-label="Simulation controls">
+      <button id="play" class="primary" type="button" disabled>Run</button>
+      <button id="step" type="button" disabled>Step 60 s</button>
+      <label>Speed <select id="speed"><option value="1">1×</option><option value="60" selected>60×</option><option value="300">300×</option><option value="1800">1800×</option></select></label>
+      <button id="reset" type="button" disabled>Reset</button>
+    </div>
+    <div class="core-status" id="core-status"><span></span>Loading firmware core…</div>
+  </header>
+
+  <main>
+    <section class="map-column" aria-label="Simulation map">
+      <div class="map-toolbar" aria-label="Map tools">
+        <button type="button" class="tool active" data-tool="select">Select / move</button>
+        <button type="button" class="tool" data-tool="waypoint">Waypoint</button>
+        <span class="divider"></span>
+        <button type="button" class="tool" data-tool="tracker">+ Tracker</button>
+        <button type="button" class="tool" data-tool="repeater">+ Relay</button>
+        <button type="button" class="tool" data-tool="receiver">+ Receiver</button>
+        <button type="button" class="tool" data-tool="forest">+ Forest</button>
+        <button type="button" class="tool" data-tool="tree">+ Tree</button>
+        <button type="button" class="tool" data-tool="building-small">+ Small building</button>
+        <button type="button" class="tool" data-tool="building-large">+ Large building</button>
+      </div>
+      <div class="map-wrap" id="map-wrap">
+        <canvas id="map" aria-label="Map showing trackers, repeaters, receivers, obstacles and radio traffic"></canvas>
+        <div class="map-stats">
+          <span id="clock">Day 1 · 07:00:00</span>
+          <span id="weather">—</span>
+          <span id="mqtt">MQTT —</span>
+        </div>
+        <div class="legend" aria-label="Map legend"><span class="tracker-dot">Tracker</span><span class="relay-dot">Relay</span><span class="receiver-dot">Receiver</span><span class="signal-line">Radio / ACK</span></div>
+      </div>
+      <div class="timeline-header"><strong>Event timeline</strong><div><button id="clear-log" type="button">Clear view</button><label><input id="follow-log" type="checkbox" checked> Follow</label></div></div>
+      <div id="events" class="events" role="log" aria-live="polite"></div>
+    </section>
+
+    <aside class="inspector">
+      <section>
+        <div class="section-heading"><div><span class="eyebrow">Scenario</span><h1 id="scenario-name">Forest edge relay</h1></div><button id="export" type="button">Export</button></div>
+        <div class="file-row"><label class="file-button">Import scenario<input id="import" type="file" accept="application/json"></label><label class="file-button">Map background<input id="background" type="file" accept="image/*"></label></div>
+      </section>
+
+      <section>
+        <div class="section-heading"><h2>Environment</h2><span id="daylight-label">Day</span></div>
+        <div class="form-grid">
+          <label>Day °C<input id="day-temp" type="number" min="-30" max="60" step="1"></label>
+          <label>Night °C<input id="night-temp" type="number" min="-30" max="60" step="1"></label>
+          <label>Day humidity %<input id="day-humidity" type="number" min="0" max="100"></label>
+          <label>Night humidity %<input id="night-humidity" type="number" min="0" max="100"></label>
+          <label>Foliage wetness<input id="wetness" type="range" min="0" max="1" step="0.05"></label>
+          <label class="switch"><input id="mqtt-online" type="checkbox"><span>MQTT online</span></label>
+          <label>Broker latency ms<input id="mqtt-latency" type="number" min="0" max="60000"></label>
+          <label>Archive latency ms<input id="archive-latency" type="number" min="0" max="60000"></label>
+        </div>
+        <p class="hint">Humidity mainly changes wet-foliage loss. Direct 868 MHz atmospheric loss remains tiny and is shown separately in link details.</p>
+      </section>
+
+      <section class="selection-section">
+        <div class="section-heading"><div><span class="eyebrow">Selection</span><h2 id="selection-title">Nothing selected</h2></div><span id="selection-status"></span></div>
+        <div id="selection-empty" class="empty-state">Select a device or obstacle on the map. Drag devices to compare links.</div>
+        <form id="device-form" hidden></form>
+        <div id="link-detail" class="link-detail" hidden></div>
+      </section>
+    </aside>
+  </main>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

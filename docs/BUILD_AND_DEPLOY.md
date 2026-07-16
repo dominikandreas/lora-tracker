@@ -4,7 +4,8 @@
 
 - PlatformIO Core for embedded builds
 - Python 3.11+ for the archiver and system simulator
-- Node.js 20+ for browser unit tests
+- Node.js 20+ for browser tests
+- Emscripten and GNU Make for the WebAssembly Network Lab
 - A private MQTT broker with TLS TCP and WebSocket listeners
 
 ## Secrets
@@ -96,6 +97,24 @@ python3 -m http.server 8080
 
 The app persists broker URL, namespace and username but not the password.
 
+## Browser Network Lab
+
+```bash
+cd components/simulator-web
+make wasm
+npm ci
+npm test
+npx playwright install --with-deps chromium
+npm run test:browser
+python3 -m http.server 8080 -d app
+```
+
+`make wasm` compiles `components/firmware-core` with Emscripten. Do not serve the
+source directory without first producing `app/firmware-core.wasm`; the release
+application fails closed rather than substituting JavaScript policy logic.
+GitHub Pages builds this file from source and publishes the lab below
+`/simulator/`.
+
 ## Validation
 
 ```bash
@@ -106,6 +125,11 @@ python -m lora_tracker_archiver.simulator \
 
 cd ../web-app
 npm test
+
+cd ../simulator-web
+make wasm
+npm ci && npm test
+npm run test:browser
 ```
 
 Run all five PlatformIO targets above. Before any field trial, also exercise a
@@ -130,8 +154,10 @@ Use `lora-tracker.code-workspace` to open all PlatformIO projects in VS Code.
 
 ## Automated builds and releases
 
-`.github/workflows/ci.yml` tests Python and browser code and compiles every
-firmware target on pushes and pull requests. `.github/workflows/release.yml`
+`.github/workflows/ci.yml` tests Python and both browser applications,
+compiles the shared core to WASM, runs native/WASM parity plus headless Chromium,
+uploads the static Network Lab artifact and compiles every firmware target on
+pushes and pull requests. `.github/workflows/release.yml`
 runs the same gates for `v*` tags, checks that the tag matches `VERSION`, builds
 secret-free generic firmware, creates merged ESP Web Tools images, publishes
 checksums/ELF files/manifests, and generates build-provenance attestations.

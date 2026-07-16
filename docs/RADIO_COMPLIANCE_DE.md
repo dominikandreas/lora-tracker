@@ -42,6 +42,11 @@ The repeater exposes a lower configurable airtime budget, but never accepts a
 value above 36,000 ms/hour or below the airtime required for one maximum-size
 frame at the selected radio profile.
 
+The browser Network Lab runs the same validation and time-on-air code from
+WebAssembly. It also rejects a modeled installed system above 14 dBm ERP after
+antenna gain and cable loss. This is a configuration pre-check only: modeled
+values do not measure actual conducted power, antenna gain or installed ERP.
+
 ## ERP, EIRP and antenna selection
 
 The allocation states **25 mW ERP**, not conducted radio power. This is

@@ -127,6 +127,56 @@ void testRelayLink() {
   assert(capacity + (36000 - capacity) == 36000);
 }
 
+void testPortableCore() {
+  using namespace LoraTrackerCore;
+  const RadioConfig radio{868100000UL, 125000UL, 14, 10, 5, 8};
+  assert(validateGermanyRadio(radio));
+  assert(estimateAirtimeMs(255, radio) == EquineRelay::estimateAirtimeMs(
+    255, 10, 125000, 5, 8));
+  assert(estimateAirtimeMs(64, radio, false) == EquineRelay::estimateAirtimeMs(
+    64, 10, 125000, 5, 8, false));
+  EquineRelay::FrameIdentityV1 relay_identity{};
+  relay_identity.device_id_hash = 0x1122334455667788ULL;
+  relay_identity.boot_id = 9;
+  relay_identity.counter = 77;
+  relay_identity.message_type = 1;
+  relay_identity.schema_version = 2;
+  assert(forwardingDelayMs(
+    relay_identity.device_id_hash, relay_identity.boot_id,
+    relay_identity.counter, relay_identity.message_type,
+    relay_identity.schema_version, 0x8877665544332211ULL, 40, 8, 45) ==
+    EquineRelay::forwardingDelayMs(
+      relay_identity, 0x8877665544332211ULL, 40, 8, 45));
+  assert(receiverSensitivityDbm(radio) < -125.0);
+  assert(ackRelayGuardMs(255, radio, 0, 2) == estimateAirtimeMs(255, radio) + 400);
+  assert(ackRelayGuardMs(255, radio, 2, 2) == 0);
+
+  TrackerPolicy policy{};
+  policy.moving_sleep_s = 60;
+  policy.stationary_sleep_s = 300;
+  policy.long_stationary_sleep_s = 600;
+  policy.no_fix_sleep_s[0] = 120;
+  policy.no_fix_sleep_s[1] = 300;
+  policy.no_fix_sleep_s[2] = 600;
+  policy.no_fix_sleep_s[3] = 900;
+  policy.stationary_fixes_for_long_sleep = 3;
+  policy.stationary_fixes_for_max_sleep = 12;
+  policy.tx_interval_s = 300;
+  policy.tx_min_points = 3;
+  policy.retry_backoff_s[0] = 60;
+  policy.retry_backoff_s[1] = 120;
+  policy.retry_backoff_s[2] = 300;
+  policy.retry_backoff_s[3] = 600;
+  assert(trackerSleepSeconds(policy, true, true, 0, 0) == 60);
+  assert(trackerSleepSeconds(policy, true, false, 3, 0) == 300);
+  assert(trackerSleepSeconds(policy, true, false, 12, 0) == 600);
+  assert(trackerSleepSeconds(policy, false, false, 0, 4) == 900);
+  assert(trackerRetryBackoffSeconds(policy, 3) == 300);
+  assert(trackerBatchDue(policy, 3, 0, 100));
+  assert(trackerBatchDue(policy, 1, 300, 100));
+  assert(!trackerBatchDue(policy, 1, 299, 100));
+}
+
 void testConfiguration() {
   using namespace EquineConfig;
 
@@ -208,6 +258,7 @@ void testConfiguration() {
 int main() {
   testProtocol();
   testRelayLink();
+  testPortableCore();
   testConfiguration();
   return 0;
 }

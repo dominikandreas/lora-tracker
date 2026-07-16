@@ -1,10 +1,12 @@
 # LoRa Tracker firmware contract simulator
 
-This native host harness compiles and runs the shared C++ protocol and
-configuration headers from all three embedded components. It covers binary
-frame layout, device hashes, ULEB128 malformed input, configuration CRC and
-registry rules, plus relay parsing, hop bounds, suppression timing, ACK cache
-lifetime and LoRa time-on-air calculation.
+This native host harness compiles and runs the protocol and configuration
+headers from all three embedded components plus the portable C++ firmware core.
+It covers binary frame layout, device hashes, ULEB128 malformed input,
+configuration CRC and registry rules, relay parsing/hop/suppression/ACK cache,
+and native parity for airtime, Germany radio policy, tracker sleep/retry/batch
+policy and the relay/ACK collision guard. The same core is compiled to WASM for
+the browser Network Lab.
 
 It does not emulate ESP32 peripherals, RF propagation/collisions, power,
 storage, BLE or Wi-Fi. Those require target builds and hardware-in-the-loop

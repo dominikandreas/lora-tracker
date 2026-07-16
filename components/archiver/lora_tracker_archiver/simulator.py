@@ -86,8 +86,11 @@ def run_embedded_simulation(*, compiler: str | None = None) -> dict[str, object]
             command = [
                 *compiler_parts, "-std=c++17", "-Wall", "-Wextra", "-Werror",
                 "-I", str(harness / "include"),
+                "-I", str(repository / "components" / "firmware-core" / "include"),
                 "-I", str(repository / "components" / component),
-                str(source), "-o", str(output),
+                str(source),
+                str(repository / "components" / "firmware-core" / "src" / "lora_tracker_core.cpp"),
+                "-o", str(output),
             ]
             subprocess.run(command, check=True, capture_output=True, text=True)
             subprocess.run([str(output)], check=True, capture_output=True, text=True)

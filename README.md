@@ -25,7 +25,9 @@ and [security](https://dominikandreas.github.io/lora-tracker-docs/reference/secu
 | `components/repeater-firmware` | Keyless bounded forwarding of encrypted history and ACK frames |
 | `components/archiver` | Validated MQTT ingestion, SQLite retention and paginated history |
 | `components/web-app` | Installable MQTT-over-WebSocket monitoring PWA |
-| `components/firmware-simulator` | Native contract tests for shared embedded headers |
+| `components/firmware-core` | Portable C++ policies shared by firmware and WebAssembly |
+| `components/firmware-simulator` | Native embedded contract tests |
+| `components/simulator-web` | Interactive deterministic WASM network lab |
 
 Only the current protocol and JSON schemas are accepted. Older packet, history,
 point and request schemas are deliberately rejected.
@@ -38,6 +40,15 @@ Run the brokerless system and embedded contract simulation:
 cd components/archiver
 python -m lora_tracker_archiver.simulator \
   --trackers 2 --points 12 --service-suite --embedded-suite
+```
+
+Build and serve the interactive WASM Network Lab:
+
+```bash
+cd components/simulator-web
+make wasm
+npm ci && npm test
+python3 -m http.server 8080 -d app
 ```
 
 Build every firmware target with the pinned PlatformIO toolchain:
@@ -74,10 +85,13 @@ The complete reader-facing documentation is rendered on [GitHub Pages](https://d
 - [Protocol specifications](https://dominikandreas.github.io/lora-tracker-docs/protocols.html)
 - [Roadmap and larger refactors](https://dominikandreas.github.io/lora-tracker-docs/reference/roadmap.html)
 
-The simulator validates cross-component contracts, all three copies of the embedded
-headers, storage, MQTT callbacks and browser payload normalization. It does not
-simulate RF, GNSS, power, flash failure, real brokers or browsers. Those limits
-are listed in [simulation coverage](https://dominikandreas.github.io/lora-tracker-docs/reference/simulation-coverage.html).
+The browser [Network Lab](https://dominikandreas.github.io/lora-tracker-docs/simulator/)
+uses the production C++ policy core compiled to WebAssembly. It visualizes
+trackers, repeaters, receivers, obstacles, RF link budgets, collisions,
+day/night conditions, MQTT archival and archive-backed ACK paths. The separate
+brokerless suite continues to execute production archiver and embedded
+contracts. Both are engineering evidence rather than RF, power, infrastructure
+or regulatory qualification; see [simulation coverage](https://dominikandreas.github.io/lora-tracker-docs/reference/simulation-coverage.html).
 
 ## Default namespace
 

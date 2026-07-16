@@ -29,6 +29,8 @@
 - Fixed repeater post-failure suppression and credential retention on factory reset.
 - Hardened browser validation/rendering, reconnect framing, history pagination, local retention and service-worker updates.
 - Anchored archiver topic parsing to nested configured base topics and documented remaining power-loss queue work.
+- Added the self-contained browser Network Lab with the shared firmware policy core compiled to WASM, deterministic waypoint/environment/RF/repeater/MQTT simulation, scenario import/export and headless browser tests.
+- Added a shared relay-clear ACK guard after simulation exposed collisions between fast archive-backed ACKs and still-airborne repeater HISTORY frames.
 
 ## Initial implementation
 

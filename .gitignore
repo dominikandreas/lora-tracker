@@ -11,6 +11,9 @@ components/.pio-build/
 .pytest_cache/
 node_modules/
 dist/
+components/simulator-web/app/firmware-core.wasm
+test-results/
+playwright-report/
 
 # Editor files
 .vscode/

@@ -79,6 +79,13 @@ reverse limits. The repeater hop value is only a local maximum.
 
 ## Timing and topology
 
+The gateway waits for the received HISTORY airtime plus the default 400 ms
+relay slot window before sending an archive-backed ACK whenever another hop is
+possible. This prevents a fast MQTT/archive round trip from colliding with a
+repeater that is still forwarding the same HISTORY frame. The policy is shared
+between the firmware and WASM simulator. Custom repeater delays above that
+window require measured topology testing and a correspondingly safe ACK plan.
+
 The default tracker ACK window is 15 seconds for up to two repeater hops at the
 default SF10/125 kHz profile. Larger packets, higher spreading factors, MQTT
 processing and four-hop paths can require up to the configurable 30-second
@@ -108,7 +115,9 @@ Before field use:
 6. Repeat with the installed antennas, enclosures, power supplies, mounting
    height, weather and vegetation.
 
-The software simulator covers frame parsing, hop bounds, deterministic delay,
-suppression policy, ACK cache lifetime, time-on-air calculation and all three
-embedded header copies. It does not model propagation, capture effect, hidden
-nodes, regulatory compliance or real radio timing; those remain hardware tests.
+The browser Network Lab covers deterministic multi-hop timing, obstacle-aware
+link budgets, collisions/capture, suppression, legal airtime, MQTT outage,
+archive receipt and reverse ACK propagation while running the shared firmware
+policy as WASM. Its RF/environment parameters are engineering estimates, not
+site calibration; installed propagation, interference, ERP and real radio
+timing remain hardware tests.

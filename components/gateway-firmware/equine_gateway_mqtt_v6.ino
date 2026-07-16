@@ -2377,6 +2377,30 @@ void loop() {
       break;
     }
 
+    // A nearby repeater can start forwarding the just-received HISTORY while
+    // the archive receipt is in flight. Wait until that deterministic relay
+    // window and packet airtime have cleared before sending the ACK; otherwise
+    // a fast archive can make the ACK collide with the repeater transmission.
+    const LoraTrackerCore::RadioConfig guard_radio{
+      gateway_config.lora.frequency_hz,
+      gateway_config.lora.bandwidth_hz,
+      gateway_config.lora.tx_power_dbm,
+      gateway_config.lora.spreading_factor,
+      gateway_config.lora.coding_rate_denominator,
+      gateway_config.lora.preamble_length};
+    const uint32_t ack_relay_guard_ms = LoraTrackerCore::ackRelayGuardMs(
+      packetSize, guard_radio, link_header.hop_count, link_header.hop_limit);
+    const uint32_t receive_finished_ms = lastLoRaPacketMs;
+    while (client.connected() &&
+           millis() - receive_finished_ms < ack_relay_guard_ms) {
+      client.loop();
+      delay(1);
+    }
+    if (ack_relay_guard_ms > 0) {
+      logPrintf("Relay/ACK collision guard complete after %lu ms.\n",
+                static_cast<unsigned long>(ack_relay_guard_ms));
+    }
+
     saveDedupState(*tracker, false);
 
     AckPayload ack{};

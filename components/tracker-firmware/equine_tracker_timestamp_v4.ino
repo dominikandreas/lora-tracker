@@ -3109,6 +3109,24 @@ bool listenForGpsFix(uint32_t listen_duration_ms,
   return false;
 }
 
+LoraTrackerCore::TrackerPolicy currentTrackerPolicy() {
+  LoraTrackerCore::TrackerPolicy policy{};
+  policy.moving_sleep_s = tracker_config.moving_sleep_s;
+  policy.stationary_sleep_s = tracker_config.stationary_sleep_s;
+  policy.long_stationary_sleep_s = tracker_config.long_stationary_sleep_s;
+  for (uint8_t index = 0; index < 4; index++) {
+    policy.no_fix_sleep_s[index] = tracker_config.no_fix_sleep_s[index];
+    policy.retry_backoff_s[index] = tracker_config.lora_retry_backoff_s[index];
+  }
+  policy.stationary_fixes_for_long_sleep =
+    tracker_config.stationary_fixes_for_long_sleep;
+  policy.stationary_fixes_for_max_sleep =
+    tracker_config.stationary_fixes_for_max_sleep;
+  policy.tx_interval_s = tracker_config.lora_tx_interval_s;
+  policy.tx_min_points = tracker_config.lora_tx_min_points;
+  return policy;
+}
+
 uint32_t chooseGpsAcquisitionTimeoutMs() {
   const bool full_attempt_due =
     consecutive_no_fix_cycles == 0 ||
@@ -3129,32 +3147,21 @@ uint32_t chooseGpsAcquisitionTimeoutMs() {
 
 uint64_t chooseNextSleepDurationUs(bool fix_found, bool movement_accepted) {
   if (!fix_found) {
-    if (consecutive_no_fix_cycles < UINT8_MAX) {
-      consecutive_no_fix_cycles++;
-    }
+    if (consecutive_no_fix_cycles < UINT8_MAX) consecutive_no_fix_cycles++;
     stationary_fix_streak = 0;
     movement_evidence_streak = 0;
-
-    if (consecutive_no_fix_cycles == 1) return NO_FIX_SLEEP_1_US;
-    if (consecutive_no_fix_cycles == 2) return NO_FIX_SLEEP_2_US;
-    if (consecutive_no_fix_cycles == 3) return NO_FIX_SLEEP_3_US;
-    return NO_FIX_SLEEP_MAX_US;
+  } else {
+    consecutive_no_fix_cycles = 0;
+    if (movement_accepted) {
+      stationary_fix_streak = 0;
+    } else if (stationary_fix_streak < UINT16_MAX) {
+      stationary_fix_streak++;
+    }
   }
-
-  consecutive_no_fix_cycles = 0;
-  if (movement_accepted) {
-    stationary_fix_streak = 0;
-    return SLEEP_DURATION_US;
-  }
-
-  if (stationary_fix_streak < UINT16_MAX) stationary_fix_streak++;
-  if (stationary_fix_streak >= STATIONARY_FIXES_FOR_MAX_SLEEP) {
-    return LONG_STATIONARY_SLEEP_DURATION_US;
-  }
-  if (stationary_fix_streak >= STATIONARY_FIXES_FOR_LONG_SLEEP) {
-    return STATIONARY_SLEEP_DURATION_US;
-  }
-  return SLEEP_DURATION_US;
+  const uint32_t seconds = LoraTrackerCore::trackerSleepSeconds(
+    currentTrackerPolicy(), fix_found, movement_accepted,
+    stationary_fix_streak, consecutive_no_fix_cycles);
+  return static_cast<uint64_t>(seconds) * 1000000ULL;
 }
 
 
@@ -3167,11 +3174,8 @@ void saturatingAddSeconds(uint32_t& value, uint32_t increment) {
 }
 
 uint32_t getLoRaRetryBackoffSeconds() {
-  if (consecutive_lora_failures == 0) return 0;
-  if (consecutive_lora_failures == 1) return LORA_RETRY_BACKOFF_1_S;
-  if (consecutive_lora_failures == 2) return LORA_RETRY_BACKOFF_2_S;
-  if (consecutive_lora_failures == 3) return LORA_RETRY_BACKOFF_3_S;
-  return LORA_RETRY_BACKOFF_MAX_S;
+  return LoraTrackerCore::trackerRetryBackoffSeconds(
+    currentTrackerPolicy(), consecutive_lora_failures);
 }
 
 void recordLoRaFailure(const char* reason) {
@@ -3603,11 +3607,8 @@ void performTrackingCycle() {
   // =====================================================
   // PACK AND TRANSMIT
   // =====================================================
-  const bool lora_batch_ready =
-    history_count > 0 &&
-    (history_count >= LORA_TX_MIN_POINTS ||
-     seconds_since_last_tx >= LORA_TX_INTERVAL_S ||
-     history_count >= (HISTORY_SIZE - 16));
+  const bool lora_batch_ready = LoraTrackerCore::trackerBatchDue(
+    currentTrackerPolicy(), history_count, seconds_since_last_tx, HISTORY_SIZE);
   const uint32_t lora_retry_backoff_s = getLoRaRetryBackoffSeconds();
   const bool lora_retry_ready =
     consecutive_lora_failures == 0 ||

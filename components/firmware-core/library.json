@@ -1,0 +1,9 @@
+{
+  "name": "lora-tracker-core",
+  "version": "0.1.0",
+  "description": "Portable deterministic policies shared by LoRa Tracker firmware and simulation",
+  "build": {
+    "includeDir": "include",
+    "srcDir": "src"
+  }
+}

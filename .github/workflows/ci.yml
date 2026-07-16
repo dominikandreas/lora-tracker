@@ -50,3 +50,37 @@ jobs:
         run: |
           pio run -d components/repeater-firmware -e heltec_wifi_lora_32_v2
           pio run -d components/repeater-firmware -e heltec_wireless_tracker
+
+  simulator-web:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: components/simulator-web/package-lock.json
+      - name: Install WebAssembly compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y emscripten
+      - name: Build production firmware core for the browser
+        working-directory: components/simulator-web
+        run: make wasm
+      - name: Test deterministic engine and native/WASM parity
+        working-directory: components/simulator-web
+        run: |
+          npm ci
+          npm test
+      - name: Install headless Chromium
+        working-directory: components/simulator-web
+        run: npx playwright install --with-deps chromium
+      - name: Test the browser simulator
+        working-directory: components/simulator-web
+        run: npm run test:browser
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lora-tracker-network-lab
+          path: components/simulator-web/app/
+          if-no-files-found: error

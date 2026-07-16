@@ -50,6 +50,9 @@ hardware support or multiple public interfaces.
 - [ ] Rename the remaining historical embedded filenames and C++ namespaces as part of the shared-library refactor.
 - [ ] Fuzz LoRa, MQTT and onboarding parsers and timestamp chains.
 - [ ] Add altitude, speed, heading, HDOP, fix quality and radio metadata.
+- [x] Extract deterministic radio/tracker/relay policies into a portable C++ core and compile it to WASM for the browser Network Lab.
+- [x] Add a deterministic visual network simulator with configurable devices, waypoint movement, obstacles, environment, collisions, repeaters and an in-browser MQTT/archive service.
+- [ ] Calibrate simulator propagation, foliage/building loss, GNSS and current models from repeatable field/HIL measurements and version the resulting site profiles.
 - [x] Define and implement keyless bounded relay forwarding, hop limits,
       duplicate suppression, reverse ACK propagation and trust boundaries.
 - [ ] Qualify repeater RF topology, collision behavior, legal airtime and power

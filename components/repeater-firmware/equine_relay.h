@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "../firmware-core/include/lora_tracker_core.h"
 #include "equine_protocol.h"
 
 // Link-layer forwarding for end-to-end encrypted LoRa frames. The mutable
@@ -144,11 +145,16 @@ inline uint32_t forwardingDelayMs(
     uint16_t base_delay_ms,
     uint8_t slot_count,
     uint16_t slot_width_ms) {
-  if (slot_count == 0) return base_delay_ms;
-  const uint64_t ranked = mix64(
-    identityFingerprint(identity) ^ repeater_id_hash);
-  return static_cast<uint32_t>(base_delay_ms) +
-         static_cast<uint32_t>(ranked % slot_count) * slot_width_ms;
+  return LoraTrackerCore::forwardingDelayMs(
+    identity.device_id_hash,
+    identity.boot_id,
+    identity.counter,
+    identity.message_type,
+    identity.schema_version,
+    repeater_id_hash,
+    base_delay_ms,
+    slot_count,
+    slot_width_ms);
 }
 
 inline uint32_t duplicateCacheTtlMs(
@@ -178,29 +184,11 @@ inline uint32_t estimateAirtimeMs(
     uint8_t coding_rate_denominator,
     uint8_t preamble_symbols,
     bool crc_enabled = true) {
-  if (packet_size == 0 || packet_size > MAX_PACKET_SIZE ||
-      spreading_factor < 7 || spreading_factor > 12 ||
-      bandwidth_hz == 0 || coding_rate_denominator < 5 ||
-      coding_rate_denominator > 8) {
-    return 0;
-  }
-
-  const double symbol_s =
-    static_cast<double>(1UL << spreading_factor) / bandwidth_hz;
-  const int low_data_rate_optimize = symbol_s >= 0.016 ? 1 : 0;
-  const int numerator =
-    8 * static_cast<int>(packet_size) - 4 * spreading_factor + 28 +
-    (crc_enabled ? 16 : 0);
-  const int denominator =
-    4 * (static_cast<int>(spreading_factor) - 2 * low_data_rate_optimize);
-  const double coded_blocks = numerator > 0
-    ? ceil(static_cast<double>(numerator) / denominator)
-    : 0.0;
-  const double payload_symbols =
-    8.0 + coded_blocks * coding_rate_denominator;
-  const double total_s =
-    (static_cast<double>(preamble_symbols) + 4.25 + payload_symbols) * symbol_s;
-  return static_cast<uint32_t>(ceil(total_s * 1000.0));
+  const LoraTrackerCore::RadioConfig radio{
+    868100000UL, bandwidth_hz, 14, spreading_factor,
+    coding_rate_denominator, preamble_symbols};
+  return LoraTrackerCore::estimateAirtimeMs(
+    packet_size, radio, crc_enabled);
 }
 
 inline double refillRollingHourAirtimeTokens(
@@ -208,12 +196,8 @@ inline double refillRollingHourAirtimeTokens(
     uint64_t elapsed_ms,
     uint32_t legal_budget_ms_per_hour,
     uint32_t capacity_ms) {
-  if (capacity_ms == 0 || capacity_ms >= legal_budget_ms_per_hour) return 0.0;
-  const uint32_t refill_ms_per_hour =
-    legal_budget_ms_per_hour - capacity_ms;
-  tokens_ms += static_cast<double>(elapsed_ms) * refill_ms_per_hour /
-               3600000.0;
-  return tokens_ms > capacity_ms ? capacity_ms : tokens_ms;
+  return LoraTrackerCore::refillAirtimeTokens(
+    tokens_ms, elapsed_ms, legal_budget_ms_per_hour, capacity_ms);
 }
 
 inline uint32_t maxFrameAirtimeMs(
@@ -227,9 +211,7 @@ inline uint32_t maxFrameAirtimeMs(
 }
 
 inline bool consumeAirtimeTokens(double& tokens_ms, uint32_t airtime_ms) {
-  if (airtime_ms == 0 || tokens_ms < airtime_ms) return false;
-  tokens_ms -= airtime_ms;
-  return true;
+  return LoraTrackerCore::consumeAirtimeTokens(tokens_ms, airtime_ms);
 }
 
 }  // namespace EquineRelay
