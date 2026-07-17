@@ -11,6 +11,8 @@ hardware support or multiple public interfaces.
 - [ ] Replace the routing hash with a random public identifier and derive purpose-separated keys.
 - [ ] Add QR bootstrap, automated key rotation/revocation and a gateway-blind ciphertext design.
 - [x] Require BLE Secure Connections/MITM and an authenticated application session.
+- [x] Show temporary first-boot credentials and random per-session BLE PINs on-device instead of requiring serial access.
+- [x] Add physically bounded BLE first-claim and authenticated phone UI credential replacement.
 - [ ] Add a supported BLE onboarding client, QR bootstrap and recovery/rotation policy.
 - [ ] Replace password-only ArduinoOTA with signed images, Secure Boot v2, flash/NVS encryption and documented eFuse/key custody.
 - [x] Require an application-level archiver receipt before gateway dedup advancement and tracker ACK; retries remain idempotent across QoS-0 loss.

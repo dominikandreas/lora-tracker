@@ -26,6 +26,7 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <esp_gap_ble_api.h>
 #include <BLESecurity.h>
 #include <string>
 #include "secrets.h"
@@ -198,6 +199,7 @@ TinyGPSPlus gps;
 Preferences prefs;
 Preferences configPrefs;
 char admin_password[25]{};
+uint32_t ble_pairing_pin = 0;
 
 RTC_DATA_ATTR double total_distance_meters = 0.0;
 RTC_DATA_ATTR double last_lat = 0.0;
@@ -653,6 +655,23 @@ void initializeAdminCredential() {
   credentials.end();
 }
 
+bool replaceAdminCredential(const char* replacement) {
+  if (!replacement) return false;
+  const size_t length = strlen(replacement);
+  if (length < 12 || length >= sizeof(admin_password)) return false;
+  for (size_t index = 0; index < length; index++) {
+    const uint8_t c = static_cast<uint8_t>(replacement[index]);
+    if (c < 0x21 || c > 0x7e) return false;
+  }
+  Preferences credentials;
+  if (!credentials.begin("ltcred", false)) return false;
+  const size_t written = credentials.putString("admin", replacement);
+  credentials.end();
+  if (written != length) return false;
+  strlcpy(admin_password, replacement, sizeof(admin_password));
+  return true;
+}
+
 void clearAdminCredential() {
   Preferences credentials;
   if (credentials.begin("ltcred", false)) {
@@ -1100,6 +1119,22 @@ void processBleConfigCommand(const char* command) {
     sendBleConfigError("command_too_large", "maximum is 1535 bytes");
     return;
   }
+  if (strncmp(command, "CLAIM ", 6) == 0) {
+    if (!tracker_onboarding_required || !ble_provisioning_mode) {
+      sendBleConfigError("claim_not_allowed",
+                         "factory reset or open the physical setup window");
+      return;
+    }
+    const char* replacement = command + 6;
+    if (!replaceAdminCredential(replacement)) {
+      sendBleConfigError("invalid_credential",
+                         "use 12 to 24 printable non-space characters");
+      return;
+    }
+    ble_session_authenticated = true;
+    sendBleConfigText("{\"ok\":true,\"claimed\":true,\"authenticated\":true}");
+    return;
+  }
   if (strncmp(command, "AUTH ", 5) == 0) {
     const char* supplied = command + 5;
     const size_t supplied_length = strlen(supplied);
@@ -1250,16 +1285,31 @@ void startBleDebugWindow(uint32_t duration_ms, bool force_provisioning) {
     logPrintln("Starting bounded BLE/configuration window...");
     String ble_name = "EqTrk-" + String(TRACKER_ID);
     BLEDevice::init(ble_name.c_str());
-    const uint32_t pairing_pin =
-      100000UL + static_cast<uint32_t>(
-        EquineProtocol::deviceIdHash(admin_password) % 900000ULL);
+    if (tracker_onboarding_required) {
+      int bond_count = esp_ble_get_bond_device_num();
+      if (bond_count > 0) {
+        auto* bonds = static_cast<esp_ble_bond_dev_t*>(
+          calloc(static_cast<size_t>(bond_count), sizeof(esp_ble_bond_dev_t)));
+        if (bonds) {
+          int listed = bond_count;
+          if (esp_ble_get_bond_device_list(&listed, bonds) == ESP_OK) {
+            for (int index = 0; index < listed; index++) {
+              esp_ble_remove_bond_device(bonds[index].bd_addr);
+            }
+            logPrintf("Removed %d stale BLE bond(s) for unprovisioned setup.\n", listed);
+          }
+          free(bonds);
+        }
+      }
+    }
+    ble_pairing_pin = 100000UL + (esp_random() % 900000UL);
     BLESecurity* security = new BLESecurity();
     security->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND);
     security->setCapability(ESP_IO_CAP_OUT);
     security->setKeySize(16);
-    security->setStaticPIN(pairing_pin);
+    security->setStaticPIN(ble_pairing_pin);
     logPrintf("BLE Secure Connections pairing PIN: %06lu\n",
-              static_cast<unsigned long>(pairing_pin));
+              static_cast<unsigned long>(ble_pairing_pin));
     pServer = BLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
 
@@ -1973,6 +2023,11 @@ void runWifiSetupMode() {
             String(tracker_config.lora_ack_timeout_ms) + "'></label>";
     html += "<input type='hidden' name='reboot' value='1'>";
     html += "<button type='submit'>Validate, save and reboot</button></form>";
+    html += "<h2>Device access</h2><p>Replace the generated setup credential with one you choose. This also becomes the fallback AP password after reboot.</p>";
+    html += "<form action='/api/v1/credentials' method='POST'>";
+    html += "<label>New credential (12–24 characters)<input type='password' minlength='12' maxlength='24' name='new_password' autocomplete='new-password' required></label>";
+    html += "<label>Confirm credential<input type='password' minlength='12' maxlength='24' name='confirm_password' autocomplete='new-password' required></label>";
+    html += "<button type='submit'>Replace credential and reboot</button></form>";
     html += "<p>The complete transactional API is available at <code>GET/POST /api/v1/config</code>. POST bodies use <code>application/x-www-form-urlencoded</code> and must include <code>expected_revision</code>.</p>";
     html += "<form action='/start' method='POST'><button>Close setup and start tracking</button></form>";
     html += "<h3>Live logs</h3><pre id='logs'>Loading...</pre>";
@@ -2063,6 +2118,28 @@ void runWifiSetupMode() {
       ",\"reboot_required\":" + String(needs_reboot ? "true" : "false") + "}";
     webServer.send(200, "application/json", out);
     config_reboot_requested |= needs_reboot;
+  });
+
+  webServer.on("/api/v1/credentials", HTTP_POST, [requireWebAuthentication]() {
+    if (!requireWebAuthentication()) return;
+    wifi_client_connected = true;
+    last_web_activity_ms = millis();
+    const String replacement = webServer.arg("new_password");
+    if (replacement != webServer.arg("confirm_password")) {
+      webServer.send(400, "application/json",
+        "{\"ok\":false,\"error\":\"credential_confirmation_mismatch\"}");
+      return;
+    }
+    if (!replaceAdminCredential(replacement.c_str())) {
+      webServer.send(400, "application/json",
+        "{\"ok\":false,\"error\":\"credential_must_be_12_to_24_printable_non_space_characters\"}");
+      return;
+    }
+    webServer.send(200, "text/html",
+      "<!doctype html><meta name='viewport' content='width=device-width'>"
+      "<h1>Credential replaced</h1>"
+      "<p>The tracker is restarting. Reconnect using the new credential.</p>");
+    config_reboot_requested = true;
   });
 
   webServer.on("/api/v1/config/rollback", HTTP_POST, [requireWebAuthentication]() {
@@ -2634,12 +2711,20 @@ void renderStatusPage() {
     case 0:
       // Main Page
       if (wifi_setup_active || wifi_station_connected || wifi_ap_active) {
-        // Setup/WiFi Mode
-        snprintf(lines[0], sizeof(lines[0]), "WiFi: %s", wifi_station_connected ? "STA" : (wifi_ap_active ? "AP" : "TRY"));
-        snprintf(lines[1], sizeof(lines[1]), "%.13s", last_wifi_ip.c_str());
-        snprintf(lines[2], sizeof(lines[2]), "%.13s", wifi_ap_active ? "LoRaTracker" : "Searching...");
-        snprintf(lines[3], sizeof(lines[3]), "B:%u%% %.1fV", cached_battery_percentage, cached_battery_voltage);
-        snprintf(lines[4], sizeof(lines[4]), "1/4 -> press");
+        if (tracker_onboarding_required) {
+          snprintf(lines[0], sizeof(lines[0]), "BLE PIN %06lu",
+                   static_cast<unsigned long>(ble_pairing_pin));
+          snprintf(lines[1], sizeof(lines[1]), "AP %.10s", admin_password);
+          snprintf(lines[2], sizeof(lines[2]), "   %.10s", admin_password + 10);
+          snprintf(lines[3], sizeof(lines[3]), "%.16s", last_wifi_ip.c_str());
+          snprintf(lines[4], sizeof(lines[4]), "Configure by phone");
+        } else {
+          snprintf(lines[0], sizeof(lines[0]), "WiFi: %s", wifi_station_connected ? "STA" : (wifi_ap_active ? "AP" : "TRY"));
+          snprintf(lines[1], sizeof(lines[1]), "%.13s", last_wifi_ip.c_str());
+          snprintf(lines[2], sizeof(lines[2]), "%.13s", wifi_ap_active ? "LoRaTracker" : "Searching...");
+          snprintf(lines[3], sizeof(lines[3]), "B:%u%% %.1fV", cached_battery_percentage, cached_battery_voltage);
+          snprintf(lines[4], sizeof(lines[4]), "1/4 -> press");
+        }
       } else {
         // Tracking Mode
         snprintf(lines[0], sizeof(lines[0]), "S:%.11s", tracker_phase);

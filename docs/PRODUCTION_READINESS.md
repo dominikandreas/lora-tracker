@@ -24,6 +24,8 @@ delivery guarantees and hardware qualification and cannot be papered over.
   counters and monotonic point replay rejection.
 - Added BLE Secure Connections plus application-session authentication.
 - Added generated first-boot credentials and random per-tracker radio keys.
+- Added on-device first-boot credentials, random per-session BLE PINs, bounded BLE claiming and authenticated credential replacement.
+- Fresh tracker and gateway onboarding no longer requires an attached serial console.
 - Added RTC history metadata/bounds/CRC validation.
 - Added CI, tagged release packaging, checksums, provenance and browser-flash images.
 - Added keyless bounded repeater forwarding for encrypted history and ACKs with

@@ -12,6 +12,7 @@
 #include <time.h>
 #include <WebServer.h>
 #include <memory>
+#include <U8g2lib.h>
 #include "secrets.h"
 #include "equine_protocol.h"
 #include "equine_relay.h"
@@ -27,6 +28,7 @@ EquineConfig::GatewayConfigV1 gateway_config{};
 Preferences configPrefs;
 char admin_password[25]{};
 String runtime_mqtt_ca_certificate;
+U8G2_SSD1306_128X64_NONAME_F_SW_I2C gateway_display(U8G2_R0, 15, 4, 16);
 
 #define USER_BTN_PIN 0
 bool gateway_onboarding_required = false;
@@ -368,6 +370,23 @@ void initializeAdminCredential() {
   credentials.end();
 }
 
+
+bool replaceAdminCredential(const char* replacement) {
+  if (!replacement) return false;
+  const size_t length = strlen(replacement);
+  if (length < 12 || length >= sizeof(admin_password)) return false;
+  for (size_t index = 0; index < length; index++) {
+    const uint8_t c = static_cast<uint8_t>(replacement[index]);
+    if (c < 0x21 || c > 0x7e) return false;
+  }
+  Preferences credentials;
+  if (!credentials.begin("ltcred", false)) return false;
+  const size_t written = credentials.putString("admin", replacement);
+  credentials.end();
+  if (written != length) return false;
+  strlcpy(admin_password, replacement, sizeof(admin_password));
+  return true;
+}
 void clearAdminCredential() {
   Preferences credentials;
   if (credentials.begin("ltcred", false)) {
@@ -1380,6 +1399,11 @@ void setupWebInterface() {
       html += "MQTT root CA (PEM): <textarea name='mqtt_ca_certificate' rows='8' cols='48' placeholder='-----BEGIN CERTIFICATE----- ... -----END CERTIFICATE-----'>__KEEP__</textarea><br>";
       html += "Maximum ACK relay hops (0-4): <input type='number' min='0' max='4' name='lora_relay_hop_limit' value='" + String(gateway_config.lora.relay_hop_limit) + "'><br>";
       html += "<input type='hidden' name='reboot' value='1'><button>Validate, save and reboot</button></form>";
+      html += "<h2>Gateway access</h2><p>Replace the generated setup credential with one you choose. This also becomes the fallback AP password after reboot.</p>";
+      html += "<form action='/api/v1/credentials' method='POST'>";
+      html += "New credential (12–24 characters): <input type='password' minlength='12' maxlength='24' name='new_password' autocomplete='new-password' required><br>";
+      html += "Confirm credential: <input type='password' minlength='12' maxlength='24' name='confirm_password' autocomplete='new-password' required><br>";
+      html += "<button>Replace credential and reboot</button></form>";
     }
     html += "<p>Full registry and radio configuration uses <code>POST /api/v1/config</code>; tracker fields are named <code>tracker.0.id</code>, <code>tracker.0.name</code>, and so on.</p>";
     html += "<h2>Live logs</h2><pre id='logs'>Loading...</pre>";
@@ -1456,6 +1480,31 @@ void setupWebInterface() {
     }
     webServer.send(200, "application/json",
       "{\"ok\":true,\"reboot_required\":true}");
+    gateway_config_reboot_requested = true;
+  });
+
+  webServer.on("/api/v1/credentials", HTTP_POST, []() {
+    if (!requireWebAuthentication()) return;
+    if (!gatewayConfigWritesAllowed()) {
+      webServer.send(403, "application/json",
+        "{\"ok\":false,\"error\":\"physical_config_mode_required\"}");
+      return;
+    }
+    const String replacement = webServer.arg("new_password");
+    if (replacement != webServer.arg("confirm_password")) {
+      webServer.send(400, "application/json",
+        "{\"ok\":false,\"error\":\"credential_confirmation_mismatch\"}");
+      return;
+    }
+    if (!replaceAdminCredential(replacement.c_str())) {
+      webServer.send(400, "application/json",
+        "{\"ok\":false,\"error\":\"credential_must_be_12_to_24_printable_non_space_characters\"}");
+      return;
+    }
+    webServer.send(200, "text/html",
+      "<!doctype html><meta name='viewport' content='width=device-width'>"
+      "<h1>Credential replaced</h1>"
+      "<p>The gateway is restarting. Reconnect using the new credential.</p>");
     gateway_config_reboot_requested = true;
   });
 
@@ -1706,6 +1755,7 @@ void publishAutoDiscovery() {
 
 
 void startGatewayFallbackAp();
+void showGatewayOnboardingDisplay();
 
 void serviceGatewayConfigButton() {
   const bool pressed = digitalRead(USER_BTN_PIN) == LOW;
@@ -1767,6 +1817,7 @@ void startGatewayFallbackAp() {
     if (gateway_onboarding_required) {
       logPrintf("FIRST-BOOT ADMIN CREDENTIAL (record securely): admin / %s\n",
                 admin_password);
+      showGatewayOnboardingDisplay();
     }
   } else {
     logPrintln("Failed to start gateway fallback AP.");
@@ -2488,4 +2539,18 @@ void loop() {
   } while (false);
 
   LoRa.receive();
+}
+void showGatewayOnboardingDisplay() {
+  gateway_display.begin();
+  gateway_display.setFont(u8g2_font_7x14_tr);
+  gateway_display.clearBuffer();
+  gateway_display.drawStr(0, 12, "PHONE SETUP");
+  char first[14]{};
+  char second[14]{};
+  snprintf(first, sizeof(first), "AP %.10s", admin_password);
+  snprintf(second, sizeof(second), "   %.10s", admin_password + 10);
+  gateway_display.drawStr(0, 28, first);
+  gateway_display.drawStr(0, 42, second);
+  gateway_display.drawStr(0, 58, "Open 192.168.4.1");
+  gateway_display.sendBuffer();
 }

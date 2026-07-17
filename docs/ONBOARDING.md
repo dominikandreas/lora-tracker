@@ -24,10 +24,13 @@ The CA certificate is public; client and signing keys are not.
 
 An unprovisioned tracker derives a setup ID from the low 24 bits of its eFuse
 MAC, generates a random 256-bit LoRa AEAD key, then exposes
-`LoRaTracker-<device_id>` and BLE name `EqTrk-<device_id>`. Record the generated
-admin credential from the serial console. Connect to the AP with that password,
-then open the AP address shown on serial output. HTTP authentication uses user
-`admin` and the same password.
+`LoRaTracker-<device_id>` and BLE name `EqTrk-<device_id>`. Its display shows
+the temporary AP credential, the current BLE pairing PIN and the setup address.
+Connect a phone to the AP and open `http://192.168.4.1`, or connect over BLE
+using the displayed PIN. The generated credential no longer has to be obtained
+from a serial console or retained permanently. Replace it from **Device access**
+before mounting the tracker; the replacement becomes both the HTTP credential
+for user `admin` and the fallback AP password after reboot.
 
 Read `GET /api/v1/config`, retain its `revision`, and submit a transactional
 `POST /api/v1/config` with `expected_revision`. Configure identity, Wi-Fi, the
@@ -49,18 +52,24 @@ state. Never hold GPIO 0 while powering or resetting an ESP32-S3 because it can
 enter the ROM downloader instead of the application.
 
 BLE requires LE Secure Connections with MITM protection, then an application
-session command `AUTH <admin-password>` before any configuration or debug logs
-are exposed. The six-digit pairing PIN is shown in the attended serial log when
-the bounded BLE window opens. BLE still lacks the planned QR bootstrap,
-purpose-separated provisioning key and fleet key-rotation workflow; disable BLE
-debug after setup.
+session before any configuration or debug logs are exposed. Each bounded setup
+window generates a new random six-digit BLE pairing PIN and shows it on the
+tracker. On an unprovisioned tracker, `CLAIM <new-credential>` both replaces the
+generated credential and authenticates that BLE session. A provisioned tracker
+uses `AUTH <admin-password>`. `CLAIM` is rejected outside the physically opened
+setup/onboarding window. BLE still lacks the planned owner-key enrollment,
+purpose-separated provisioning key and fleet key-rotation workflow; disable
+BLE debug after setup.
 
 ## Gateway first boot
 
 An unprovisioned gateway derives its setup ID from its eFuse MAC and exposes
 `LoRaGateway-<gateway_id>` with an empty tracker allowlist. Authenticate as
-`admin`, configure Wi-Fi, TLS MQTT settings, the same regional LoRa settings as
-the trackers, and a registry entry for every allowed tracker. IDs must be unique
+`admin` using the temporary credential shown on its OLED. Connect a phone to
+that AP and open `http://192.168.4.1`; no serial console is needed. Configure
+Wi-Fi, TLS MQTT settings, the same regional LoRa settings as the trackers, and a
+registry entry for every allowed tracker. Replace the generated credential from
+**Gateway access** while the physical write window is open. IDs must be unique
 canonical lowercase strings.
 
 For each tracker registry entry, copy `lora_aead_key` from the tracker's
@@ -75,6 +84,9 @@ also require authentication so status, logs and device inventory are not
 available anonymously on the LAN.
 
 ## Transaction rules
+
+- Credential replacement is deliberately outside the revisioned device config;
+  it is write-only, requires current authentication, and takes effect after reboot.
 
 - Always read immediately before writing and send `expected_revision`.
 - On HTTP 409, reload, merge and retry; never blindly increment a guessed revision.

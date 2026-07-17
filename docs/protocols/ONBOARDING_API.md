@@ -104,6 +104,22 @@ The next boot enters onboarding automatically.
 
 `POST /api/v1/reboot`
 
+
+### Replace the administrator credential
+
+`POST /api/v1/credentials`
+
+```text
+new_password=<12-to-24-printable-non-space-characters>
+confirm_password=<same-value>
+```
+
+This write-only operation requires the current HTTP authentication. A gateway
+also requires its physical write window. The credential is stored separately
+from the revisioned configuration because it protects access to that
+configuration; it becomes both the HTTP Basic password and fallback AP WPA2
+password after reboot. Factory reset removes it and generates a new value.
+
 ## Tracker onboarding
 
 After factory reset, or after an explicit post-boot Wi-Fi setup gesture, the tracker provides both transports concurrently:
@@ -112,9 +128,10 @@ After factory reset, or after an explicit post-boot Wi-Fi setup gesture, the tra
 - BLE name: `EqTrk-<device_id>`
 
 An erased generic release generates a unique 20-character admin credential and
-prints it during the attended onboarding serial session. A factory may instead
-set a unique `factory_admin_password` in each device's `secrets.h`. The firmware
-refuses to start the AP or authorize HTTP with fewer than 12 characters.
+shows it on the tracker display during onboarding. A factory may instead set a
+unique `factory_admin_password` in each device's `secrets.h`. The firmware
+refuses to start the AP or authorize HTTP with fewer than 12 characters. The
+phone UI can replace it through `POST /api/v1/credentials`.
 
 The tracker also tries station mode during an explicit setup session when it is already provisioned. Timer wake-ups never expose configuration services.
 
@@ -133,6 +150,7 @@ Commands are UTF-8 text terminated by `\n`. Responses are JSON terminated by `\n
 Commands:
 
 ```text
+CLAIM <new-admin-password>
 AUTH <admin-password>
 HELLO
 GET CONFIG
@@ -142,11 +160,14 @@ FACTORY_RESET FACTORY_RESET
 REBOOT
 ```
 
-The RX characteristic requires LE Secure Connections with MITM protection. The
-pairing PIN is printed in the attended serial session when the bounded BLE
-window opens. `AUTH` is mandatory for every connection before responses or
-debug logs are exposed. The PATCH body uses the same URL-encoded fields and
-secret semantics as HTTP.
+The RX characteristic requires LE Secure Connections with MITM protection. A
+fresh random pairing PIN is generated for each bounded BLE session and shown on
+the tracker display. While `onboarding_required=true`, `CLAIM` is allowed only
+inside that physically opened provisioning window; it validates and stores the
+new credential and authenticates the current session. Otherwise `AUTH` is
+mandatory before responses or debug logs are exposed. The PATCH body uses the
+same URL-encoded fields and secret semantics as HTTP. A claim alone does not
+mark configuration complete; a successful transactional PATCH still does that.
 
 ## Gateway onboarding and write protection
 
@@ -159,8 +180,10 @@ Password: the gateway's unique onboarding password
 
 For a provisioned gateway, configuration reads remain available on the local network, but writes are locked. Holding the gateway USER button for five seconds unlocks writes for ten minutes. If Wi-Fi is unavailable, the gateway exposes its fallback AP; it remains read-only until that physical hold unless it is unprovisioned.
 
-The erased gateway generates its unique admin credential; a factory may inject
-`factory_admin_password` per device before first flash.
+The erased gateway generates its unique admin credential and displays it with
+the setup address on the Heltec V2 OLED; a factory may inject
+`factory_admin_password` per device before first flash. Replace it through the
+phone UI while the physical write window is open.
 
 ## Tracker patch fields
 
@@ -240,7 +263,9 @@ The complete candidate is validated after all fields are applied, so `tracker_co
 
 HTTP has per-device password authentication and gateway mutations additionally
 require a physical unlock. BLE uses Secure Connections/MITM and an authenticated
-application session. Remaining provisioning work includes:
+application session. A tracker may establish its first authenticated session
+with `CLAIM` only during unprovisioned physical setup. Remaining provisioning
+work includes:
 
 - a random per-device cryptographic provisioning secret distinct from the AP password;
 - purpose-separated provisioning/session keys rather than deriving pairing from the admin credential;
