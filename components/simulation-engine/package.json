@@ -1,0 +1,11 @@
+{
+  "name": "simulation-engine",
+  "version": "1.0.0",
+  "description": "Shared simulator engine for LoRa Tracker",
+  "main": "dist/simulation-engine.js",
+  "type": "module",
+  "scripts": {
+    "build": "make build",
+    "test": "node --test tests/*.test.mjs"
+  }
+}

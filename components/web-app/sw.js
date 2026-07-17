@@ -1,5 +1,11 @@
-const CACHE = "lora-tracker-web-v3";
-const ASSETS = ["./", "index.html", "styles.css", "app.js", "mqtt.js", "points.js", "storage.js", "manifest.webmanifest"];
+const CACHE = "lora-tracker-web-v5";
+const ASSETS = [
+  "./", "index.html", "styles.css", "app.js", "mqtt.js", "points.js", "storage.js", 
+  "manifest.webmanifest", "map.js", "simulator-integration.js", "alerts.js", 
+  "onboarding.js", "firmware-core.wasm", "simulator-worker.js", 
+  "default-scenario.js", "geometry.js", "simulation-engine.js",
+  "vendor/leaflet/leaflet.js", "vendor/leaflet/leaflet.css", "vendor/pmtiles/pmtiles.js"
+];
 
 self.addEventListener("install", event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(ASSETS)).then(() => self.skipWaiting()));

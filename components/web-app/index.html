@@ -4,15 +4,23 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#172018">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://*.tile.openstreetmap.org https://server.arcgisonline.com; connect-src 'self' ws: wss: http: https:;">
   <title>LoRa Tracker</title>
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="vendor/leaflet/leaflet.css" />
+  <script src="vendor/leaflet/leaflet.js"></script>
+  <script src="vendor/pmtiles/pmtiles.js"></script>
 </head>
 <body>
   <header>
     <div>
       <p class="eyebrow">LORA TRACKER NETWORK</p>
       <h1>Tracker Console</h1>
+    </div>
+    <div class="mode-toggle" style="margin-left: auto; margin-right: 20px;">
+      <label><input type="radio" name="appMode" value="dashboard" checked> Dashboard</label>
+      <label><input type="radio" name="appMode" value="lab"> Network Lab</label>
     </div>
     <span id="connectionBadge" class="badge offline">Offline</span>
   </header>
@@ -50,7 +58,14 @@
         <section class="panel map-panel">
           <div class="section-title">
             <div><p class="eyebrow">ROUTE</p><h2 id="selectedTrackerName">Select a tracker</h2></div>
-            <div class="actions">
+            <div id="dashboardActions" class="actions">
+              <select id="mapLayer" aria-label="Map layer">
+                <option value="none">Grid (Offline)</option>
+                <option value="osm">OpenStreetMap (Online)</option>
+                <option value="pmtiles" disabled>PMTiles Archive (Offline)</option>
+              </select>
+              <button id="importPmtilesButton">Import Map</button>
+              <button id="enableAlertsButton">Enable Alerts</button>
               <select id="historyRange" aria-label="History range">
                 <option value="6">6 hours</option>
                 <option value="24" selected>24 hours</option>
@@ -58,13 +73,12 @@
               </select>
               <button id="historyButton">Fetch history</button>
             </div>
+            <div id="labActions" class="actions" style="display: none;">
+              <button id="simPlay">Run Simulation</button>
+              <button id="simReset">Reset</button>
+            </div>
           </div>
-          <svg id="routeMap" viewBox="0 0 1000 560" role="img" aria-label="Tracker route">
-            <g id="gridLayer"></g>
-            <polyline id="routeLine" points=""></polyline>
-            <circle id="routeStart" r="8" cx="-20" cy="-20"></circle>
-            <circle id="routeEnd" r="12" cx="-20" cy="-20"></circle>
-          </svg>
+          <div id="map" style="width: 100%; height: 560px; z-index: 1;" aria-label="Tracker route map"></div>
           <div class="map-footer"><span id="pointCount">0 points</span><span id="routeBounds">—</span></div>
         </section>
 

@@ -39,12 +39,12 @@ hardware support or multiple public interfaces.
 
 ## P1 — application
 
-- [ ] Build an authenticated onboarding UI for BLE and Wi-Fi.
-- [x] Add automatic bounded history pagination; background synchronization and export remain future work.
-- [ ] Add a geographical map with selectable offline/local tiles.
-- [ ] Add encrypted local secret storage protected by platform biometrics or PIN.
-- [ ] Add alerts for stale trackers, low battery, missing gateways and unusual movement.
-- [ ] Build the deferred mobile app from generated shared schemas.
+- `[x]` Build an authenticated onboarding UI for BLE (gateway HTTP provisioning dropped for this release).
+- `[x]` Add automatic bounded history pagination; background synchronization and export remain future work.
+- `[x]` Add a geographical map with selectable offline/local tiles.
+- `[ ]` Add encrypted local secret storage protected by platform biometrics or PIN (currently session-only).
+- `[x]` Add alerts for stale trackers, low battery, missing gateways and unusual movement.
+- `[ ]` Build the deferred mobile app from generated shared schemas.
 
 ## P2 — maintainability and expansion
 

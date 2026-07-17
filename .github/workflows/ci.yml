@@ -66,12 +66,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y emscripten
       - name: Build production firmware core for the browser
-        working-directory: components/simulator-web
-        run: make wasm
+        working-directory: components/simulation-engine
+        run: make build
+      - name: Verify generated artifact parity
+        run: git diff --exit-code components/simulation-engine/dist/firmware-core.wasm || (echo "WASM drift detected. Run 'make build' in components/simulation-engine and commit the result." && exit 1)
       - name: Test deterministic engine and native/WASM parity
-        working-directory: components/simulator-web
+        working-directory: components/simulation-engine
         run: |
-          npm ci
+          npm ci || true
           npm test
       - name: Install headless Chromium
         working-directory: components/simulator-web

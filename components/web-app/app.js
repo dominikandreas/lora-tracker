@@ -1,8 +1,14 @@
 import { MqttWebSocketClient } from './mqtt.js';
 import { putPoint, listPoints, clearPoints } from './storage.js';
 import { normalizePoint } from './points.js';
+import { MapManager } from './map.js';
+import { SimulatorIntegration } from './simulator-integration.js';
+import { AlertsManager } from './alerts.js';
 
 const els = Object.fromEntries([...document.querySelectorAll('[id]')].map(el => [el.id, el]));
+const mapManager = new MapManager('map');
+const simulator = new SimulatorIntegration(mapManager);
+const alertsManager = new AlertsManager();
 const mqtt = new MqttWebSocketClient();
 const trackers = new Map();
 let selectedHash = null;
@@ -14,11 +20,121 @@ els.brokerUrl.value = saved.brokerUrl || '';
 els.baseTopic.value = saved.baseTopic || 'lora-tracker';
 els.username.value = saved.username || '';
 
+let appMode = saved.appMode || 'dashboard';
+document.querySelector(`input[name="appMode"][value="${appMode}"]`).checked = true;
+
+let mapLayerType = saved.mapLayerType || 'none';
+els.mapLayer.value = mapLayerType;
+
+async function loadPmtiles() {
+  try {
+    const root = await navigator.storage.getDirectory();
+    const handle = await root.getFileHandle('map.pmtiles');
+    await mapManager.setLayer('pmtiles', handle);
+    els.mapLayer.querySelector('option[value="pmtiles"]').disabled = false;
+  } catch {
+    if (mapLayerType === 'pmtiles') mapLayerType = 'none';
+    els.mapLayer.value = mapLayerType;
+    mapManager.setLayer(mapLayerType);
+  }
+}
+
+if (mapLayerType === 'pmtiles') {
+  loadPmtiles();
+} else {
+  mapManager.setLayer(mapLayerType);
+  // Still check if we have a PMTiles file available
+  navigator.storage.getDirectory().then(root => root.getFileHandle('map.pmtiles')).then(() => {
+    els.mapLayer.querySelector('option[value="pmtiles"]').disabled = false;
+  }).catch(() => {});
+}
+
+els.mapLayer.addEventListener('change', async (e) => {
+  mapLayerType = e.target.value;
+  saveSettings();
+  if (mapLayerType === 'pmtiles') {
+    await loadPmtiles();
+  } else {
+    mapManager.setLayer(mapLayerType);
+  }
+});
+
+els.importPmtilesButton.addEventListener('click', async () => {
+  try {
+    const [fileHandle] = await window.showOpenFilePicker({
+      types: [{ description: 'PMTiles Archive', accept: { 'application/octet-stream': ['.pmtiles'] } }]
+    });
+    const file = await fileHandle.getFile();
+    const root = await navigator.storage.getDirectory();
+    const draft = await root.getFileHandle('map.pmtiles', { create: true });
+    const writable = await draft.createWritable();
+    await writable.write(file);
+    await writable.close();
+    
+    els.mapLayer.querySelector('option[value="pmtiles"]').disabled = false;
+    els.mapLayer.value = 'pmtiles';
+    mapLayerType = 'pmtiles';
+    saveSettings();
+    await mapManager.setLayer('pmtiles', draft);
+  } catch (e) {
+    console.warn('Import cancelled or failed', e);
+  }
+});
+
+function updateAlertsButtonState() {
+  if (alertsManager.enabled) {
+    els.enableAlertsButton.textContent = 'Alerts Enabled';
+    els.enableAlertsButton.disabled = true;
+    alertsManager.startInterval(trackers);
+  } else {
+    els.enableAlertsButton.textContent = 'Enable Alerts';
+    els.enableAlertsButton.disabled = false;
+    alertsManager.stopInterval();
+  }
+}
+
+els.enableAlertsButton.addEventListener('click', async () => {
+  if (await alertsManager.requestPermission()) {
+    updateAlertsButtonState();
+  }
+});
+updateAlertsButtonState();
+
+function updateAppMode() {
+  if (appMode === 'lab') {
+    els.dashboardActions.style.display = 'none';
+    els.labActions.style.display = 'flex';
+    simulator.init();
+  } else {
+    els.dashboardActions.style.display = 'flex';
+    els.labActions.style.display = 'none';
+    simulator.terminate();
+  }
+}
+
+document.querySelectorAll('input[name="appMode"]').forEach(radio => {
+  radio.addEventListener('change', (e) => {
+    appMode = e.target.value;
+    saveSettings();
+    updateAppMode();
+  });
+});
+
+els.simPlay?.addEventListener('click', () => simulator.togglePlay());
+els.simReset?.addEventListener('click', () => {
+  simulator.terminate();
+  simulator.init();
+});
+
+updateAppMode();
+
 function saveSettings() {
   localStorage.setItem('lora-tracker.web.settings', JSON.stringify({
     brokerUrl: els.brokerUrl.value.trim(),
     baseTopic: els.baseTopic.value.trim() || 'lora-tracker',
     username: els.username.value.trim(),
+    appMode,
+    mapLayerType,
   }));
 }
 
@@ -48,8 +164,9 @@ function trackerFromPoint(point) {
 
 async function ingestPoint(raw) {
   const point = normalizePoint(raw);
-  trackerFromPoint(point);
+  const tracker = trackerFromPoint(point);
   await putPoint(point);
+  alertsManager.evaluateTracker(tracker, point);
   renderTrackerList();
   if (point.device_hash === selectedHash) await renderSelectedTracker();
 }
@@ -82,32 +199,15 @@ function renderTrackerList() {
     node.addEventListener('click', async () => {
       selectedHash = tracker.hash;
       renderTrackerList();
-      await renderSelectedTracker();
+      await renderSelectedTracker(true);
     });
     els.trackerList.append(node);
   }
   els.trackerCount.textContent = String(sorted.length);
 }
 
-function drawGrid() {
-  if (els.gridLayer.childElementCount) return;
-  for (let x = 100; x < 1000; x += 100) {
-    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-    line.setAttribute('x1', x); line.setAttribute('x2', x); line.setAttribute('y1', 0); line.setAttribute('y2', 560);
-    els.gridLayer.append(line);
-  }
-  for (let y = 80; y < 560; y += 80) {
-    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-    line.setAttribute('x1', 0); line.setAttribute('x2', 1000); line.setAttribute('y1', y); line.setAttribute('y2', y);
-    els.gridLayer.append(line);
-  }
-}
-
-function drawRoute(points) {
-  drawGrid();
+function drawRoute(points, fitBounds = false) {
   if (!points.length) {
-    els.routeLine.setAttribute('points', '');
-    els.routeStart.setAttribute('cx', -20); els.routeEnd.setAttribute('cx', -20);
     els.routeBounds.textContent = '—';
     return;
   }
@@ -116,20 +216,13 @@ function drawRoute(points) {
     minLat = Math.min(minLat, p.latitude); maxLat = Math.max(maxLat, p.latitude);
     minLon = Math.min(minLon, p.longitude); maxLon = Math.max(maxLon, p.longitude);
   }
-  const latSpan = Math.max(maxLat - minLat, 0.0001);
-  const lonSpan = Math.max(maxLon - minLon, 0.0001);
-  const projected = points.map(p => ({
-    x: 40 + ((p.longitude - minLon) / lonSpan) * 920,
-    y: 520 - ((p.latitude - minLat) / latSpan) * 480,
-  }));
-  els.routeLine.setAttribute('points', projected.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' '));
-  const start = projected[0], end = projected.at(-1);
-  els.routeStart.setAttribute('cx', start.x); els.routeStart.setAttribute('cy', start.y);
-  els.routeEnd.setAttribute('cx', end.x); els.routeEnd.setAttribute('cy', end.y);
+  const bounds = mapManager.drawRoute(selectedHash, points);
+  if (fitBounds) mapManager.fitBounds(bounds);
+  mapManager.updateTracker(selectedHash, points.at(-1), trackers.get(selectedHash)?.name || selectedHash);
   els.routeBounds.textContent = `${minLat.toFixed(5)}, ${minLon.toFixed(5)} → ${maxLat.toFixed(5)}, ${maxLon.toFixed(5)}`;
 }
 
-async function renderSelectedTracker() {
+async function renderSelectedTracker(fitBounds = false) {
   const tracker = trackers.get(selectedHash);
   if (!tracker) return;
   const latest = tracker.latest;
@@ -144,7 +237,7 @@ async function renderSelectedTracker() {
 
   const hours = Number(els.historyRange.value || 24);
   const points = await listPoints(selectedHash, Date.now() - hours * 3600_000, Date.now() + 3600_000);
-  drawRoute(points);
+  drawRoute(points, fitBounds);
   els.pointCount.textContent = `${points.length} point${points.length === 1 ? '' : 's'}`;
   els.eventTable.innerHTML = '';
   for (const point of points.slice(-30).reverse()) {
@@ -276,7 +369,7 @@ els.historyButton.addEventListener('click', () => {
   });
 });
 
-els.historyRange.addEventListener('change', renderSelectedTracker);
+els.historyRange.addEventListener('change', () => renderSelectedTracker(true));
 els.clearLocalButton.addEventListener('click', async () => {
   if (!selectedHash) return;
   await clearPoints(selectedHash);
@@ -288,4 +381,3 @@ els.clearLocalButton.addEventListener('click', async () => {
 setInterval(() => { renderTrackerList(); if (selectedHash) renderSelectedTracker(); }, 30_000);
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(console.warn);
 setConnectionState('offline', 'Not connected.');
-drawGrid();

@@ -35,3 +35,8 @@ end-to-end encryption step is implemented.
 - No end-to-end encryption yet
 - No geographical base map; the route is plotted in local coordinates
 - History pagination beyond the first 500 points is not automated yet
+## Notifications
+
+The alerts implemented in this PWA (staleness, battery hysteresis, unusual movement) run via a \setInterval\ loop while the application is open. These are **open-PWA notifications**. They require the browser tab to be active or running in the background. 
+
+True **closed-app push notifications** require server-side integration with Web Push (VAPID) and a Service Worker push event listener. This is not currently implemented in this offline-first release.

@@ -4,7 +4,15 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test tests/*.test.mjs",
+    "build": "make -C ../simulation-engine build && cp -r ../simulation-engine/dist/* ./ && mkdir -p vendor/leaflet vendor/pmtiles && cp node_modules/leaflet/dist/leaflet.js vendor/leaflet/ && cp node_modules/leaflet/dist/leaflet.css vendor/leaflet/ && cp -r node_modules/leaflet/dist/images vendor/leaflet/ && cp node_modules/pmtiles/dist/pmtiles.js vendor/pmtiles/",
+    "test": "node --test tests/*.test.mjs && playwright test",
     "serve": "python3 -m http.server 8080"
+  },
+  "dependencies": {
+    "leaflet": "^1.9.4",
+    "pmtiles": "^4.4.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.1"
   }
 }

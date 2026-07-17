@@ -1,0 +1,11 @@
+node_modules
+vendor
+firmware-core.js
+firmware-core.wasm
+geometry.js
+default-scenario.js
+simulation-engine.js
+simulator-worker.js
+playwright-report
+test-results
+package-lock.json
