@@ -14,7 +14,10 @@ function openDb() {
         ? request.transaction.objectStore(STORE)
         : db.createObjectStore(STORE, { keyPath: "point_id" });
       if (!store.indexNames.contains("device_time")) {
-        store.createIndex("device_time", ["device_hash", "effective_time_unix_ms"]);
+        store.createIndex("device_time", [
+          "device_hash",
+          "effective_time_unix_ms",
+        ]);
       }
       if (!store.indexNames.contains("time")) {
         store.createIndex("time", "effective_time_unix_ms");
@@ -48,9 +51,16 @@ async function prunePoints() {
   lastPruneAt = now;
   const db = await openDb();
   try {
-    await deleteOldest(db, IDBKeyRange.upperBound(now - RETENTION_MS, true), Number.MAX_SAFE_INTEGER);
+    await deleteOldest(
+      db,
+      IDBKeyRange.upperBound(now - RETENTION_MS, true),
+      Number.MAX_SAFE_INTEGER,
+    );
     const count = await new Promise((resolve, reject) => {
-      const request = db.transaction(STORE, "readonly").objectStore(STORE).count();
+      const request = db
+        .transaction(STORE, "readonly")
+        .objectStore(STORE)
+        .count();
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
     });
@@ -74,7 +84,11 @@ export async function putPoint(point) {
   prunePoints().catch(console.warn);
 }
 
-export async function listPoints(deviceHash, fromMs = 0, toMs = Number.MAX_SAFE_INTEGER) {
+export async function listPoints(
+  deviceHash,
+  fromMs = 0,
+  toMs = Number.MAX_SAFE_INTEGER,
+) {
   const db = await openDb();
   const result = await new Promise((resolve, reject) => {
     const tx = db.transaction(STORE, "readonly");
@@ -85,7 +99,10 @@ export async function listPoints(deviceHash, fromMs = 0, toMs = Number.MAX_SAFE_
     request.onerror = () => reject(request.error);
   });
   db.close();
-  return result.sort((a, b) => a.effective_time_unix_ms - b.effective_time_unix_ms || a.seq - b.seq);
+  return result.sort(
+    (a, b) =>
+      a.effective_time_unix_ms - b.effective_time_unix_ms || a.seq - b.seq,
+  );
 }
 
 export async function clearPoints(deviceHash) {
@@ -93,7 +110,10 @@ export async function clearPoints(deviceHash) {
   await new Promise((resolve, reject) => {
     const tx = db.transaction(STORE, "readwrite");
     const index = tx.objectStore(STORE).index("device_time");
-    const range = IDBKeyRange.bound([deviceHash, 0], [deviceHash, Number.MAX_SAFE_INTEGER]);
+    const range = IDBKeyRange.bound(
+      [deviceHash, 0],
+      [deviceHash, Number.MAX_SAFE_INTEGER],
+    );
     const request = index.openKeyCursor(range);
     request.onsuccess = () => {
       const cursor = request.result;

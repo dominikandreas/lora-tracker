@@ -1,108 +1,215 @@
 <!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-  <meta name="theme-color" content="#172018">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://*.tile.openstreetmap.org https://server.arcgisonline.com; connect-src 'self' ws: wss: http: https:;">
-  <title>LoRa Tracker</title>
-  <link rel="manifest" href="manifest.webmanifest">
-  <link rel="stylesheet" href="styles.css">
-  <link rel="stylesheet" href="vendor/leaflet/leaflet.css" />
-  <script src="vendor/leaflet/leaflet.js"></script>
-  <script src="vendor/pmtiles/pmtiles.js"></script>
-</head>
-<body>
-  <header>
-    <div>
-      <p class="eyebrow">LORA TRACKER NETWORK</p>
-      <h1>Tracker Console</h1>
-    </div>
-    <div class="mode-toggle" style="margin-left: auto; margin-right: 20px;">
-      <label><input type="radio" name="appMode" value="dashboard" checked> Dashboard</label>
-      <label><input type="radio" name="appMode" value="lab"> Network Lab</label>
-    </div>
-    <span id="connectionBadge" class="badge offline">Offline</span>
-  </header>
-
-  <main>
-    <section class="panel connection-panel">
-      <div class="section-title">
-        <div><p class="eyebrow">TRANSPORT</p><h2>MQTT connection</h2></div>
-        <button id="connectButton" class="primary">Connect</button>
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width,initial-scale=1,viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#172018" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://*.tile.openstreetmap.org https://server.arcgisonline.com; connect-src 'self' ws: wss: http: https:;"
+    />
+    <title>LoRa Tracker</title>
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="vendor/leaflet/leaflet.css" />
+    <script src="vendor/leaflet/leaflet.js"></script>
+    <script src="vendor/pmtiles/pmtiles.js"></script>
+  </head>
+  <body>
+    <header>
+      <div>
+        <p class="eyebrow">LORA TRACKER NETWORK</p>
+        <h1>Tracker Console</h1>
       </div>
-      <div class="form-grid">
-        <label>WebSocket URL<input id="brokerUrl" placeholder="wss://broker.example.com:8084/mqtt"></label>
-        <label>Base topic<input id="baseTopic" value="lora-tracker"></label>
-        <label>Username<input id="username" autocomplete="username"></label>
-        <label>Password<input id="password" type="password" autocomplete="current-password"></label>
+      <div class="mode-toggle" style="margin-left: auto; margin-right: 20px">
+        <label
+          ><input type="radio" name="appMode" value="dashboard" checked />
+          Dashboard</label
+        >
+        <label
+          ><input type="radio" name="appMode" value="lab" /> Network Lab</label
+        >
       </div>
-      <p class="hint">The password remains in memory only. Broker URL, topic and username are saved locally.</p>
-      <p id="connectionMessage" class="status-line">Not connected.</p>
-    </section>
+      <span id="connectionBadge" class="badge offline">Offline</span>
+    </header>
 
-    <section class="layout">
-      <aside class="panel tracker-list-panel">
-        <div class="section-title"><div><p class="eyebrow">CLIENTS</p><h2>Trackers</h2></div><span id="trackerCount">0</span></div>
-        <div id="trackerList" class="tracker-list"></div>
-      </aside>
-
-      <section class="dashboard">
-        <div class="stats-grid">
-          <article class="stat panel"><span>Last position</span><strong id="lastSeen">—</strong><small id="timeSource">No data</small></article>
-          <article class="stat panel"><span>Battery</span><strong id="battery">—</strong><small id="batteryDetail">—</small></article>
-          <article class="stat panel"><span>Distance</span><strong id="distance">—</strong><small>Daily tracker counter</small></article>
-          <article class="stat panel"><span>LoRa</span><strong id="rssi">—</strong><small id="gateway">—</small></article>
+    <main>
+      <section class="panel connection-panel">
+        <div class="section-title">
+          <div>
+            <p class="eyebrow">TRANSPORT</p>
+            <h2>MQTT connection</h2>
+          </div>
+          <button id="connectButton" class="primary">Connect</button>
         </div>
+        <div class="form-grid">
+          <label
+            >WebSocket URL<input
+              id="brokerUrl"
+              placeholder="wss://broker.example.com:8084/mqtt"
+          /></label>
+          <label>Base topic<input id="baseTopic" value="lora-tracker" /></label>
+          <label>Username<input id="username" autocomplete="username" /></label>
+          <label
+            >Password<input
+              id="password"
+              type="password"
+              autocomplete="current-password"
+          /></label>
+        </div>
+        <p class="hint">
+          The password remains in memory only. Broker URL, topic and username
+          are saved locally.
+        </p>
+        <p id="connectionMessage" class="status-line">Not connected.</p>
+      </section>
 
-        <section class="panel map-panel">
+      <section class="layout">
+        <aside class="panel tracker-list-panel">
           <div class="section-title">
-            <div><p class="eyebrow">ROUTE</p><h2 id="selectedTrackerName">Select a tracker</h2></div>
-            <div id="dashboardActions" class="actions">
-              <select id="mapLayer" aria-label="Map layer">
-                <option value="none">Grid (Offline)</option>
-                <option value="osm">OpenStreetMap (Online)</option>
-                <option value="pmtiles" disabled>PMTiles Archive (Offline)</option>
-              </select>
-              <button id="importPmtilesButton">Import Map</button>
-              <button id="enableAlertsButton">Enable Alerts</button>
-              <select id="historyRange" aria-label="History range">
-                <option value="6">6 hours</option>
-                <option value="24" selected>24 hours</option>
-                <option value="240">10 days</option>
-              </select>
-              <button id="historyButton">Fetch history</button>
+            <div>
+              <p class="eyebrow">CLIENTS</p>
+              <h2>Trackers</h2>
             </div>
-            <div id="labActions" class="actions" style="display: none;">
-              <button id="simPlay">Run Simulation</button>
-              <button id="simReset">Reset</button>
-            </div>
+            <span id="trackerCount">0</span>
           </div>
-          <div id="map" style="width: 100%; height: 560px; z-index: 1;" aria-label="Tracker route map"></div>
-          <div class="map-footer"><span id="pointCount">0 points</span><span id="routeBounds">—</span></div>
-        </section>
+          <div id="trackerList" class="tracker-list"></div>
+        </aside>
 
-        <section class="panel events-panel">
-          <div class="section-title"><div><p class="eyebrow">EVENTS</p><h2>Recent telemetry</h2></div><button id="clearLocalButton">Clear local history</button></div>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>Time</th><th>Position</th><th>Battery</th><th>RSSI</th><th>Gateway</th></tr></thead>
-              <tbody id="eventTable"></tbody>
-            </table>
+        <section class="dashboard">
+          <div class="stats-grid">
+            <article class="stat panel">
+              <span>Last position</span><strong id="lastSeen">—</strong
+              ><small id="timeSource">No data</small>
+            </article>
+            <article class="stat panel">
+              <span>Battery</span><strong id="battery">—</strong
+              ><small id="batteryDetail">—</small>
+            </article>
+            <article class="stat panel">
+              <span>Distance</span><strong id="distance">—</strong
+              ><small>Daily tracker counter</small>
+            </article>
+            <article class="stat panel">
+              <span>LoRa</span><strong id="rssi">—</strong
+              ><small id="gateway">—</small>
+            </article>
           </div>
+
+          <section class="panel map-panel">
+            <div class="section-title">
+              <div>
+                <p class="eyebrow">ROUTE</p>
+                <h2 id="selectedTrackerName">Select a tracker</h2>
+              </div>
+              <div id="dashboardActions" class="actions">
+                <select id="mapLayer" aria-label="Map layer">
+                  <option value="none">Grid (Offline)</option>
+                  <option value="osm">OpenStreetMap (Online)</option>
+                  <option value="pmtiles" disabled>
+                    PMTiles Archive (Offline)
+                  </option>
+                </select>
+                <input
+                  type="file"
+                  id="pmtilesInput"
+                  accept=".pmtiles"
+                  style="display: none"
+                />
+                <button id="importPmtilesButton">Import Map</button>
+                <button id="enableAlertsButton">Enable Alerts</button>
+                <button id="onboardingButton">Connect Tracker</button>
+                <select id="historyRange" aria-label="History range">
+                  <option value="6">6 hours</option>
+                  <option value="24" selected>24 hours</option>
+                  <option value="240">10 days</option>
+                </select>
+                <button id="historyButton">Fetch history</button>
+              </div>
+              <div id="labActions" class="actions" style="display: none">
+                <button id="simPlay">Run Simulation</button>
+                <button id="simReset">Reset</button>
+              </div>
+              <div id="onboardingPanel" style="display: none" class="panel">
+                <h3>Tracker Configuration</h3>
+                <p>Status: <span id="bleStatus">Disconnected</span></p>
+                <div id="bleControls" style="display: none">
+                  <input
+                    type="password"
+                    id="blePassword"
+                    placeholder="PIN/Password"
+                  />
+                  <button id="bleClaim">Claim</button>
+                  <button id="bleAuth">Auth</button>
+                  <button id="bleGetConfig">Get Config</button>
+                  <button id="bleRollback">Rollback</button>
+                  <button id="bleReboot">Reboot</button>
+                  <button id="bleFactoryReset">Factory Reset</button>
+                  <pre
+                    id="bleOutput"
+                    style="
+                      background: #222;
+                      padding: 5px;
+                      margin-top: 10px;
+                      max-height: 200px;
+                      overflow-y: auto;
+                    "
+                  ></pre>
+                </div>
+              </div>
+            </div>
+            <div
+              id="map"
+              style="width: 100%; height: 560px; z-index: 1"
+              aria-label="Tracker route map"
+            ></div>
+            <div class="map-footer">
+              <span id="pointCount">0 points</span
+              ><span id="routeBounds">—</span>
+            </div>
+          </section>
+
+          <section class="panel events-panel">
+            <div class="section-title">
+              <div>
+                <p class="eyebrow">EVENTS</p>
+                <h2>Recent telemetry</h2>
+              </div>
+              <button id="clearLocalButton">Clear local history</button>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Position</th>
+                    <th>Battery</th>
+                    <th>RSSI</th>
+                    <th>Gateway</th>
+                  </tr>
+                </thead>
+                <tbody id="eventTable"></tbody>
+              </table>
+            </div>
+          </section>
         </section>
       </section>
-    </section>
-  </main>
+    </main>
 
-  <template id="trackerTemplate">
-    <button class="tracker-card">
-      <span class="tracker-dot"></span>
-      <span><strong class="tracker-name"></strong><small class="tracker-hash"></small></span>
-      <span class="tracker-age"></span>
-    </button>
-  </template>
+    <template id="trackerTemplate">
+      <button class="tracker-card">
+        <span class="tracker-dot"></span>
+        <span
+          ><strong class="tracker-name"></strong
+          ><small class="tracker-hash"></small
+        ></span>
+        <span class="tracker-age"></span>
+      </button>
+    </template>
 
-  <script type="module" src="app.js"></script>
-</body>
+    <script type="module" src="app.js"></script>
+  </body>
 </html>

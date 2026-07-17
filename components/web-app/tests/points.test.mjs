@@ -36,38 +36,59 @@ test("uses a valid GNSS timestamp as the browser display time", () => {
 });
 
 test("uses received time for a consistent untimed point", () => {
-  const point = normalizePoint({
-    ...base,
-    timestamp_valid: false,
-    fix_time_unix_ms: 0,
-    time_source: "unavailable",
-    received_at_ms: 1234,
-  }, 99);
+  const point = normalizePoint(
+    {
+      ...base,
+      timestamp_valid: false,
+      fix_time_unix_ms: 0,
+      time_source: "unavailable",
+      received_at_ms: 1234,
+    },
+    99,
+  );
   assert.equal(point.effective_time_unix_ms, 1234);
   assert.equal(point.time_source, "received");
 });
 
 test("rejects incompatible schemas and malformed identity", () => {
-  assert.throws(() => normalizePoint({ api_version: 2, point_schema_version: 2 }), /Unsupported/);
-  assert.throws(() => normalizePoint({ ...base, transport_version: 1 }), /Unsupported/);
-  assert.throws(() => normalizePoint({
-    ...base,
-    timestamp_valid: true,
-    fix_time_unix_ms: 1.5,
-    time_source: "gnss",
-  }), /fix_time/);
-  assert.throws(() => normalizePoint({
-    ...base,
-    gateway_id: `<img src=x onerror=alert(1)>`,
-    timestamp_valid: false,
-    fix_time_unix_ms: 0,
-    time_source: "unavailable",
-  }), /gateway_id/);
-  assert.throws(() => normalizePoint({
-    ...base,
-    latitude: "50.1",
-    timestamp_valid: false,
-    fix_time_unix_ms: 0,
-    time_source: "unavailable",
-  }), /latitude/);
+  assert.throws(
+    () => normalizePoint({ api_version: 2, point_schema_version: 2 }),
+    /Unsupported/,
+  );
+  assert.throws(
+    () => normalizePoint({ ...base, transport_version: 1 }),
+    /Unsupported/,
+  );
+  assert.throws(
+    () =>
+      normalizePoint({
+        ...base,
+        timestamp_valid: true,
+        fix_time_unix_ms: 1.5,
+        time_source: "gnss",
+      }),
+    /fix_time/,
+  );
+  assert.throws(
+    () =>
+      normalizePoint({
+        ...base,
+        gateway_id: `<img src=x onerror=alert(1)>`,
+        timestamp_valid: false,
+        fix_time_unix_ms: 0,
+        time_source: "unavailable",
+      }),
+    /gateway_id/,
+  );
+  assert.throws(
+    () =>
+      normalizePoint({
+        ...base,
+        latitude: "50.1",
+        timestamp_valid: false,
+        fix_time_unix_ms: 0,
+        time_source: "unavailable",
+      }),
+    /latitude/,
+  );
 });

@@ -1,4 +1,4 @@
-import { geoPosition } from './geometry.js';
+import { geoPosition } from "./geometry.js";
 
 export class SimulatorIntegration {
   constructor(mapManager) {
@@ -10,22 +10,27 @@ export class SimulatorIntegration {
 
   async init() {
     if (this.worker) return;
-    const { createDefaultScenario } = await import('./default-scenario.js');
+    const { createDefaultScenario } = await import("./default-scenario.js");
     this.scenario = createDefaultScenario();
-    this.worker = new Worker(new URL('./simulator-worker.js', import.meta.url), { type: 'module' });
+    this.worker = new Worker(
+      new URL("./simulator-worker.js", import.meta.url),
+      { type: "module" },
+    );
 
     this.worker.onmessage = ({ data }) => {
-      if (data.type === 'snapshot') {
+      if (data.type === "snapshot") {
         this.handleSnapshot(data.snapshot);
-      } else if (data.type === 'ready') {
+      } else if (data.type === "ready") {
         // We do not start automatically unless user presses play
-      } else if (data.type === 'play-state') {
+      } else if (data.type === "play-state") {
         this.playing = data.playing;
-        document.getElementById('simPlay').textContent = this.playing ? 'Pause' : 'Run Simulation';
+        document.getElementById("simPlay").textContent = this.playing
+          ? "Pause"
+          : "Run Simulation";
       }
     };
-    
-    this.worker.postMessage({ type: 'init', scenario: this.scenario });
+
+    this.worker.postMessage({ type: "init", scenario: this.scenario });
   }
 
   terminate() {
@@ -39,24 +44,29 @@ export class SimulatorIntegration {
 
   togglePlay() {
     if (!this.worker) return;
-    this.worker.postMessage({ type: this.playing ? 'pause' : 'play' });
+    this.worker.postMessage({ type: this.playing ? "pause" : "play" });
   }
 
   handleSnapshot(snapshot) {
     if (!snapshot || !snapshot.devices) return;
 
     for (const device of snapshot.devices) {
-      if (device.role === 'tracker') {
+      if (device.role === "tracker") {
         const point = geoPosition(this.scenario, device);
         if (!point) continue;
-        
+
         // Update marker
-        this.mapManager.updateTracker(`sim_${device.id}`, point, `[SIM] ${device.name}`, true);
-        
+        this.mapManager.updateTracker(
+          `sim_${device.id}`,
+          point,
+          `[SIM] ${device.name}`,
+          true,
+        );
+
         // Draw waypoints/route if applicable
         if (device.waypoints && device.waypoints.length > 0) {
           const points = device.waypoints
-            .map(w => geoPosition(this.scenario, w))
+            .map((w) => geoPosition(this.scenario, w))
             .filter(Boolean);
           this.mapManager.drawRoute(`sim_route_${device.id}`, points, true);
         }
@@ -65,10 +75,10 @@ export class SimulatorIntegration {
   }
 
   addEntity(entity) {
-    this.worker.postMessage({ type: 'add-entity', entity });
+    this.worker.postMessage({ type: "add-entity", entity });
   }
 
   reset() {
-    this.worker.postMessage({ type: 'reset', scenario: this.scenario });
+    this.worker.postMessage({ type: "reset", scenario: this.scenario });
   }
 }

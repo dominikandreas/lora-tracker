@@ -6,7 +6,7 @@ export class BleTransport {
     this.tx = null;
     this.queue = [];
     this.activeCommand = null;
-    this.buffer = '';
+    this.buffer = "";
     this.disconnectHandler = this.onDisconnected.bind(this);
     this.notificationHandler = this.onNotification.bind(this);
   }
@@ -16,22 +16,37 @@ export class BleTransport {
   }
 
   async connect() {
-    if (!this.isSupported) throw new Error('Web Bluetooth is not supported in this browser (e.g., iOS Safari).');
-    
+    if (!this.isSupported)
+      throw new Error(
+        "Web Bluetooth is not supported in this browser (e.g., iOS Safari).",
+      );
+
     this.device = await this.adapter.requestDevice({
-      filters: [{ namePrefix: 'EqTrk-' }],
-      optionalServices: ['6e400001-b5a3-f393-e0a9-e50e24dcca9e']
+      filters: [{ namePrefix: "EqTrk-" }],
+      optionalServices: ["6e400001-b5a3-f393-e0a9-e50e24dcca9e"],
     });
-    
-    this.device.addEventListener('gattserverdisconnected', this.disconnectHandler);
-    
+
+    this.device.addEventListener(
+      "gattserverdisconnected",
+      this.disconnectHandler,
+    );
+
     const server = await this.device.gatt.connect();
-    const service = await server.getPrimaryService('6e400001-b5a3-f393-e0a9-e50e24dcca9e');
-    
-    this.rx = await service.getCharacteristic('6e400002-b5a3-f393-e0a9-e50e24dcca9e');
-    this.tx = await service.getCharacteristic('6e400003-b5a3-f393-e0a9-e50e24dcca9e');
-    
-    this.tx.addEventListener('characteristicvaluechanged', this.notificationHandler);
+    const service = await server.getPrimaryService(
+      "6e400001-b5a3-f393-e0a9-e50e24dcca9e",
+    );
+
+    this.rx = await service.getCharacteristic(
+      "6e400002-b5a3-f393-e0a9-e50e24dcca9e",
+    );
+    this.tx = await service.getCharacteristic(
+      "6e400003-b5a3-f393-e0a9-e50e24dcca9e",
+    );
+
+    this.tx.addEventListener(
+      "characteristicvaluechanged",
+      this.notificationHandler,
+    );
     await this.tx.startNotifications();
   }
 
@@ -44,17 +59,23 @@ export class BleTransport {
 
   onDisconnected() {
     if (this.tx) {
-      this.tx.removeEventListener('characteristicvaluechanged', this.notificationHandler);
+      this.tx.removeEventListener(
+        "characteristicvaluechanged",
+        this.notificationHandler,
+      );
     }
     if (this.device) {
-      this.device.removeEventListener('gattserverdisconnected', this.disconnectHandler);
+      this.device.removeEventListener(
+        "gattserverdisconnected",
+        this.disconnectHandler,
+      );
     }
     this.device = null;
     this.rx = null;
     this.tx = null;
-    this.buffer = '';
-    
-    const error = new Error('BLE Disconnected');
+    this.buffer = "";
+
+    const error = new Error("BLE Disconnected");
     if (this.activeCommand) {
       clearTimeout(this.activeCommand.timer);
       this.activeCommand.reject(error);
@@ -67,38 +88,41 @@ export class BleTransport {
   onNotification(event) {
     const value = new TextDecoder().decode(event.target.value);
     this.buffer += value;
-    
+
     if (this.buffer.length > 4096) {
-      this.buffer = ''; // Prevent infinite growth on malformed data
+      this.buffer = ""; // Prevent infinite growth on malformed data
       return;
     }
-    
+
     let newlineIdx;
-    while ((newlineIdx = this.buffer.indexOf('\n')) >= 0) {
+    while ((newlineIdx = this.buffer.indexOf("\n")) >= 0) {
       const line = this.buffer.slice(0, newlineIdx).trim();
       this.buffer = this.buffer.slice(newlineIdx + 1);
-      
+
       if (line.length > 0 && this.activeCommand) {
         try {
           const parsed = JSON.parse(line);
           clearTimeout(this.activeCommand.timer);
-          this.activeCommand.resolve(parsed);
+          const cmd = this.activeCommand;
+          this.activeCommand = null;
+          cmd.resolve(parsed);
         } catch (e) {
           clearTimeout(this.activeCommand.timer);
-          this.activeCommand.reject(new Error(`Invalid JSON response: ${line}`));
+          const cmd = this.activeCommand;
+          this.activeCommand = null;
+          cmd.reject(new Error(`Invalid JSON response: ${line}`));
         }
-        this.activeCommand = null;
         this.processQueue();
       } else if (line.length > 0) {
-        console.warn('Unsolicited BLE message:', line);
+        console.warn("Unsolicited BLE message:", line);
       }
     }
   }
 
   async sendCommand(cmd, timeoutMs = 5000) {
-    if (!this.rx) throw new Error('Not connected');
-    if (cmd.length > 1024) throw new Error('Command too long');
-    
+    if (!this.rx) throw new Error("Not connected");
+    if (cmd.length > 1024) throw new Error("Command too long");
+
     return new Promise((resolve, reject) => {
       this.queue.push({ cmd, resolve, reject, timeoutMs });
       if (!this.activeCommand) this.processQueue();
@@ -107,20 +131,25 @@ export class BleTransport {
 
   async processQueue() {
     if (this.activeCommand || this.queue.length === 0) return;
-    
-    this.activeCommand = this.queue.shift();
-    this.activeCommand.timer = setTimeout(() => {
-      this.activeCommand.reject(new Error('Command timeout'));
-      this.activeCommand = null;
-      this.processQueue();
-    }, this.activeCommand.timeoutMs);
-    
+
+    const cmd = this.queue.shift();
+    this.activeCommand = cmd;
+    cmd.timer = setTimeout(() => {
+      if (this.activeCommand === cmd) {
+        this.activeCommand = null;
+        cmd.reject(new Error("Command timeout"));
+        this.processQueue();
+      }
+    }, cmd.timeoutMs);
+
     try {
-      const payload = new TextEncoder().encode(this.activeCommand.cmd);
+      const payload = new TextEncoder().encode(cmd.cmd);
       let offset = 0;
       while (offset < payload.length) {
         const chunkLen = Math.min(18, payload.length - offset);
-        const chunk = new Uint8Array(chunkLen + (offset + chunkLen === payload.length ? 1 : 0));
+        const chunk = new Uint8Array(
+          chunkLen + (offset + chunkLen === payload.length ? 1 : 0),
+        );
         chunk.set(payload.subarray(offset, offset + chunkLen));
         if (offset + chunkLen === payload.length) {
           chunk[chunkLen] = 10; // '\n'
@@ -129,10 +158,12 @@ export class BleTransport {
         offset += chunkLen;
       }
     } catch (e) {
-      clearTimeout(this.activeCommand.timer);
-      this.activeCommand.reject(e);
-      this.activeCommand = null;
-      this.processQueue();
+      if (this.activeCommand === cmd) {
+        clearTimeout(cmd.timer);
+        this.activeCommand = null;
+        cmd.reject(e);
+        this.processQueue();
+      }
     }
   }
 }
@@ -159,29 +190,40 @@ export class OnboardingManager {
   }
 
   async getConfig() {
-    return this.transport.sendCommand('GET CONFIG');
+    this.lastConfig = await this.transport.sendCommand("GET CONFIG");
+    return this.lastConfig;
   }
 
   async patchConfig(expectedRevision, fields) {
-    const params = new URLSearchParams({ expected_revision: expectedRevision, ...fields }).toString();
+    const params = new URLSearchParams({
+      expected_revision: expectedRevision,
+      ...fields,
+    }).toString();
     return this.transport.sendCommand(`PATCH ${params}`);
   }
 
   async rollback() {
-    if (confirm('Are you sure you want to rollback to the previous configuration?')) {
-      return this.transport.sendCommand('ROLLBACK');
+    if (!this.lastConfig) throw new Error("Must fetch config before rollback");
+    if (
+      confirm(
+        "Are you sure you want to rollback to the previous configuration?",
+      )
+    ) {
+      return this.transport.sendCommand(`ROLLBACK ${this.lastConfig.revision}`);
     }
   }
 
   async reboot() {
-    if (confirm('Reboot the tracker?')) {
-      return this.transport.sendCommand('REBOOT');
+    if (confirm("Reboot the tracker?")) {
+      return this.transport.sendCommand("REBOOT");
     }
   }
 
   async factoryReset() {
-    if (confirm('WARNING: Factory reset will erase all configuration. Continue?')) {
-      return this.transport.sendCommand('FACTORY RESET');
+    if (
+      confirm("WARNING: Factory reset will erase all configuration. Continue?")
+    ) {
+      return this.transport.sendCommand("FACTORY_RESET FACTORY_RESET");
     }
   }
 }

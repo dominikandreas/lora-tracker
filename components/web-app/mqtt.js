@@ -5,18 +5,25 @@ function concatBytes(...arrays) {
   const size = arrays.reduce((sum, a) => sum + a.length, 0);
   const out = new Uint8Array(size);
   let offset = 0;
-  for (const a of arrays) { out.set(a, offset); offset += a.length; }
+  for (const a of arrays) {
+    out.set(a, offset);
+    offset += a.length;
+  }
   return out;
 }
 
 function utf8Field(value) {
-  const encoded = textEncoder.encode(value ?? '');
-  if (encoded.length > 65535) throw new Error('MQTT string too long');
-  return concatBytes(new Uint8Array([encoded.length >> 8, encoded.length & 0xff]), encoded);
+  const encoded = textEncoder.encode(value ?? "");
+  if (encoded.length > 65535) throw new Error("MQTT string too long");
+  return concatBytes(
+    new Uint8Array([encoded.length >> 8, encoded.length & 0xff]),
+    encoded,
+  );
 }
 
 export function encodeRemainingLength(length) {
-  if (!Number.isInteger(length) || length < 0 || length > 268435455) throw new Error('Invalid MQTT remaining length');
+  if (!Number.isInteger(length) || length < 0 || length > 268435455)
+    throw new Error("Invalid MQTT remaining length");
   const bytes = [];
   do {
     let digit = length % 128;
@@ -28,7 +35,9 @@ export function encodeRemainingLength(length) {
 }
 
 export function decodeRemainingLength(bytes, start = 1) {
-  let multiplier = 1, value = 0, offset = start;
+  let multiplier = 1,
+    value = 0,
+    offset = start;
   for (let i = 0; i < 4; i++) {
     if (offset >= bytes.length) return null;
     const digit = bytes[offset++];
@@ -36,21 +45,36 @@ export function decodeRemainingLength(bytes, start = 1) {
     if ((digit & 0x80) === 0) return { value, bytesUsed: offset - start };
     multiplier *= 128;
   }
-  throw new Error('Malformed MQTT remaining length');
+  throw new Error("Malformed MQTT remaining length");
 }
 
 function packet(typeAndFlags, body) {
-  return concatBytes(new Uint8Array([typeAndFlags]), encodeRemainingLength(body.length), body);
+  return concatBytes(
+    new Uint8Array([typeAndFlags]),
+    encodeRemainingLength(body.length),
+    body,
+  );
 }
 
-export function encodeConnect({ clientId, username = '', password = '', keepAlive = 30 }) {
+export function encodeConnect({
+  clientId,
+  username = "",
+  password = "",
+  keepAlive = 30,
+}) {
   let flags = 0x02; // clean session
   const payload = [utf8Field(clientId)];
-  if (username) { flags |= 0x80; payload.push(utf8Field(username)); }
-  if (password) { flags |= 0x40; payload.push(utf8Field(password)); }
+  if (username) {
+    flags |= 0x80;
+    payload.push(utf8Field(username));
+  }
+  if (password) {
+    flags |= 0x40;
+    payload.push(utf8Field(password));
+  }
   const variable = concatBytes(
-    utf8Field('MQTT'),
-    new Uint8Array([0x04, flags, keepAlive >> 8, keepAlive & 0xff])
+    utf8Field("MQTT"),
+    new Uint8Array([0x04, flags, keepAlive >> 8, keepAlive & 0xff]),
   );
   return packet(0x10, concatBytes(variable, ...payload));
 }
@@ -62,7 +86,8 @@ export function encodeSubscribe(packetId, topics) {
 }
 
 export function encodePublish(topic, payload, retain = false) {
-  const data = typeof payload === 'string' ? textEncoder.encode(payload) : payload;
+  const data =
+    typeof payload === "string" ? textEncoder.encode(payload) : payload;
   return packet(0x30 | (retain ? 1 : 0), concatBytes(utf8Field(topic), data));
 }
 
@@ -89,15 +114,19 @@ export function parsePackets(input) {
 
 export function decodePublish(packetData) {
   const body = packetData.body;
-  if (body.length < 2) throw new Error('Malformed MQTT PUBLISH');
+  if (body.length < 2) throw new Error("Malformed MQTT PUBLISH");
   const topicLength = (body[0] << 8) | body[1];
-  if (2 + topicLength > body.length) throw new Error('Malformed MQTT topic');
+  if (2 + topicLength > body.length) throw new Error("Malformed MQTT topic");
   const topic = textDecoder.decode(body.slice(2, 2 + topicLength));
   const qos = (packetData.flags >> 1) & 0x03;
   let offset = 2 + topicLength;
   if (qos > 0) offset += 2;
-  if (offset > body.length) throw new Error('Malformed MQTT packet id');
-  return { topic, payload: textDecoder.decode(body.slice(offset)), retain: Boolean(packetData.flags & 1) };
+  if (offset > body.length) throw new Error("Malformed MQTT packet id");
+  return {
+    topic,
+    payload: textDecoder.decode(body.slice(offset)),
+    retain: Boolean(packetData.flags & 1),
+  };
 }
 
 export class MqttWebSocketClient extends EventTarget {
@@ -121,30 +150,35 @@ export class MqttWebSocketClient extends EventTarget {
     this.#open();
   }
 
-  #emit(name, detail) { this.dispatchEvent(new CustomEvent(name, { detail })); }
+  #emit(name, detail) {
+    this.dispatchEvent(new CustomEvent(name, { detail }));
+  }
 
   #open() {
     if (!this.options) return;
     this.buffer = new Uint8Array();
-    this.#emit('status', { state: 'connecting' });
-    const socket = new WebSocket(this.options.url, ['mqtt']);
-    socket.binaryType = 'arraybuffer';
+    this.#emit("status", { state: "connecting" });
+    const socket = new WebSocket(this.options.url, ["mqtt"]);
+    socket.binaryType = "arraybuffer";
     this.socket = socket;
     socket.onopen = () => {
-      socket.send(encodeConnect({
-        clientId: this.options.clientId,
-        username: this.options.username,
-        password: this.options.password,
-        keepAlive: this.options.keepAlive,
-      }));
+      socket.send(
+        encodeConnect({
+          clientId: this.options.clientId,
+          username: this.options.username,
+          password: this.options.password,
+          keepAlive: this.options.keepAlive,
+        }),
+      );
     };
-    socket.onmessage = event => this.#onBytes(new Uint8Array(event.data));
-    socket.onerror = () => this.#emit('error', { message: 'WebSocket transport error' });
+    socket.onmessage = (event) => this.#onBytes(new Uint8Array(event.data));
+    socket.onerror = () =>
+      this.#emit("error", { message: "WebSocket transport error" });
     socket.onclose = () => {
       this.buffer = new Uint8Array();
       clearInterval(this.keepAliveTimer);
       this.keepAliveTimer = null;
-      this.#emit('status', { state: 'offline' });
+      this.#emit("status", { state: "offline" });
       if (!this.manualClose) this.#scheduleReconnect();
     };
   }
@@ -157,39 +191,56 @@ export class MqttWebSocketClient extends EventTarget {
       if (packetData.type === 2) {
         if (packetData.body.length < 2 || packetData.body[1] !== 0) {
           const code = packetData.body[1] ?? -1;
-          this.#emit('error', { message: `MQTT connection rejected (${code})` });
+          this.#emit("error", {
+            message: `MQTT connection rejected (${code})`,
+          });
           this.socket?.close();
           continue;
         }
         this.reconnectAttempt = 0;
-        this.#emit('status', { state: 'online' });
+        this.#emit("status", { state: "online" });
         this.#startKeepAlive();
-        if (this.subscriptions.size) this.#sendSubscribe([...this.subscriptions]);
+        if (this.subscriptions.size)
+          this.#sendSubscribe([...this.subscriptions]);
       } else if (packetData.type === 3) {
-        try { this.#emit('message', decodePublish(packetData)); }
-        catch (error) { this.#emit('error', { message: error.message }); }
+        try {
+          this.#emit("message", decodePublish(packetData));
+        } catch (error) {
+          this.#emit("error", { message: error.message });
+        }
       } else if (packetData.type === 9) {
-        this.#emit('subscribed', {});
+        this.#emit("subscribed", {});
       }
     }
   }
 
   #startKeepAlive() {
     clearInterval(this.keepAliveTimer);
-    this.keepAliveTimer = setInterval(() => {
-      if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(new Uint8Array([0xc0, 0x00]));
-    }, Math.max(5000, this.options.keepAlive * 500));
+    this.keepAliveTimer = setInterval(
+      () => {
+        if (this.socket?.readyState === WebSocket.OPEN)
+          this.socket.send(new Uint8Array([0xc0, 0x00]));
+      },
+      Math.max(5000, this.options.keepAlive * 500),
+    );
   }
 
   #scheduleReconnect() {
-    const delay = Math.min(30000, 1000 * 2 ** Math.min(this.reconnectAttempt++, 5));
-    this.#emit('status', { state: 'reconnecting', delay });
+    const delay = Math.min(
+      30000,
+      1000 * 2 ** Math.min(this.reconnectAttempt++, 5),
+    );
+    this.#emit("status", { state: "reconnecting", delay });
     this.reconnectTimer = setTimeout(() => this.#open(), delay);
   }
 
   subscribe(...topics) {
-    topics.flat().filter(Boolean).forEach(t => this.subscriptions.add(t));
-    if (this.socket?.readyState === WebSocket.OPEN) this.#sendSubscribe(topics.flat());
+    topics
+      .flat()
+      .filter(Boolean)
+      .forEach((t) => this.subscriptions.add(t));
+    if (this.socket?.readyState === WebSocket.OPEN)
+      this.#sendSubscribe(topics.flat());
   }
 
   #sendSubscribe(topics) {
@@ -199,7 +250,8 @@ export class MqttWebSocketClient extends EventTarget {
   }
 
   publish(topic, payload, retain = false) {
-    if (this.socket?.readyState !== WebSocket.OPEN) throw new Error('MQTT is not connected');
+    if (this.socket?.readyState !== WebSocket.OPEN)
+      throw new Error("MQTT is not connected");
     this.socket.send(encodePublish(topic, payload, retain));
   }
 
@@ -208,7 +260,8 @@ export class MqttWebSocketClient extends EventTarget {
     this.buffer = new Uint8Array();
     clearTimeout(this.reconnectTimer);
     clearInterval(this.keepAliveTimer);
-    if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(new Uint8Array([0xe0, 0x00]));
+    if (this.socket?.readyState === WebSocket.OPEN)
+      this.socket.send(new Uint8Array([0xe0, 0x00]));
     this.socket?.close();
     this.socket = null;
   }

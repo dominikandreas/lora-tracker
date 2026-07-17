@@ -3,7 +3,8 @@ export class AlertsManager {
     this.states = new Map(); // trackerHash -> { batteryState, lastSeen, alertLevel, etc }
     this.staleThresholdMs = 2 * 60 * 60 * 1000; // 2 hours
     this.missingGatewayThresholdMs = 15 * 60 * 1000; // 15 mins without a gateway update if expected
-    this.enabled = "Notification" in window && Notification.permission === "granted";
+    this.enabled =
+      "Notification" in window && Notification.permission === "granted";
     this.intervalId = null;
   }
 
@@ -49,7 +50,7 @@ export class AlertsManager {
     if (latestPoint.battery_level !== undefined) {
       const bat = latestPoint.battery_level;
       let newLevel = state.batteryState;
-      
+
       if (bat <= 5) newLevel = 5;
       else if (bat <= 10) newLevel = 10;
       else if (bat <= 20) newLevel = 20;
@@ -62,27 +63,47 @@ export class AlertsManager {
     }
 
     // Unusual Movement
-    if (state.lastPosition && latestPoint.latitude && latestPoint.longitude) {
-      const dt = (latestPoint.effective_time_unix_ms - state.lastPosition.time) / 1000;
-      if (dt > 0 && dt < 3600) { // only evaluate if time diff is reasonable
+    if (
+      state.lastPosition &&
+      latestPoint.latitude !== undefined &&
+      latestPoint.longitude !== undefined
+    ) {
+      const dt =
+        (latestPoint.effective_time_unix_ms - state.lastPosition.time) / 1000;
+      if (dt > 0 && dt < 3600) {
+        // only evaluate if time diff is reasonable
         // Simple distance using lat/lon delta approx
-        const dx = (latestPoint.longitude - state.lastPosition.lon) * 111320 * Math.cos(latestPoint.latitude * Math.PI / 180);
+        const dx =
+          (latestPoint.longitude - state.lastPosition.lon) *
+          111320 *
+          Math.cos((latestPoint.latitude * Math.PI) / 180);
         const dy = (latestPoint.latitude - state.lastPosition.lat) * 110574;
-        const dist = Math.sqrt(dx*dx + dy*dy);
+        const dist = Math.sqrt(dx * dx + dy * dy);
         const speed = dist / dt; // m/s
-        
-        if (speed > 30) { // ~108 km/h is unusually fast for a horse
-          this.notify(`Unusual movement detected for ${tracker.name} (${Math.round(speed * 3.6)} km/h).`);
+
+        if (speed > 30) {
+          // ~108 km/h is unusually fast for a horse
+          this.notify(
+            `Unusual movement detected for ${tracker.name} (${Math.round(speed * 3.6)} km/h).`,
+          );
         }
       }
     }
 
-    if (latestPoint.latitude && latestPoint.longitude) {
+    if (
+      latestPoint.latitude !== undefined &&
+      latestPoint.longitude !== undefined
+    ) {
       state.lastPosition = {
         lat: latestPoint.latitude,
         lon: latestPoint.longitude,
-        time: latestPoint.effective_time_unix_ms
+        time: latestPoint.effective_time_unix_ms,
       };
+    }
+
+    if (latestPoint.gateway_id || latestPoint.gateway_hash) {
+      state.lastGatewayTime = latestPoint.effective_time_unix_ms;
+      state.missingAlerted = false;
     }
 
     // Reset staleness if fresh
@@ -95,10 +116,22 @@ export class AlertsManager {
       if (!tracker.latest) continue;
       const state = this.getState(tracker.hash);
       const age = now - tracker.latest.effective_time_unix_ms;
-      
+
       if (age > this.staleThresholdMs && !state.staleAlerted) {
-        this.notify(`Tracker ${tracker.name} is stale (last seen > 2 hours ago).`);
+        this.notify(
+          `Tracker ${tracker.name} is stale (last seen > 2 hours ago).`,
+        );
         state.staleAlerted = true;
+      }
+
+      if (state.lastGatewayTime && !state.missingAlerted) {
+        const gwAge = now - state.lastGatewayTime;
+        if (gwAge > this.missingGatewayThresholdMs) {
+          this.notify(
+            `Tracker ${tracker.name} has not reached a gateway in > 15 mins.`,
+          );
+          state.missingAlerted = true;
+        }
       }
     }
   }
@@ -108,7 +141,7 @@ export class AlertsManager {
     if (this.enabled) {
       new Notification("LoRa Tracker Alert", {
         body: message,
-        icon: "manifest-icon-192.maskable.png"
+        icon: "manifest-icon-192.maskable.png",
       });
     }
   }

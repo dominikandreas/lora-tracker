@@ -11,7 +11,7 @@ components/.pio-build/
 .pytest_cache/
 node_modules/
 dist/
-components/simulator-web/app/firmware-core.wasm
+!components/simulation-engine/dist/
 test-results/
 playwright-report/
 
