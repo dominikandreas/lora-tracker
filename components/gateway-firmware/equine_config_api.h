@@ -458,6 +458,11 @@ inline FieldResult applyGatewayField(EquineConfig::GatewayConfigV1& config,
 #undef EQ_GW_U8
   uint8_t index=0; const char* subfield=nullptr;
   if (parseTrackerIndexKey(key,index,subfield)) {
+    if (index >= config.tracker_count) {
+      config.tracker_count = index + 1;
+      status.changed = true;
+      status.reboot_required = true;
+    }
     EquineConfig::GatewayTrackerConfigV1& tracker=config.trackers[index];
     if(strcmp(subfield,"id")==0) return assignText(tracker.device_id,value,status,key,false,true)?FieldResult::APPLIED:FieldResult::INVALID;
     if(strcmp(subfield,"name")==0) return assignText(tracker.device_name,value,status,key,false,true)?FieldResult::APPLIED:FieldResult::INVALID;
