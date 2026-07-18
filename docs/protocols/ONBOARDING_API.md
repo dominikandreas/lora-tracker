@@ -125,7 +125,7 @@ password after reboot. Factory reset removes it and generates a new value.
 After factory reset, or after an explicit post-boot Wi-Fi setup gesture, the tracker provides both transports concurrently:
 
 - Wi-Fi AP: `LoRaTracker-<device_id>`
-- BLE name: `EqTrk-<device_id>`
+- BLE name: `LT-<device_id>`
 
 An erased generic release generates a unique 20-character admin credential and
 shows it on the tracker display during onboarding. A factory may instead set a
@@ -155,6 +155,7 @@ AUTH <admin-password>
 HELLO
 GET CONFIG
 PATCH expected_revision=4&device_name=Wera&moving_sleep_s=45
+SET_CREDENTIAL <new-admin-password>
 ROLLBACK 5
 FACTORY_RESET FACTORY_RESET
 REBOOT
@@ -168,6 +169,8 @@ new credential and authenticates the current session. Otherwise `AUTH` is
 mandatory before responses or debug logs are exposed. The PATCH body uses the
 same URL-encoded fields and secret semantics as HTTP. A claim alone does not
 mark configuration complete; a successful transactional PATCH still does that.
+After authentication, `SET_CREDENTIAL` replaces the write-only administrator
+credential and reboots so the fallback AP adopts the new password.
 
 ## Gateway onboarding and write protection
 

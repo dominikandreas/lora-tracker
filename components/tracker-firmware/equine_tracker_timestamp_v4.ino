@@ -1174,6 +1174,17 @@ void processBleConfigCommand(const char* command) {
     sendBleConfigText(trackerConfigJson());
     return;
   }
+  if (strncmp(command, "SET_CREDENTIAL ", 15) == 0) {
+    if (!replaceAdminCredential(command + 15)) {
+      sendBleConfigError("invalid_credential",
+                         "use 12 to 24 printable non-space characters");
+      return;
+    }
+    sendBleConfigText(
+      "{\"ok\":true,\"credential_replaced\":true,\"reboot_required\":true}");
+    config_reboot_requested = true;
+    return;
+  }
   if (strncmp(command, "PATCH ", 6) == 0) {
     const size_t length = strlen(command + 6);
     if (length >= BLE_CONFIG_COMMAND_MAX) {
@@ -1248,7 +1259,7 @@ void processBleConfigCommand(const char* command) {
     return;
   }
   sendBleConfigError("unknown_command",
-    "use HELLO, GET CONFIG, PATCH, ROLLBACK, FACTORY_RESET or REBOOT");
+    "use HELLO, GET CONFIG, PATCH, SET_CREDENTIAL, ROLLBACK, FACTORY_RESET or REBOOT");
 }
 
 void stopBleDebug() {
@@ -1283,7 +1294,7 @@ void startBleDebugWindow(uint32_t duration_ms, bool force_provisioning) {
 
   if (!ble_initialized) {
     logPrintln("Starting bounded BLE/configuration window...");
-    String ble_name = "EqTrk-" + String(TRACKER_ID);
+    String ble_name = "LT-" + String(TRACKER_ID);
     BLEDevice::init(ble_name.c_str());
     if (tracker_onboarding_required) {
       int bond_count = esp_ble_get_bond_device_num();

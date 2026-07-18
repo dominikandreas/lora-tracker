@@ -40,7 +40,7 @@ delivery guarantees and hardware qualification and cannot be papered over.
 | Area | Missing production behavior | Acceptance evidence |
 |---|---|---|
 | Key lifecycle | Random public IDs, purpose-separated keys, QR bootstrap, rotation/revocation and reduced gateway key exposure | Provision/rotate/revoke/recover tests and key-custody records |
-| BLE provisioning | Supported onboarding client and QR/recovery workflow beyond the authenticated firmware session | Pairing/replay/recovery tests on supported phones |
+| BLE provisioning | QR bootstrap, fleet recovery/rotation workflow and a qualified phone/browser support matrix beyond the authenticated Tracker Console | Pairing/replay/recovery tests on supported phones |
 | Firmware trust | Signed OTA, Secure Boot v2, flash/NVS encryption and key custody | Factory provisioning record and failed unsigned-image tests |
 | Tracker queue durability | Unacknowledged telemetry currently survives deep sleep only, not power loss or hard reset | Wear-levelled flash-journal fault injection with zero sequence reuse or silent point loss |
 | Hardware | Current gateway board port, qualified tracker design and installed repeater power/RF design | HIL CI, RF/power/environmental reports and factory tests |

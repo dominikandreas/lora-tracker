@@ -1,4 +1,4 @@
-const CACHE = "lora-tracker-web-v5";
+const CACHE = "lora-tracker-web-v6";
 const ASSETS = [
   "./",
   "index.html",
@@ -8,6 +8,7 @@ const ASSETS = [
   "points.js",
   "storage.js",
   "manifest.webmanifest",
+  "icon.svg",
   "map.js",
   "alerts.js",
   "onboarding.js",

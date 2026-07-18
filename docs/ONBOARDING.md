@@ -5,10 +5,11 @@
 1. Copy `secrets.example.h` to `secrets.h` in the relevant firmware directory,
    or install a generic release with the [browser flasher](FLASHING.md).
 2. Leave `factory_admin_password` empty for a generic image. On erased flash,
-   the device generates a unique 20-character credential and prints it while
-   the unprovisioned setup AP starts in the attended serial log. A factory may inject a different 12+
-   character value into each device build instead. Record it in the protected
-   device inventory.
+   the device generates a unique 20-character credential. Trackers and gateways
+   show it on their local display during attended setup; diagnostic serial also
+   records it. A factory may inject a different 12+ character value into each
+   device build instead. Record the final credential in the protected device
+   inventory.
 3. Set `ota_password_hash` to the 64-character lowercase or uppercase SHA-256
    hash of a separate password. Leave it empty to keep OTA disabled.
 4. For a gateway, set a TLS broker port (normally 8883) and paste the broker root
@@ -24,7 +25,7 @@ The CA certificate is public; client and signing keys are not.
 
 An unprovisioned tracker derives a setup ID from the low 24 bits of its eFuse
 MAC, generates a random 256-bit LoRa AEAD key, then exposes
-`LoRaTracker-<device_id>` and BLE name `EqTrk-<device_id>`. Its display shows
+`LoRaTracker-<device_id>` and BLE name `LT-<device_id>`. Its display shows
 the temporary AP credential, the current BLE pairing PIN and the setup address.
 Connect a phone to the AP and open `http://192.168.4.1`, or connect over BLE
 using the displayed PIN. The generated credential no longer has to be obtained
@@ -57,9 +58,12 @@ window generates a new random six-digit BLE pairing PIN and shows it on the
 tracker. On an unprovisioned tracker, `CLAIM <new-credential>` both replaces the
 generated credential and authenticates that BLE session. A provisioned tracker
 uses `AUTH <admin-password>`. `CLAIM` is rejected outside the physically opened
-setup/onboarding window. BLE still lacks the planned owner-key enrollment,
-purpose-separated provisioning key and fleet key-rotation workflow; disable
-BLE debug after setup.
+setup/onboarding window. The Pages-hosted Tracker Console provides a supported
+Chromium Web Bluetooth client for these commands. BLE still lacks QR bootstrap,
+owner-key enrollment, a purpose-separated provisioning key and fleet
+key-rotation workflow. An authenticated, physically opened BLE session can use
+`SET_CREDENTIAL` to replace the administrator credential. Disable BLE debug
+after setup.
 
 ## Gateway first boot
 

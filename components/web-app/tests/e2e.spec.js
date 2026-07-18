@@ -51,6 +51,21 @@ test.describe("PWA Offline & Mode Tests", () => {
     expect(mapLayerValue).toBe("none");
   });
 
+  test("bundled PMTiles exposes the Leaflet raster adapter", async ({ page }) => {
+    expect(
+      await page.evaluate(() => typeof window.pmtiles.leafletRasterLayer),
+    ).toBe("function");
+  });
+
+  test("Network Lab link targets the sibling Pages application", async ({
+    page,
+  }) => {
+    await expect(page.getByRole("link", { name: /Open Network Lab/ })).toHaveAttribute(
+      "href",
+      "https://dominikandreas.github.io/lora-tracker-docs/simulator/",
+    );
+  });
+
   test("Enable Alerts button exists and updates state", async ({ page }) => {
     const alertsBtn = page.locator("#enableAlertsButton");
     await expect(alertsBtn).toBeVisible();

@@ -7,8 +7,10 @@ export class BleTransport {
     this.queue = [];
     this.activeCommand = null;
     this.buffer = "";
+    this.decoder = new TextDecoder();
     this.disconnectHandler = this.onDisconnected.bind(this);
     this.notificationHandler = this.onNotification.bind(this);
+    this.onDisconnect = null;
   }
 
   get isSupported() {
@@ -22,7 +24,7 @@ export class BleTransport {
       );
 
     this.device = await this.adapter.requestDevice({
-      filters: [{ namePrefix: "EqTrk-" }],
+      filters: [{ services: ["6e400001-b5a3-f393-e0a9-e50e24dcca9e"] }],
       optionalServices: ["6e400001-b5a3-f393-e0a9-e50e24dcca9e"],
     });
 
@@ -31,23 +33,28 @@ export class BleTransport {
       this.disconnectHandler,
     );
 
-    const server = await this.device.gatt.connect();
-    const service = await server.getPrimaryService(
-      "6e400001-b5a3-f393-e0a9-e50e24dcca9e",
-    );
+    try {
+      const server = await this.device.gatt.connect();
+      const service = await server.getPrimaryService(
+        "6e400001-b5a3-f393-e0a9-e50e24dcca9e",
+      );
 
-    this.rx = await service.getCharacteristic(
-      "6e400002-b5a3-f393-e0a9-e50e24dcca9e",
-    );
-    this.tx = await service.getCharacteristic(
-      "6e400003-b5a3-f393-e0a9-e50e24dcca9e",
-    );
+      this.rx = await service.getCharacteristic(
+        "6e400002-b5a3-f393-e0a9-e50e24dcca9e",
+      );
+      this.tx = await service.getCharacteristic(
+        "6e400003-b5a3-f393-e0a9-e50e24dcca9e",
+      );
 
-    this.tx.addEventListener(
-      "characteristicvaluechanged",
-      this.notificationHandler,
-    );
-    await this.tx.startNotifications();
+      this.tx.addEventListener(
+        "characteristicvaluechanged",
+        this.notificationHandler,
+      );
+      await this.tx.startNotifications();
+    } catch (error) {
+      this.onDisconnected();
+      throw error;
+    }
   }
 
   disconnect() {
@@ -74,6 +81,7 @@ export class BleTransport {
     this.rx = null;
     this.tx = null;
     this.buffer = "";
+    this.decoder = new TextDecoder();
 
     const error = new Error("BLE Disconnected");
     if (this.activeCommand) {
@@ -83,10 +91,11 @@ export class BleTransport {
     }
     for (const cmd of this.queue) cmd.reject(error);
     this.queue = [];
+    this.onDisconnect?.();
   }
 
   onNotification(event) {
-    const value = new TextDecoder().decode(event.target.value);
+    const value = this.decoder.decode(event.target.value, { stream: true });
     this.buffer += value;
 
     if (this.buffer.length > 4096) {
@@ -99,13 +108,22 @@ export class BleTransport {
       const line = this.buffer.slice(0, newlineIdx).trim();
       this.buffer = this.buffer.slice(newlineIdx + 1);
 
-      if (line.length > 0 && this.activeCommand) {
+      if (line.length > 0 && this.activeCommand && line.startsWith("{")) {
         try {
           const parsed = JSON.parse(line);
           clearTimeout(this.activeCommand.timer);
           const cmd = this.activeCommand;
           this.activeCommand = null;
-          cmd.resolve(parsed);
+          if (parsed?.ok === false) {
+            const detail = parsed.detail ? `: ${parsed.detail}` : "";
+            cmd.reject(
+              new Error(
+                `${parsed.error || "Device rejected command"}${detail}`,
+              ),
+            );
+          } else {
+            cmd.resolve(parsed);
+          }
         } catch (e) {
           clearTimeout(this.activeCommand.timer);
           const cmd = this.activeCommand;
@@ -121,7 +139,8 @@ export class BleTransport {
 
   async sendCommand(cmd, timeoutMs = 5000) {
     if (!this.rx) throw new Error("Not connected");
-    if (cmd.length > 1024) throw new Error("Command too long");
+    if (new TextEncoder().encode(cmd).length > 1534)
+      throw new Error("Command too long");
 
     return new Promise((resolve, reject) => {
       this.queue.push({ cmd, resolve, reject, timeoutMs });
@@ -138,26 +157,17 @@ export class BleTransport {
       if (this.activeCommand === cmd) {
         this.activeCommand = null;
         cmd.reject(new Error("Command timeout"));
-        if (this.device && this.device.gatt && this.device.gatt.connected) {
-          this.device.gatt.disconnect();
-        } else {
-          this.onDisconnected();
-        }
+        if (this.device?.gatt?.connected) this.device.gatt.disconnect();
+        this.onDisconnected();
       }
     }, cmd.timeoutMs);
 
     try {
-      const payload = new TextEncoder().encode(cmd.cmd);
+      const payload = new TextEncoder().encode(`${cmd.cmd}\n`);
       let offset = 0;
       while (offset < payload.length) {
         const chunkLen = Math.min(18, payload.length - offset);
-        const chunk = new Uint8Array(
-          chunkLen + (offset + chunkLen === payload.length ? 1 : 0),
-        );
-        chunk.set(payload.subarray(offset, offset + chunkLen));
-        if (offset + chunkLen === payload.length) {
-          chunk[chunkLen] = 10; // '\n'
-        }
+        const chunk = payload.slice(offset, offset + chunkLen);
         await this.rx.writeValueWithResponse(chunk);
         offset += chunkLen;
       }
@@ -194,8 +204,15 @@ export class OnboardingManager {
   }
 
   async getConfig() {
-    const response = await this.transport.sendCommand("GET CONFIG");
-    this.lastConfig = JSON.parse(response);
+    this.lastConfig = await this.transport.sendCommand("GET CONFIG");
+    if (
+      !this.lastConfig ||
+      this.lastConfig.role !== "tracker" ||
+      !Number.isSafeInteger(this.lastConfig.revision)
+    ) {
+      this.lastConfig = null;
+      throw new Error("Tracker returned an invalid configuration response");
+    }
     return this.lastConfig;
   }
 
@@ -205,6 +222,10 @@ export class OnboardingManager {
       ...fields,
     }).toString();
     return this.transport.sendCommand(`PATCH ${params}`);
+  }
+
+  async replaceCredential(password) {
+    return this.transport.sendCommand(`SET_CREDENTIAL ${password}`);
   }
 
   async rollback() {

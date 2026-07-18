@@ -1,5 +1,10 @@
 import { MqttWebSocketClient } from "./mqtt.js";
-import { putPoint, listPoints, clearPoints } from "./storage.js";
+import {
+  putPoint,
+  listPoints,
+  listLatestPoints,
+  clearPoints,
+} from "./storage.js";
 import { normalizePoint } from "./points.js";
 import { MapManager } from "./map.js";
 import { AlertsManager } from "./alerts.js";
@@ -17,18 +22,34 @@ let selectedHash = null;
 let connected = false;
 let pendingHistoryRequest = null;
 
-const saved = JSON.parse(
-  localStorage.getItem("lora-tracker.web.settings") || "{}",
-);
+onboardingManager.transport.onDisconnect = () => {
+  setBleStatus("Disconnected");
+  els.bleControls.hidden = true;
+  els.blePassword.value = "";
+  els.cfgRadioKey.value = "";
+  onboardingManager.lastConfig = null;
+};
+
+let saved = {};
+try {
+  saved = JSON.parse(
+    localStorage.getItem("lora-tracker.web.settings") || "{}",
+  );
+} catch {
+  localStorage.removeItem("lora-tracker.web.settings");
+}
 els.brokerUrl.value = saved.brokerUrl || "";
 els.baseTopic.value = saved.baseTopic || "lora-tracker";
 els.username.value = saved.username || "";
 
-let mapLayerType = saved.mapLayerType || "none";
+let mapLayerType = ["none", "osm", "pmtiles"].includes(saved.mapLayerType)
+  ? saved.mapLayerType
+  : "none";
 els.mapLayer.value = mapLayerType;
 
 async function loadPmtiles() {
   try {
+    if (!navigator.storage?.getDirectory) throw new Error("OPFS unavailable");
     const root = await navigator.storage.getDirectory();
     const handle = await root.getFileHandle("map.pmtiles");
     await mapManager.setLayer("pmtiles", handle);
@@ -37,6 +58,7 @@ async function loadPmtiles() {
     if (mapLayerType === "pmtiles") mapLayerType = "none";
     els.mapLayer.value = mapLayerType;
     mapManager.setLayer(mapLayerType);
+    saveSettings();
   }
 }
 
@@ -45,28 +67,45 @@ if (mapLayerType === "pmtiles") {
 } else {
   mapManager.setLayer(mapLayerType);
   // Still check if we have a PMTiles file available
-  navigator.storage
-    .getDirectory()
-    .then((root) => root.getFileHandle("map.pmtiles"))
-    .then(() => {
-      els.mapLayer.querySelector('option[value="pmtiles"]').disabled = false;
-    })
-    .catch(() => {});
+  if (navigator.storage?.getDirectory) {
+    navigator.storage
+      .getDirectory()
+      .then((root) => root.getFileHandle("map.pmtiles"))
+      .then(() => {
+        els.mapLayer.querySelector('option[value="pmtiles"]').disabled = false;
+      })
+      .catch(() => {});
+  }
 }
 
 els.mapLayer.addEventListener("change", async (e) => {
+  const previous = mapLayerType;
   mapLayerType = e.target.value;
-  saveSettings();
-  if (mapLayerType === "pmtiles") {
-    await loadPmtiles();
-  } else {
-    mapManager.setLayer(mapLayerType);
+  try {
+    if (mapLayerType === "pmtiles") {
+      await loadPmtiles();
+    } else {
+      await mapManager.setLayer(mapLayerType);
+    }
+    saveSettings();
+  } catch (error) {
+    mapLayerType = previous;
+    els.mapLayer.value = previous;
+    els.connectionMessage.textContent = `Map layer failed: ${error.message}`;
   }
 });
 
 // --- Onboarding Logic ---
 function setBleStatus(msg) {
   els.bleStatus.textContent = msg;
+  const connected = msg === "Connected";
+  const state =
+    connected
+      ? "online"
+      : msg === "Disconnected" || msg.startsWith("Error")
+        ? "offline"
+        : "connecting";
+  els.bleStatus.className = `badge ${state}`;
 }
 
 function appendBleOutput(msg) {
@@ -76,29 +115,41 @@ function appendBleOutput(msg) {
 }
 
 els.onboardingButton.addEventListener("click", async () => {
-  els.onboardingPanel.style.display =
-    els.onboardingPanel.style.display === "none" ? "block" : "none";
-  if (els.onboardingPanel.style.display === "block") {
+  els.onboardingPanel.hidden = !els.onboardingPanel.hidden;
+  if (!els.onboardingPanel.hidden) {
     try {
       setBleStatus("Connecting...");
       await onboardingManager.connectTracker();
       setBleStatus("Connected");
-      els.bleControls.style.display = "block";
+      els.bleControls.hidden = false;
     } catch (e) {
       setBleStatus(`Error: ${e.message}`);
     }
   } else {
     onboardingManager.disconnect();
     setBleStatus("Disconnected");
-    els.bleControls.style.display = "none";
+    els.bleControls.hidden = true;
   }
 });
+
+function requireCredential() {
+  const credential = els.blePassword.value;
+  if (
+    credential.length < 12 ||
+    credential.length > 24 ||
+    /\s/.test(credential)
+  ) {
+    throw new Error("Credential must be 12–24 characters without spaces");
+  }
+  return credential;
+}
 
 els.bleClaim.addEventListener("click", async () => {
   try {
     appendBleOutput("Claiming...");
-    const result = await onboardingManager.claim(els.blePassword.value);
+    const result = await onboardingManager.claim(requireCredential());
     appendBleOutput(result);
+    els.bleGetConfig.click();
   } catch (e) {
     appendBleOutput(`Error: ${e.message}`);
   }
@@ -107,7 +158,7 @@ els.bleClaim.addEventListener("click", async () => {
 els.bleAuth.addEventListener("click", async () => {
   try {
     appendBleOutput("Authenticating...");
-    const result = await onboardingManager.auth(els.blePassword.value);
+    const result = await onboardingManager.auth(requireCredential());
     appendBleOutput(result);
     // Auto-fetch config after auth
     els.bleGetConfig.click();
@@ -116,23 +167,51 @@ els.bleAuth.addEventListener("click", async () => {
   }
 });
 
-function loadConfigIntoForm(config) {
+els.bleReplaceCredential.addEventListener("click", async () => {
   try {
-    els.bleConfigForm.style.display = "block";
-    els.cfgDeviceName.value = config.device_name || "";
-    els.cfgWifiSsid.value = config.wifi_ssid || "";
-    els.cfgWifiPassword.value = config.wifi_password || "";
-    els.cfgTxInterval.value = config.lora_tx_interval_s || "";
+    if (!onboardingManager.lastConfig) {
+      throw new Error("Authenticate and fetch configuration first");
+    }
+    if (!confirm("Replace the administrator credential and reboot the tracker?")) {
+      return;
+    }
+    const result = await onboardingManager.replaceCredential(
+      requireCredential(),
+    );
+    appendBleOutput(result);
   } catch (e) {
-    // ignore
+    appendBleOutput(`Error: ${e.message}`);
   }
+});
+
+function loadConfigIntoForm(config) {
+  els.bleConfigForm.hidden = false;
+  els.cfgDeviceId.value = config.device_id || "";
+  els.cfgDeviceName.value = config.device_name || "";
+  els.cfgWifiSsid.value = config.wifi_ssid || "";
+  els.cfgWifiPassword.value = "";
+  els.cfgFrequency.value = config.lora?.frequency_hz ?? "";
+  els.cfgTxPower.value = config.lora?.tx_power_dbm ?? "";
+  els.cfgSf.value = config.lora?.sf ?? "";
+  els.cfgHopLimit.value = config.lora?.relay_hop_limit ?? "";
+  els.cfgTxInterval.value = config.communication?.tx_interval_s ?? "";
+  els.cfgAckTimeout.value = config.communication?.ack_timeout_ms ?? "";
+  els.cfgMovingSleep.value = config.sleep?.moving_s ?? "";
+  els.cfgStationarySleep.value = config.sleep?.stationary_s ?? "";
+  els.cfgRadioKey.value = config.lora_aead_key || "";
 }
+
+els.bleRevealKey.addEventListener("click", () => {
+  const showing = els.cfgRadioKey.type === "text";
+  els.cfgRadioKey.type = showing ? "password" : "text";
+  els.bleRevealKey.textContent = showing ? "Show key" : "Hide key";
+});
 
 els.bleGetConfig.addEventListener("click", async () => {
   try {
     appendBleOutput("Fetching config...");
     const result = await onboardingManager.getConfig();
-    appendBleOutput(JSON.stringify(result, null, 2));
+    appendBleOutput(`Configuration revision ${result.revision} loaded.`);
     loadConfigIntoForm(result);
   } catch (e) {
     appendBleOutput(`Error: ${e.message}`);
@@ -142,12 +221,24 @@ els.bleGetConfig.addEventListener("click", async () => {
 els.bleSaveConfig.addEventListener("click", async () => {
   try {
     const fields = {};
+    if (els.cfgDeviceId.value) fields.device_id = els.cfgDeviceId.value;
     if (els.cfgDeviceName.value) fields.device_name = els.cfgDeviceName.value;
     if (els.cfgWifiSsid.value) fields.wifi_ssid = els.cfgWifiSsid.value;
     if (els.cfgWifiPassword.value)
       fields.wifi_password = els.cfgWifiPassword.value;
-    if (els.cfgTxInterval.value)
-      fields.lora_tx_interval_s = parseInt(els.cfgTxInterval.value, 10);
+    const numericFields = [
+      ["lora_frequency_hz", els.cfgFrequency],
+      ["lora_tx_power_dbm", els.cfgTxPower],
+      ["lora_sf", els.cfgSf],
+      ["lora_relay_hop_limit", els.cfgHopLimit],
+      ["lora_tx_interval_s", els.cfgTxInterval],
+      ["lora_ack_timeout_ms", els.cfgAckTimeout],
+      ["moving_sleep_s", els.cfgMovingSleep],
+      ["stationary_sleep_s", els.cfgStationarySleep],
+    ];
+    for (const [name, input] of numericFields) {
+      if (input.value !== "") fields[name] = input.value;
+    }
 
     if (!onboardingManager.lastConfig)
       throw new Error("Must fetch config first");
@@ -192,6 +283,27 @@ els.bleFactoryReset.addEventListener("click", async () => {
   }
 });
 
+async function importPmtiles(file) {
+  // Validate and display before replacing the persisted archive.
+  await mapManager.setLayer("pmtiles", file);
+  if (navigator.storage?.getDirectory) {
+    try {
+      const root = await navigator.storage.getDirectory();
+      const draft = await root.getFileHandle("map.pmtiles", { create: true });
+      const writable = await draft.createWritable();
+      await writable.write(file);
+      await writable.close();
+    } catch (error) {
+      els.connectionMessage.textContent =
+        `Map loaded for this session but could not be retained: ${error.message}`;
+    }
+  }
+  els.mapLayer.querySelector('option[value="pmtiles"]').disabled = false;
+  els.mapLayer.value = "pmtiles";
+  mapLayerType = "pmtiles";
+  saveSettings();
+}
+
 els.importPmtilesButton.addEventListener("click", async () => {
   if ("showOpenFilePicker" in window) {
     try {
@@ -204,19 +316,14 @@ els.importPmtilesButton.addEventListener("click", async () => {
         ],
       });
       const file = await fileHandle.getFile();
-      const root = await navigator.storage.getDirectory();
-      const draft = await root.getFileHandle("map.pmtiles", { create: true });
-      const writable = await draft.createWritable();
-      await writable.write(file);
-      await writable.close();
-
-      els.mapLayer.querySelector('option[value="pmtiles"]').disabled = false;
-      els.mapLayer.value = "pmtiles";
-      mapLayerType = "pmtiles";
-      saveSettings();
-      await mapManager.setLayer("pmtiles", draft);
+      await importPmtiles(file);
     } catch (e) {
-      if (e.name !== "AbortError") els.pmtilesInput?.click();
+      if (e.name === "AbortError") return;
+      if (e.name === "NotSupportedError" || e.name === "SecurityError") {
+        els.pmtilesInput?.click();
+      } else {
+        alert(`Failed to load PMTiles: ${e.message}`);
+      }
     }
   } else {
     els.pmtilesInput?.click();
@@ -246,19 +353,11 @@ els.pmtilesInput?.addEventListener("change", async (e) => {
   const file = e.target.files[0];
   if (!file) return;
   try {
-    const root = await navigator.storage.getDirectory();
-    const draft = await root.getFileHandle("map.pmtiles", { create: true });
-    const writable = await draft.createWritable();
-    await writable.write(file);
-    await writable.close();
-
-    els.mapLayer.querySelector('option[value="pmtiles"]').disabled = false;
-    els.mapLayer.value = "pmtiles";
-    mapLayerType = "pmtiles";
-    saveSettings();
-    await mapManager.setLayer("pmtiles", draft);
+    await importPmtiles(file);
   } catch (err) {
     alert(`Failed to load PMTiles: ${err.message}`);
+  } finally {
+    e.target.value = "";
   }
 });
 
@@ -308,11 +407,12 @@ function trackerFromPoint(point) {
   return tracker;
 }
 
-async function ingestPoint(raw) {
+async function ingestPoint(raw, { evaluateAlerts = true } = {}) {
   const point = normalizePoint(raw);
   const tracker = trackerFromPoint(point);
   await putPoint(point);
-  alertsManager.evaluateTracker(tracker, point);
+  if (evaluateAlerts && tracker.latest === point)
+    alertsManager.evaluateTracker(tracker, point);
   renderTrackerList();
   if (point.device_hash === selectedHash) await renderSelectedTracker();
 }
@@ -449,12 +549,8 @@ function parseTopic(topic) {
     .split("/")
     .filter(Boolean);
   const parts = topic.split("/");
-  const start = parts.findIndex((_, i) =>
-    base.every((part, j) => parts[i + j] === part),
-  );
-  if (start < 0) return null;
-  const tail = parts.slice(start + base.length);
-  return tail;
+  if (!base.every((part, index) => parts[index] === part)) return null;
+  return parts.slice(base.length);
 }
 
 mqtt.addEventListener("status", (event) => {
@@ -493,6 +589,7 @@ mqtt.addEventListener("message", async (event) => {
   }
   const tail = parseTopic(topic);
   if (!tail || tail[0] !== "v1" || tail[1] !== "trackers") return;
+  if (data.device_hash && data.device_hash !== tail[2]) return;
   if ((tail[3] === "events" && tail[4] === "point") || tail[3] === "state") {
     try {
       await ingestPoint(data);
@@ -503,7 +600,7 @@ mqtt.addEventListener("message", async (event) => {
     if (!data.ok || !Array.isArray(data.points)) return;
     for (const raw of data.points) {
       try {
-        await ingestPoint(raw);
+        await ingestPoint(raw, { evaluateAlerts: false });
       } catch (error) {
         console.warn(error);
       }
@@ -546,6 +643,22 @@ els.connectButton.addEventListener("click", () => {
   if (!/^wss?:\/\//i.test(url)) {
     els.connectionMessage.textContent =
       "Enter an MQTT WebSocket URL beginning with ws:// or wss://.";
+    return;
+  }
+  if (location.protocol === "https:" && !url.toLowerCase().startsWith("wss://")) {
+    els.connectionMessage.textContent =
+      "This HTTPS page requires a secure wss:// MQTT WebSocket endpoint.";
+    return;
+  }
+  const baseTopic = els.baseTopic.value.trim();
+  if (
+    !baseTopic ||
+    baseTopic.startsWith("/") ||
+    baseTopic.endsWith("/") ||
+    /[+#\u0000]/.test(baseTopic)
+  ) {
+    els.connectionMessage.textContent =
+      "Base topic must be a concrete MQTT topic without wildcards.";
     return;
   }
   saveSettings();
@@ -605,6 +718,16 @@ setInterval(() => {
   renderTrackerList();
   if (selectedHash) renderSelectedTracker();
 }, 30_000);
+async function restoreCachedTrackers() {
+  try {
+    for (const point of await listLatestPoints()) trackerFromPoint(point);
+    renderTrackerList();
+    if (selectedHash) await renderSelectedTracker(true);
+  } catch (error) {
+    console.warn("Could not restore cached trackers", error);
+  }
+}
+restoreCachedTrackers();
 if ("serviceWorker" in navigator)
   navigator.serviceWorker.register("./sw.js").catch(console.warn);
 setConnectionState("offline", "Not connected.");

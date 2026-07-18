@@ -4,9 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "make -C ../simulation-engine build && cp -r ../simulation-engine/dist/* app/",
-    "test:browser": "playwright test",
-    "serve": "python3 -m http.server 8080 -d app"
+    "build": "npm --prefix ../simulation-engine run build && node scripts/copy-engine.mjs",
+    "copy-engine": "node scripts/copy-engine.mjs",
+    "test:browser": "npm run copy-engine && playwright test",
+    "serve": "node scripts/serve.mjs 8080 app"
   },
   "devDependencies": {
     "@playwright/test": "1.55.0"

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="LoRa Tracker">
+  <rect width="512" height="512" rx="112" fill="#172018"/>
+  <circle cx="256" cy="256" r="142" fill="none" stroke="#9bdb7d" stroke-width="24" opacity=".28"/>
+  <path d="M256 112c-60 0-108 48-108 108 0 86 108 188 108 188s108-102 108-188c0-60-48-108-108-108Zm0 154a46 46 0 1 1 0-92 46 46 0 0 1 0 92Z" fill="#9bdb7d"/>
+</svg>

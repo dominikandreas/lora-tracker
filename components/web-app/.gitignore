@@ -8,3 +8,5 @@ simulation-engine.js
 simulator-worker.js
 playwright-report
 test-results
+dist
+debug.log

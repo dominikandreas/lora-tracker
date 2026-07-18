@@ -13,7 +13,9 @@ hardware support or multiple public interfaces.
 - [x] Require BLE Secure Connections/MITM and an authenticated application session.
 - [x] Show temporary first-boot credentials and random per-session BLE PINs on-device instead of requiring serial access.
 - [x] Add physically bounded BLE first-claim and authenticated phone UI credential replacement.
-- [ ] Add a supported BLE onboarding client, QR bootstrap and recovery/rotation policy.
+- [x] Add a supported authenticated BLE onboarding client with claiming,
+      credential replacement, transactional configuration and recovery actions.
+- [ ] Add QR bootstrap and fleet credential/key recovery and rotation policy.
 - [ ] Replace password-only ArduinoOTA with signed images, Secure Boot v2, flash/NVS encryption and documented eFuse/key custody.
 - [x] Require an application-level archiver receipt before gateway dedup advancement and tracker ACK; retries remain idempotent across QoS-0 loss.
 - [ ] Port the gateway to a current ESP32-S3/SX1262 board and share its RadioLib driver with the tracker.
@@ -39,11 +41,12 @@ hardware support or multiple public interfaces.
 
 ## P1 — application
 
-- [ ] Build an authenticated onboarding UI for BLE (gateway HTTP provisioning dropped for this release).
+- [x] Build an authenticated onboarding UI for tracker BLE (gateway provisioning remains on its captive portal).
 - [x] Add automatic bounded history pagination; background synchronization and export remain future work.
-- [ ] Add a geographical map with selectable offline/local tiles.
+- [x] Add a geographical map with an offline grid, opt-in online tiles and imported local raster PMTiles.
 - [ ] Add encrypted local secret storage protected by platform biometrics or PIN (currently session-only).
-- [ ] Add alerts for stale trackers, low battery, missing gateways and unusual movement.
+- [x] Add open-app alerts for stale trackers, low battery and unusual movement.
+- [ ] Add server-backed closed-app push and explicit gateway heartbeat/fleet-health alerts.
 - [ ] Build the deferred mobile app from generated shared schemas.
 
 ## P2 — maintainability and expansion

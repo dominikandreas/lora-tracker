@@ -46,8 +46,10 @@ Build and serve the interactive WASM Network Lab:
 
 ```bash
 cd components/simulator-web
-make wasm
-npm ci && npm test
+npm ci
+npm run build
+npx playwright install chromium
+npm run test:browser
 python3 -m http.server 8080 -d app
 ```
 

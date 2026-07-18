@@ -92,25 +92,30 @@ listener. A local development server is sufficient for a smoke test:
 
 ```bash
 cd components/web-app
+npm ci
+npm run build
 python3 -m http.server 8080
 ```
 
-The app persists broker URL, namespace and username but not the password.
+The app persists broker URL, namespace and username but not the password. Run
+`npm run package` to assemble the self-contained `dist/` artifact. The public
+documentation deploys that artifact at `/app/` and the Network Lab at
+`/simulator/`.
 
 ## Browser Network Lab
 
 ```bash
 cd components/simulator-web
-make wasm
 npm ci
-npm test
+npm run build
 npx playwright install --with-deps chromium
 npm run test:browser
 python3 -m http.server 8080 -d app
 ```
 
-`make wasm` compiles `components/firmware-core` with Emscripten. Do not serve the
-source directory without first producing `app/firmware-core.wasm`; the release
+`npm run build` compiles `components/firmware-core` with Emscripten through the
+shared simulation engine. Do not serve the source directory without first producing
+`app/firmware-core.wasm`; the release
 application fails closed rather than substituting JavaScript policy logic.
 GitHub Pages builds this file from source and publishes the lab below
 `/simulator/`.
@@ -124,11 +129,14 @@ python -m lora_tracker_archiver.simulator \
   --trackers 2 --points 12 --service-suite --embedded-suite
 
 cd ../web-app
+npm ci
+npm run build
 npm test
 
 cd ../simulator-web
-make wasm
-npm ci && npm test
+npm ci
+npm run build
+npx playwright install chromium
 npm run test:browser
 ```
 

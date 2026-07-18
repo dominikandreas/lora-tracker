@@ -1,6 +1,6 @@
 export class MapManager {
   constructor(containerId) {
-    this.map = L.map(containerId).setView([51.505, -0.09], 13);
+    this.map = L.map(containerId).setView([51.1657, 10.4515], 6);
 
     // Grid (Offline) layer
     this.gridLayer = L.GridLayer.extend({
@@ -21,33 +21,10 @@ export class MapManager {
 
     this.markers = new Map();
     this.routes = new Map();
-    this.appMode = "dashboard";
-  }
-
-  setMode(mode) {
-    this.appMode = mode;
-    this._updateVisibility();
-  }
-
-  _updateVisibility() {
-    for (const m of this.markers.values()) {
-      if (!m.isSimulated && this.appMode === "lab") {
-        m.layer.remove();
-      } else if (!this.map.hasLayer(m.layer)) {
-        m.layer.addTo(this.map);
-      }
-    }
-    for (const r of this.routes.values()) {
-      if (!r.isSimulated && this.appMode === "lab") {
-        r.layer.remove();
-      } else if (!this.map.hasLayer(r.layer)) {
-        r.layer.addTo(this.map);
-      }
-    }
   }
 
   async setLayer(type, fileHandleOrFile) {
-    this.map.removeLayer(this.currentLayer);
+    let nextLayer;
 
     if (type === "pmtiles" && fileHandleOrFile) {
       // Implement PMTiles source wrapper
@@ -62,40 +39,49 @@ export class MapManager {
           return { data: await slice.arrayBuffer() };
         },
       };
-      const p = new pmtiles.PMTiles(source);
-      this.currentLayer = pmtiles.leafletLayer(p);
+      const archive = new pmtiles.PMTiles(source);
+      const header = await archive.getHeader();
+      if (header.tileType === pmtiles.TileType.Mvt) {
+        throw new Error(
+          "Vector PMTiles are not supported; import a raster archive",
+        );
+      }
+      nextLayer = pmtiles.leafletRasterLayer(archive, {
+        attribution: "Offline PMTiles archive",
+      });
     } else if (type === "osm") {
-      this.currentLayer = L.tileLayer(
+      nextLayer = L.tileLayer(
         "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
         {
           maxZoom: 19,
-          attribution: "© OpenStreetMap",
+          attribution: "© OpenStreetMap contributors",
         },
       );
     } else {
-      this.currentLayer = new this.gridLayer();
+      nextLayer = new this.gridLayer();
     }
 
+    this.map.removeLayer(this.currentLayer);
+    this.currentLayer = nextLayer;
     this.currentLayer.addTo(this.map);
   }
 
-  updateTracker(hash, point, name, isSimulated = false) {
+  updateTracker(hash, point, name) {
     if (!this.markers.has(hash)) {
       const marker = L.circleMarker([point.latitude, point.longitude], {
         radius: 8,
-        color: isSimulated ? "#ff7800" : "#3388ff",
-        fillColor: isSimulated ? "#ff7800" : "#3388ff",
+        color: "#3388ff",
+        fillColor: "#3388ff",
         fillOpacity: 0.8,
       }).addTo(this.map);
       marker.bindTooltip(name);
-      this.markers.set(hash, { layer: marker, isSimulated });
+      this.markers.set(hash, { layer: marker });
     } else {
       this.markers.get(hash).layer.setLatLng([point.latitude, point.longitude]);
     }
-    this._updateVisibility();
   }
 
-  drawRoute(hash, points, isSimulated = false) {
+  drawRoute(hash, points) {
     if (this.routes.has(hash)) {
       this.map.removeLayer(this.routes.get(hash).layer);
     }
@@ -103,12 +89,10 @@ export class MapManager {
 
     const latlngs = points.map((p) => [p.latitude, p.longitude]);
     const route = L.polyline(latlngs, {
-      color: isSimulated ? "#ff7800" : "#3388ff",
-      dashArray: isSimulated ? "5, 5" : null,
+      color: "#3388ff",
       weight: 3,
     });
-    this.routes.set(hash, { layer: route, isSimulated });
-    this._updateVisibility();
+    this.routes.set(hash, { layer: route });
     return route.getBounds();
   }
 
@@ -125,18 +109,4 @@ export class MapManager {
     this.routes.clear();
   }
 
-  clearSimulated() {
-    for (const [hash, m] of this.markers.entries()) {
-      if (m.isSimulated) {
-        m.layer.remove();
-        this.markers.delete(hash);
-      }
-    }
-    for (const [hash, r] of this.routes.entries()) {
-      if (r.isSimulated) {
-        r.layer.remove();
-        this.routes.delete(hash);
-      }
-    }
-  }
 }

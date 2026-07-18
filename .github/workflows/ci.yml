@@ -51,6 +51,7 @@ jobs:
         run: |
           npm ci
           npm run build
+          git diff --exit-code ../simulation-engine/dist/ || (echo "Simulation engine drift detected. Update the repository." && exit 1)
           npx playwright install --with-deps chromium
           npm run test:browser
       - name: Test browser application
@@ -58,7 +59,6 @@ jobs:
         run: |
           npm ci
           npm run build
-          git diff --exit-code ../simulation-engine/dist/ || (echo "Simulation engine drift detected. Update the repository." && exit 1)
           npx playwright install --with-deps chromium
           npm test
           npm run package

@@ -1,0 +1,8 @@
+app/default-scenario.js
+app/firmware-core.js
+app/firmware-core.wasm
+app/geometry.js
+app/simulation-engine.js
+app/simulator-worker.js
+playwright-report/
+test-results/

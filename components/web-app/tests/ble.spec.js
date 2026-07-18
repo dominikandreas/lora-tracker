@@ -94,11 +94,94 @@ test.describe("BLE Mock Transport Integration", () => {
     // "EEDS EIGHTEEN BYTE" (18 bytes)
     // "S\n" (2 bytes)
     expect(result.length).toBeGreaterThan(1);
-    expect(result[0].length).toBeLessThanOrEqual(18);
+    expect(result.every((chunk) => chunk.length <= 18)).toBe(true);
 
     // Check that the last chunk ends with a newline (10)
     const lastChunk = result[result.length - 1];
     expect(lastChunk[lastChunk.length - 1]).toBe(10);
+  });
+
+  test("OnboardingManager accepts the firmware configuration object without reparsing it", async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      const { OnboardingManager } = await import("./onboarding.js");
+      const config = {
+        role: "tracker",
+        revision: 7,
+        device_name: "Pasture 1",
+        communication: { tx_interval_s: 60 },
+      };
+      const manager = new OnboardingManager({
+        sendCommand: async (command) => {
+          if (command !== "GET CONFIG") throw new Error("unexpected command");
+          return config;
+        },
+      });
+      return await manager.getConfig();
+    });
+
+    expect(result.revision).toBe(7);
+    expect(result.communication.tx_interval_s).toBe(60);
+  });
+
+  test("OnboardingManager sends authenticated credential replacement command", async ({
+    page,
+  }) => {
+    const command = await page.evaluate(async () => {
+      const { OnboardingManager } = await import("./onboarding.js");
+      let sent;
+      const manager = new OnboardingManager({
+        sendCommand: async (value) => {
+          sent = value;
+          return { ok: true };
+        },
+      });
+      await manager.replaceCredential("new-secret-123");
+      return sent;
+    });
+    expect(command).toBe("SET_CREDENTIAL new-secret-123");
+  });
+
+  test("a timeout rejects both the active and queued BLE commands", async ({
+    page,
+  }) => {
+    const messages = await page.evaluate(async () => {
+      const { BleTransport } = await import("./onboarding.js");
+      const mockTx = {
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        startNotifications: async () => {},
+      };
+      const mockRx = {
+        writeValueWithResponse: async () => new Promise(() => {}),
+      };
+      const device = {
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        gatt: {
+          connected: true,
+          connect: async () => ({
+            getPrimaryService: async () => ({
+              getCharacteristic: async (uuid) =>
+                uuid === "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+                  ? mockTx
+                  : mockRx,
+            }),
+          }),
+          disconnect() {
+            this.connected = false;
+          },
+        },
+      };
+      const transport = new BleTransport({ requestDevice: async () => device });
+      await transport.connect();
+      const first = transport.sendCommand("FIRST", 10).catch((e) => e.message);
+      const second = transport.sendCommand("SECOND", 5000).catch((e) => e.message);
+      return await Promise.all([first, second]);
+    });
+
+    expect(messages).toEqual(["Command timeout", "BLE Disconnected"]);
   });
 
   test("BleTransport handles timeouts and disconnect rejections", async ({

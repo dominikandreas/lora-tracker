@@ -95,7 +95,9 @@ export class AlertsManager {
 
     if (
       latestPoint.latitude !== undefined &&
-      latestPoint.longitude !== undefined
+      latestPoint.longitude !== undefined &&
+      (!state.lastPosition ||
+        latestPoint.effective_time_unix_ms >= state.lastPosition.time)
     ) {
       state.lastPosition = {
         lat: latestPoint.latitude,
@@ -127,10 +129,14 @@ export class AlertsManager {
   notify(message) {
     console.warn(`[ALERT] ${message}`);
     if (this.enabled) {
-      new Notification("LoRa Tracker Alert", {
-        body: message,
-        icon: "manifest-icon-192.maskable.png",
-      });
+      try {
+        new Notification("LoRa Tracker Alert", {
+          body: message,
+          icon: "icon.svg",
+        });
+      } catch (error) {
+        console.warn("Could not display notification", error);
+      }
     }
   }
 }

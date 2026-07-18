@@ -1,5 +1,5 @@
 const DB_NAME = "lora-tracker-web";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const STORE = "points";
 const RETENTION_MS = 180 * 24 * 3600_000;
 const MAX_POINTS = 250_000;
@@ -21,6 +21,9 @@ function openDb() {
       }
       if (!store.indexNames.contains("time")) {
         store.createIndex("time", "effective_time_unix_ms");
+      }
+      if (!store.indexNames.contains("device")) {
+        store.createIndex("device", "device_hash");
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -103,6 +106,50 @@ export async function listPoints(
     (a, b) =>
       a.effective_time_unix_ms - b.effective_time_unix_ms || a.seq - b.seq,
   );
+}
+
+export async function listLatestPoints() {
+  const db = await openDb();
+  try {
+    const hashes = await new Promise((resolve, reject) => {
+      const values = [];
+      const request = db
+        .transaction(STORE, "readonly")
+        .objectStore(STORE)
+        .index("device")
+        .openKeyCursor(null, "nextunique");
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) return resolve(values);
+        values.push(cursor.key);
+        cursor.continue();
+      };
+      request.onerror = () => reject(request.error);
+    });
+    const points = await Promise.all(
+      hashes.map(
+        (hash) =>
+          new Promise((resolve, reject) => {
+            const request = db
+              .transaction(STORE, "readonly")
+              .objectStore(STORE)
+              .index("device_time")
+              .openCursor(
+                IDBKeyRange.bound(
+                  [hash, 0],
+                  [hash, Number.MAX_SAFE_INTEGER],
+                ),
+                "prev",
+              );
+            request.onsuccess = () => resolve(request.result?.value || null);
+            request.onerror = () => reject(request.error);
+          }),
+      ),
+    );
+    return points.filter(Boolean);
+  } finally {
+    db.close();
+  }
 }
 
 export async function clearPoints(deviceHash) {

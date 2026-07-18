@@ -9,9 +9,8 @@ core used by the ESP32 firmware as WebAssembly.
 
 ```text
 cd components/simulator-web
-make wasm
 npm ci
-npm test
+npm run build
 npx playwright install --with-deps chromium
 npm run test:browser
 python3 -m http.server 8080 -d app

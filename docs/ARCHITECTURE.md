@@ -105,9 +105,14 @@ physical tests.
 ## Web application
 
 The web app is a static PWA. It implements MQTT 3.1.1 over WebSocket directly,
-stores non-secret broker settings in localStorage, keeps points in IndexedDB,
-and displays a local-coordinate SVG route. It currently has no BLE onboarding
-UI and no geographical tile layer.
+stores non-secret broker settings in localStorage, keeps bounded point history
+in IndexedDB, and restores cached tracker state after an offline reload. Leaflet
+renders an offline grid, an explicitly selected OpenStreetMap layer, or a local
+raster PMTiles archive retained in OPFS. MQTT passwords remain session-only.
+An attended Web Bluetooth client supports authenticated tracker claiming,
+configuration, rollback, reboot and factory reset. Gateway configuration stays
+on the gateway's own captive portal because a Pages origin cannot safely reach
+an arbitrary local HTTP gateway.
 
 ## Identity and trust
 

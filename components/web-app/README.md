@@ -1,7 +1,7 @@
 # LoRa Tracker web app
 
-A dependency-free progressive web app for the LoRa Tracker MQTT API. It runs as static
-files and uses MQTT 3.1.1 over WebSocket directly in the browser.
+A static progressive web app for the LoRa Tracker MQTT API. It uses MQTT 3.1.1
+over WebSocket directly in the browser and bundles Leaflet and PMTiles locally.
 
 ## Current features
 
@@ -12,12 +12,17 @@ files and uses MQTT 3.1.1 over WebSocket directly in the browser.
 - MQTT history-schema v2 requests and chunk collection
 - IndexedDB local point cache
 - Multi-tracker selection and status cards
-- Lightweight SVG route view with no external map or tile dependency
+- Leaflet route map with an offline grid, opt-in OpenStreetMap, or an imported
+  raster PMTiles archive stored in OPFS
+- Authenticated Web Bluetooth tracker configuration
+- Open-app staleness, battery and unusual-movement notifications
 - Installable/offline application shell through a service worker
 
 ## Run
 
 ```bash
+npm ci
+npm run build
 python3 -m http.server 8080
 ```
 
@@ -28,13 +33,13 @@ The app stores broker URL, base topic and username in localStorage. It never
 persists the MQTT password. MQTT remains an untrusted transport until the later
 end-to-end encryption step is implemented.
 
-## Deliberate limitations of this first app
+## Deliberate limitations
 
-- No BLE or Wi-Fi onboarding UI yet
 - No QR provisioning or app-to-app transfer yet
 - No end-to-end encryption yet
-- No geographical base map; the route is plotted in local coordinates
-- History pagination beyond the first 500 points is not automated yet
+- MQTT passwords are session-only; reconnecting after a reload requires entry
+- BLE tracker setup requires Chromium on a platform with Web Bluetooth
+- PMTiles support is raster-only
 
 ## Notifications
 

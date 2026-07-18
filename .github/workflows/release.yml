@@ -54,6 +54,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y emscripten
+      - name: Test simulation engine
+        working-directory: components/simulation-engine
+        run: |
+          npm ci
+          npm test
       - name: Test browser application
         working-directory: components/web-app
         run: |
@@ -62,11 +67,13 @@ jobs:
           npx playwright install --with-deps chromium
           npm test
           npm run package
-      - name: Build simulator-web
+      - name: Test and build simulator-web
         working-directory: components/simulator-web
         run: |
           npm ci
           npm run build
+          npx playwright install --with-deps chromium
+          npm run test:browser
       - name: Build and package every supported firmware target
         env:
           VERSION: ${{ steps.version.outputs.version }}

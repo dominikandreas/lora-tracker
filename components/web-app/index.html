@@ -9,7 +9,7 @@
     <meta name="theme-color" content="#172018" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://*.tile.openstreetmap.org https://server.arcgisonline.com; connect-src 'self' ws: wss: http: https:;"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://*.tile.openstreetmap.org; connect-src 'self' ws: wss:;"
     />
     <title>LoRa Tracker</title>
     <link rel="manifest" href="manifest.webmanifest" />
@@ -24,12 +24,16 @@
         <p class="eyebrow">LORA TRACKER NETWORK</p>
         <h1>Tracker Console</h1>
       </div>
-      <div class="mode-toggle" style="margin-left: auto; margin-right: 20px">
+      <div class="mode-toggle">
         <a
-          href="../simulator-web/app/index.html"
+          href="https://dominikandreas.github.io/lora-tracker-docs/simulator/"
           target="_blank"
-          style="color: #4caf50; text-decoration: none; font-weight: bold"
           >Open Network Lab ↗</a
+        >
+        <a
+          class="header-link"
+          href="https://dominikandreas.github.io/lora-tracker-docs/"
+          >Documentation</a
         >
       </div>
       <span id="connectionBadge" class="badge offline">Offline</span>
@@ -128,64 +132,63 @@
                 </select>
                 <button id="historyButton">Fetch history</button>
               </div>
-              <div id="labActions" class="actions" style="display: none">
-                <button id="simPlay">Run Simulation</button>
-                <button id="simReset">Reset</button>
-              </div>
-              <div id="onboardingPanel" style="display: none" class="panel">
-                <h3>Tracker Configuration</h3>
-                <p>Status: <span id="bleStatus">Disconnected</span></p>
-                <div id="bleControls" style="display: none">
-                  <div style="margin-bottom: 10px">
-                    <input
-                      type="password"
-                      id="blePassword"
-                      placeholder="Administrator Claim Key"
-                    />
-                    <button id="bleClaim">Claim</button>
-                    <button id="bleAuth">Auth</button>
-                  </div>
-                  <div
-                    id="bleConfigForm"
-                    style="
-                      display: none;
-                      border: 1px solid #333;
-                      padding: 10px;
-                      margin-bottom: 10px;
-                    "
-                  >
-                    <label>Device Name <input id="cfgDeviceName" /></label
-                    ><br />
-                    <label>WiFi SSID <input id="cfgWifiSsid" /></label><br />
-                    <label
-                      >WiFi Password
-                      <input type="password" id="cfgWifiPassword" /></label
-                    ><br />
-                    <label
-                      >TX Interval (s)
-                      <input type="number" id="cfgTxInterval" /></label
-                    ><br />
-                    <button id="bleSaveConfig" class="primary">
-                      Save Config
-                    </button>
-                  </div>
-                  <div>
-                    <button id="bleGetConfig">Refresh Config</button>
-                    <button id="bleRollback">Rollback</button>
-                    <button id="bleReboot">Reboot</button>
-                    <button id="bleFactoryReset">Factory Reset</button>
-                  </div>
-                  <pre
-                    id="bleOutput"
-                    style="
-                      background: #222;
-                      padding: 5px;
-                      margin-top: 10px;
-                      max-height: 200px;
-                      overflow-y: auto;
-                    "
-                  ></pre>
+            </div>
+            <div id="onboardingPanel" hidden class="onboarding-panel">
+              <div class="section-title">
+                <div>
+                  <p class="eyebrow">LOCAL BLUETOOTH</p>
+                  <h3>Tracker configuration</h3>
                 </div>
+                <span id="bleStatus" class="badge offline">Disconnected</span>
+              </div>
+              <p class="hint">
+                Open the tracker’s setup window first. Pair using the PIN shown
+                on its display. Use Claim only on a factory-new tracker to set a
+                new 12–24 character administrator credential; otherwise use
+                Authenticate with its existing credential.
+              </p>
+              <div id="bleControls" hidden>
+                <div class="credential-row">
+                  <label>Administrator credential
+                    <input type="password" id="blePassword" minlength="12" maxlength="24" autocomplete="off" />
+                  </label>
+                  <button id="bleClaim">Claim new tracker</button>
+                  <button id="bleAuth">Authenticate</button>
+                  <button id="bleReplaceCredential">Replace credential</button>
+                </div>
+                <div id="bleConfigForm" hidden>
+                  <div class="config-grid">
+                    <label>Device ID<input id="cfgDeviceId" maxlength="24" /></label>
+                    <label>Device name<input id="cfgDeviceName" maxlength="32" /></label>
+                    <label>Wi-Fi SSID<input id="cfgWifiSsid" maxlength="32" /></label>
+                    <label>Wi-Fi password<input type="password" id="cfgWifiPassword" placeholder="Leave blank to keep" /></label>
+                    <label>Frequency (Hz)<input type="number" id="cfgFrequency" /></label>
+                    <label>Transmit power (dBm)<input type="number" id="cfgTxPower" min="-9" max="14" /></label>
+                    <label>Spreading factor<input type="number" id="cfgSf" min="7" max="12" /></label>
+                    <label>Relay hop limit<input type="number" id="cfgHopLimit" min="0" max="4" /></label>
+                    <label>Transmit interval (s)<input type="number" id="cfgTxInterval" min="1" /></label>
+                    <label>ACK timeout (ms)<input type="number" id="cfgAckTimeout" min="1" /></label>
+                    <label>Moving sleep (s)<input type="number" id="cfgMovingSleep" min="1" /></label>
+                    <label>Stationary sleep (s)<input type="number" id="cfgStationarySleep" min="1" /></label>
+                    <label class="radio-key">Tracker radio key
+                      <input type="password" id="cfgRadioKey" readonly autocomplete="off" />
+                    </label>
+                    <button id="bleRevealKey" type="button">Show key</button>
+                  </div>
+                  <p class="hint">
+                    The radio key is secret. Transfer it to an authorized
+                    gateway over an attended channel. Changing the device ID or
+                    key also requires updating every gateway registry entry.
+                  </p>
+                  <button id="bleSaveConfig" class="primary">Save configuration</button>
+                </div>
+                <div class="actions onboarding-actions">
+                  <button id="bleGetConfig">Refresh configuration</button>
+                  <button id="bleRollback">Rollback</button>
+                  <button id="bleReboot">Reboot</button>
+                  <button id="bleFactoryReset" class="danger">Factory reset</button>
+                </div>
+                <pre id="bleOutput" class="ble-output" role="log" aria-live="polite"></pre>
               </div>
             </div>
             <div

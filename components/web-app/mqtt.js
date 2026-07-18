@@ -1,5 +1,6 @@
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
+const MAX_BUFFER_BYTES = 2 * 1024 * 1024;
 
 function concatBytes(...arrays) {
   const size = arrays.reduce((sum, a) => sum + a.length, 0);
@@ -158,7 +159,14 @@ export class MqttWebSocketClient extends EventTarget {
     if (!this.options) return;
     this.buffer = new Uint8Array();
     this.#emit("status", { state: "connecting" });
-    const socket = new WebSocket(this.options.url, ["mqtt"]);
+    let socket;
+    try {
+      socket = new WebSocket(this.options.url, ["mqtt"]);
+    } catch (error) {
+      this.#emit("error", { message: `Invalid WebSocket URL: ${error.message}` });
+      this.#emit("status", { state: "offline" });
+      return;
+    }
     socket.binaryType = "arraybuffer";
     this.socket = socket;
     socket.onopen = () => {
@@ -184,6 +192,11 @@ export class MqttWebSocketClient extends EventTarget {
   }
 
   #onBytes(bytes) {
+    if (this.buffer.length + bytes.length > MAX_BUFFER_BYTES) {
+      this.#emit("error", { message: "MQTT packet exceeds the browser limit" });
+      this.socket?.close();
+      return;
+    }
     const combined = concatBytes(this.buffer, bytes);
     const parsed = parsePackets(combined);
     this.buffer = parsed.remainder;
@@ -194,6 +207,7 @@ export class MqttWebSocketClient extends EventTarget {
           this.#emit("error", {
             message: `MQTT connection rejected (${code})`,
           });
+          this.manualClose = true;
           this.socket?.close();
           continue;
         }
@@ -235,12 +249,16 @@ export class MqttWebSocketClient extends EventTarget {
   }
 
   subscribe(...topics) {
-    topics
+    const added = topics
       .flat()
       .filter(Boolean)
-      .forEach((t) => this.subscriptions.add(t));
-    if (this.socket?.readyState === WebSocket.OPEN)
-      this.#sendSubscribe(topics.flat());
+      .filter((topic) => {
+        if (this.subscriptions.has(topic)) return false;
+        this.subscriptions.add(topic);
+        return true;
+      });
+    if (this.socket?.readyState === WebSocket.OPEN && added.length)
+      this.#sendSubscribe(added);
   }
 
   #sendSubscribe(topics) {
