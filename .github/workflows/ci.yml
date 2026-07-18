@@ -41,19 +41,38 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y emscripten
+      - name: Test simulation engine
+        working-directory: components/simulation-engine
+        run: |
+          npm ci
+          npm test
+      - name: Test simulator-web
+        working-directory: components/simulator-web
+        run: |
+          npm ci
+          npm run build
+          npx playwright install --with-deps chromium
+          npm run test:browser
       - name: Test browser application
         working-directory: components/web-app
         run: |
           npm ci
           npm run build
-          git diff --exit-code ../simulation-engine/dist/firmware-core.wasm || (echo "WASM drift detected. Update the repository." && exit 1)
+          git diff --exit-code ../simulation-engine/dist/ || (echo "Simulation engine drift detected. Update the repository." && exit 1)
           npx playwright install --with-deps chromium
           npm test
+          npm run package
+      - name: Upload Network Lab artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lora-tracker-network-lab
+          path: components/simulator-web/app/
+          if-no-files-found: error
       - name: Upload PWA artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: lora-tracker-web-app
-          path: components/web-app/
+          path: components/web-app/dist/
           if-no-files-found: error
       - name: Build tracker firmware
         run: |

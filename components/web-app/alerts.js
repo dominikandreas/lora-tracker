@@ -2,7 +2,6 @@ export class AlertsManager {
   constructor() {
     this.states = new Map(); // trackerHash -> { batteryState, lastSeen, alertLevel, etc }
     this.staleThresholdMs = 2 * 60 * 60 * 1000; // 2 hours
-    this.missingGatewayThresholdMs = 15 * 60 * 1000; // 15 mins without a gateway update if expected
     this.enabled =
       "Notification" in window && Notification.permission === "granted";
     this.intervalId = null;
@@ -33,8 +32,8 @@ export class AlertsManager {
       this.states.set(hash, {
         batteryState: 100, // assume full initially to avoid false alarms
         staleAlerted: false,
-        missingAlerted: false,
         lastPosition: null,
+        lastMovementAlertTime: 0,
       });
     }
     return this.states.get(hash);
@@ -83,9 +82,13 @@ export class AlertsManager {
 
         if (speed > 30) {
           // ~108 km/h is unusually fast for a horse
-          this.notify(
-            `Unusual movement detected for ${tracker.name} (${Math.round(speed * 3.6)} km/h).`,
-          );
+          // Deduplicate alerts (5 minute cooldown)
+          if (now - state.lastMovementAlertTime > 5 * 60 * 1000) {
+            this.notify(
+              `Unusual movement detected for ${tracker.name} (${Math.round(speed * 3.6)} km/h).`,
+            );
+            state.lastMovementAlertTime = now;
+          }
         }
       }
     }
@@ -99,11 +102,6 @@ export class AlertsManager {
         lon: latestPoint.longitude,
         time: latestPoint.effective_time_unix_ms,
       };
-    }
-
-    if (latestPoint.gateway_id || latestPoint.gateway_hash) {
-      state.lastGatewayTime = latestPoint.effective_time_unix_ms;
-      state.missingAlerted = false;
     }
 
     // Reset staleness if fresh
@@ -122,16 +120,6 @@ export class AlertsManager {
           `Tracker ${tracker.name} is stale (last seen > 2 hours ago).`,
         );
         state.staleAlerted = true;
-      }
-
-      if (state.lastGatewayTime && !state.missingAlerted) {
-        const gwAge = now - state.lastGatewayTime;
-        if (gwAge > this.missingGatewayThresholdMs) {
-          this.notify(
-            `Tracker ${tracker.name} has not reached a gateway in > 15 mins.`,
-          );
-          state.missingAlerted = true;
-        }
       }
     }
   }

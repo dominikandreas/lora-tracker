@@ -25,12 +25,11 @@
         <h1>Tracker Console</h1>
       </div>
       <div class="mode-toggle" style="margin-left: auto; margin-right: 20px">
-        <label
-          ><input type="radio" name="appMode" value="dashboard" checked />
-          Dashboard</label
-        >
-        <label
-          ><input type="radio" name="appMode" value="lab" /> Network Lab</label
+        <a
+          href="../simulator-web/app/index.html"
+          target="_blank"
+          style="color: #4caf50; text-decoration: none; font-weight: bold"
+          >Open Network Lab ↗</a
         >
       </div>
       <span id="connectionBadge" class="badge offline">Offline</span>
@@ -137,17 +136,45 @@
                 <h3>Tracker Configuration</h3>
                 <p>Status: <span id="bleStatus">Disconnected</span></p>
                 <div id="bleControls" style="display: none">
-                  <input
-                    type="password"
-                    id="blePassword"
-                    placeholder="PIN/Password"
-                  />
-                  <button id="bleClaim">Claim</button>
-                  <button id="bleAuth">Auth</button>
-                  <button id="bleGetConfig">Get Config</button>
-                  <button id="bleRollback">Rollback</button>
-                  <button id="bleReboot">Reboot</button>
-                  <button id="bleFactoryReset">Factory Reset</button>
+                  <div style="margin-bottom: 10px">
+                    <input
+                      type="password"
+                      id="blePassword"
+                      placeholder="Administrator Claim Key"
+                    />
+                    <button id="bleClaim">Claim</button>
+                    <button id="bleAuth">Auth</button>
+                  </div>
+                  <div
+                    id="bleConfigForm"
+                    style="
+                      display: none;
+                      border: 1px solid #333;
+                      padding: 10px;
+                      margin-bottom: 10px;
+                    "
+                  >
+                    <label>Device Name <input id="cfgDeviceName" /></label
+                    ><br />
+                    <label>WiFi SSID <input id="cfgWifiSsid" /></label><br />
+                    <label
+                      >WiFi Password
+                      <input type="password" id="cfgWifiPassword" /></label
+                    ><br />
+                    <label
+                      >TX Interval (s)
+                      <input type="number" id="cfgTxInterval" /></label
+                    ><br />
+                    <button id="bleSaveConfig" class="primary">
+                      Save Config
+                    </button>
+                  </div>
+                  <div>
+                    <button id="bleGetConfig">Refresh Config</button>
+                    <button id="bleRollback">Rollback</button>
+                    <button id="bleReboot">Reboot</button>
+                    <button id="bleFactoryReset">Factory Reset</button>
+                  </div>
                   <pre
                     id="bleOutput"
                     style="

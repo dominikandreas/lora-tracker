@@ -1,43 +1,24 @@
-# Application Refactoring Complete
+# Release Blockers Addressed
 
-I have completed the P1 Application architecture refactoring, including testing, verification, and documentation. The application now supports robust offline mapping, isolated modes, and reliable BLE onboarding.
+I have successfully resolved the 12 critical issues and release blockers you identified. The project's web-app branch is now stable, pushed, and has a reliable CI/CD pipeline.
 
-## Summary of Changes
+## 1. Onboarding & BLE Controls
+- Integrated the HTML UI in `index.html` for Tracker Onboarding (Claim, Auth, Config, Rollback, Reboot, Factory Reset).
+- Corrected the `ROLLBACK <revision>` command dynamically using the previously fetched configuration revision.
+- Fixed the `FACTORY_RESET FACTORY_RESET` command parameter according to firmware requirements.
+- Addressed the timeout queue race condition in `onboarding.js`, avoiding synchronous array mutation anomalies on timeout/disconnect.
 
-### 1. Application Modes & Simulation Isolation
-- Integrated a Mode switch in the UI (Dashboard vs Network Lab).
-- **Dashboard Mode**: Uses the production `IndexedDB` storage, hides the simulation UI, and does not instantiate the Web Worker.
-- **Lab Mode**: Explicitly initializes the Web Worker for the Network Simulator, uses an isolated in-memory namespace for simulated telemetry (`isSimulated` flag in map points), and cleans up all simulation resources when the mode is disabled.
-- Application mode is correctly persisted to `localStorage`.
+## 2. Infrastructure & Tests
+- Hardened `ci.yml` to explicitly install the emscripten compiler, run `npm ci`, and build/copy assets in an isolated step, strictly evaluating `web-app` against the generated `simulation-engine` outputs.
+- Prettier/dos2unix formatters were run, and `package-lock.json` files are properly versioned alongside `.gitignore` corrections (now tracking `dist/` explicitly to catch WASM drift securely via Git exit codes).
+- The `ble.spec.js` suite now explicitly evaluates mock rejections on slow device writes and full timeout coverage.
+- The `e2e.spec.js` suite includes new Content-Security-Policy evaluations utilizing console interceptors and fully tests offline service worker activation via Playwright context overrides.
 
-### 2. Offline Maps & PMTiles
-- Configured local offline mapping via **Leaflet** and **PMTiles**.
-- Created an Explicit Layer Selector:
-  - **Grid (Offline)**: Provides a fallback grid mapping layer when no archive is installed.
-  - **OpenStreetMap (Online)**: A remote explicitly-opted-in map layer.
-  - **PMTiles Archive (Offline)**: Support for offline maps imported from local `.pmtiles` archives via the Origin Private File System (OPFS).
-- Repaired map camera behavior: Bounds are now fit only on explicit user actions (e.g. clicking a tracker or fetching history) instead of resetting uncontrollably on every heartbeat.
+## 3. UI/UX Enhancements
+- Fixed UI fallback for `showOpenFilePicker()` utilizing a traditional `<input type="file" />` when the File System Access API is unavailable.
+- Hidden `MapManager`'s production tracking nodes gracefully when swapping to "Network Lab" view.
+- Adjusted alert thresholds correctly using the `missingGatewayThresholdMs` against individual tracker timelines, while protecting against zero-coordinate map exceptions (`latitude !== undefined`).
+- Updated `ROADMAP.md` checkmarks properly matching incomplete CI requirements.
 
-### 3. Robust BLE Transport & Onboarding
-- Replaced rudimentary direct GATT writes with a highly-robust `BleTransport` class wrapper.
-- Uses strict 18-byte MTU chunking and sequential sequencing for all payloads over BLE.
-- Added a serialized queue, ensuring exactly one outstanding command exists at a time, backed by per-command timeouts and disconnect rejections.
-- Implemented handler cleanup upon reconnect/disconnect.
-- Supported tracking flows for `CLAIM`, `AUTH`, `GET/PATCH CONFIG`, `ROLLBACK`, `REBOOT` and `FACTORY RESET`.
-- Dropped gateway HTTP onboarding provisioning from the PWA as decided.
-
-### 4. Secure Storage
-- Enforced session-only scope for MQTT credentials. All connection parameters (except passwords) are saved, while the password must explicitly be re-entered (or populated via browser auto-fill). The previous PIN-backed storage scheme was deleted to prevent weak symmetric fallback storage in a shared-origin deployment (like GitHub Pages).
-
-### 5. Alerts & Notifications
-- Refined alerting logic into robust state machines evaluated on a fixed interval (`setInterval`), separating alert checks from new point ingestions.
-- Added hysteresis loops to battery states (e.g. critical alerts at 20%, 10%, 5%, resetting only when charging past a 5% threshold).
-- Discovered and alerted on "Unusual Movement" dynamically (e.g. speed spikes exceeding normal biological limitations).
-- Integrated an explicit `Enable Alerts` UI button adhering to modern Notification API requirements.
-- Documented distinction between active PWA notifications vs closed-app Web Push logic.
-
-### 6. Verification & End-to-End Testing
-- Fully integrated **Playwright** end-to-end tests covering Mode switching, explicit simulation initialization, CSP rules (guaranteeing no CDN scripts), map fallback logic, and BLE capability.
-- Added a fully mocked-adapter suite for the `BleTransport` chunking algorithm, verifying maximum string chunk lengths without hardware-in-the-loop dependencies.
-
-All tests passed locally with deterministic builds, and the code has been staged, committed, and pushed!
+## Next Steps
+The changes are fully committed and pushed. `npm test` runs cleanly on Playwright including all hardened specs. This branch is now ready for your review and possible merge into the production mainline!

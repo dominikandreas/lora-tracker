@@ -2,7 +2,6 @@ import { MqttWebSocketClient } from "./mqtt.js";
 import { putPoint, listPoints, clearPoints } from "./storage.js";
 import { normalizePoint } from "./points.js";
 import { MapManager } from "./map.js";
-import { SimulatorIntegration } from "./simulator-integration.js";
 import { AlertsManager } from "./alerts.js";
 import { OnboardingManager } from "./onboarding.js";
 
@@ -10,7 +9,6 @@ const els = Object.fromEntries(
   [...document.querySelectorAll("[id]")].map((el) => [el.id, el]),
 );
 const mapManager = new MapManager("map");
-const simulator = new SimulatorIntegration(mapManager);
 const alertsManager = new AlertsManager();
 const onboardingManager = new OnboardingManager();
 const mqtt = new MqttWebSocketClient();
@@ -25,10 +23,6 @@ const saved = JSON.parse(
 els.brokerUrl.value = saved.brokerUrl || "";
 els.baseTopic.value = saved.baseTopic || "lora-tracker";
 els.username.value = saved.username || "";
-
-let appMode = saved.appMode || "dashboard";
-document.querySelector(`input[name="appMode"][value="${appMode}"]`).checked =
-  true;
 
 let mapLayerType = saved.mapLayerType || "none";
 els.mapLayer.value = mapLayerType;
@@ -115,16 +109,57 @@ els.bleAuth.addEventListener("click", async () => {
     appendBleOutput("Authenticating...");
     const result = await onboardingManager.auth(els.blePassword.value);
     appendBleOutput(result);
+    // Auto-fetch config after auth
+    els.bleGetConfig.click();
   } catch (e) {
     appendBleOutput(`Error: ${e.message}`);
   }
 });
+
+function loadConfigIntoForm(config) {
+  try {
+    els.bleConfigForm.style.display = "block";
+    els.cfgDeviceName.value = config.device_name || "";
+    els.cfgWifiSsid.value = config.wifi_ssid || "";
+    els.cfgWifiPassword.value = config.wifi_password || "";
+    els.cfgTxInterval.value = config.lora_tx_interval_s || "";
+  } catch (e) {
+    // ignore
+  }
+}
 
 els.bleGetConfig.addEventListener("click", async () => {
   try {
     appendBleOutput("Fetching config...");
     const result = await onboardingManager.getConfig();
     appendBleOutput(result);
+    loadConfigIntoForm(result);
+  } catch (e) {
+    appendBleOutput(`Error: ${e.message}`);
+  }
+});
+
+els.bleSaveConfig.addEventListener("click", async () => {
+  try {
+    const fields = {};
+    if (els.cfgDeviceName.value) fields.device_name = els.cfgDeviceName.value;
+    if (els.cfgWifiSsid.value) fields.wifi_ssid = els.cfgWifiSsid.value;
+    if (els.cfgWifiPassword.value)
+      fields.wifi_password = els.cfgWifiPassword.value;
+    if (els.cfgTxInterval.value)
+      fields.lora_tx_interval_s = parseInt(els.cfgTxInterval.value, 10);
+
+    if (!onboardingManager.lastConfig)
+      throw new Error("Must fetch config first");
+
+    appendBleOutput("Saving config...");
+    const result = await onboardingManager.patchConfig(
+      onboardingManager.lastConfig.revision,
+      fields,
+    );
+    appendBleOutput(result);
+    // Refresh to get updated revision
+    els.bleGetConfig.click();
   } catch (e) {
     appendBleOutput(`Error: ${e.message}`);
   }
@@ -158,29 +193,33 @@ els.bleFactoryReset.addEventListener("click", async () => {
 });
 
 els.importPmtilesButton.addEventListener("click", async () => {
-  try {
-    const [fileHandle] = await window.showOpenFilePicker({
-      types: [
-        {
-          description: "PMTiles Archive",
-          accept: { "application/octet-stream": [".pmtiles"] },
-        },
-      ],
-    });
-    const file = await fileHandle.getFile();
-    const root = await navigator.storage.getDirectory();
-    const draft = await root.getFileHandle("map.pmtiles", { create: true });
-    const writable = await draft.createWritable();
-    await writable.write(file);
-    await writable.close();
+  if ("showOpenFilePicker" in window) {
+    try {
+      const [fileHandle] = await window.showOpenFilePicker({
+        types: [
+          {
+            description: "PMTiles Archive",
+            accept: { "application/octet-stream": [".pmtiles"] },
+          },
+        ],
+      });
+      const file = await fileHandle.getFile();
+      const root = await navigator.storage.getDirectory();
+      const draft = await root.getFileHandle("map.pmtiles", { create: true });
+      const writable = await draft.createWritable();
+      await writable.write(file);
+      await writable.close();
 
-    els.mapLayer.querySelector('option[value="pmtiles"]').disabled = false;
-    els.mapLayer.value = "pmtiles";
-    mapLayerType = "pmtiles";
-    saveSettings();
-    await mapManager.setLayer("pmtiles", draft);
-  } catch (e) {
-    console.warn("Import cancelled or failed", e);
+      els.mapLayer.querySelector('option[value="pmtiles"]').disabled = false;
+      els.mapLayer.value = "pmtiles";
+      mapLayerType = "pmtiles";
+      saveSettings();
+      await mapManager.setLayer("pmtiles", draft);
+    } catch (e) {
+      if (e.name !== "AbortError") els.pmtilesInput?.click();
+    }
+  } else {
+    els.pmtilesInput?.click();
   }
 });
 
@@ -203,36 +242,25 @@ els.enableAlertsButton.addEventListener("click", async () => {
 });
 updateAlertsButtonState();
 
-function updateAppMode() {
-  mapManager.setMode(appMode);
-  if (appMode === "lab") {
-    els.dashboardActions.style.display = "none";
-    els.labActions.style.display = "flex";
-    document.querySelector(".tracker-list-panel").style.display = "none";
-    simulator.init();
-  } else {
-    els.dashboardActions.style.display = "flex";
-    els.labActions.style.display = "none";
-    document.querySelector(".tracker-list-panel").style.display = "block";
-    simulator.terminate();
-  }
-}
+els.pmtilesInput?.addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  try {
+    const root = await navigator.storage.getDirectory();
+    const draft = await root.getFileHandle("map.pmtiles", { create: true });
+    const writable = await draft.createWritable();
+    await writable.write(file);
+    await writable.close();
 
-document.querySelectorAll('input[name="appMode"]').forEach((radio) => {
-  radio.addEventListener("change", (e) => {
-    appMode = e.target.value;
+    els.mapLayer.querySelector('option[value="pmtiles"]').disabled = false;
+    els.mapLayer.value = "pmtiles";
+    mapLayerType = "pmtiles";
     saveSettings();
-    updateAppMode();
-  });
+    await mapManager.setLayer("pmtiles", draft);
+  } catch (err) {
+    alert(`Failed to load PMTiles: ${err.message}`);
+  }
 });
-
-els.simPlay?.addEventListener("click", () => simulator.togglePlay());
-els.simReset?.addEventListener("click", () => {
-  simulator.terminate();
-  simulator.init();
-});
-
-updateAppMode();
 
 function saveSettings() {
   localStorage.setItem(
@@ -241,7 +269,6 @@ function saveSettings() {
       brokerUrl: els.brokerUrl.value.trim(),
       baseTopic: els.baseTopic.value.trim() || "lora-tracker",
       username: els.username.value.trim(),
-      appMode,
       mapLayerType,
     }),
   );

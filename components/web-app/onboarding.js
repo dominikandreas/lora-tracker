@@ -138,7 +138,11 @@ export class BleTransport {
       if (this.activeCommand === cmd) {
         this.activeCommand = null;
         cmd.reject(new Error("Command timeout"));
-        this.processQueue();
+        if (this.device && this.device.gatt && this.device.gatt.connected) {
+          this.device.gatt.disconnect();
+        } else {
+          this.onDisconnected();
+        }
       }
     }, cmd.timeoutMs);
 

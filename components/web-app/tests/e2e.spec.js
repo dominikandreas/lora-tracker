@@ -46,21 +46,6 @@ test.describe("PWA Offline & Mode Tests", () => {
     await context.setOffline(false);
   });
 
-  test("Dashboard mode hides lab actions and simulation", async ({ page }) => {
-    await page.click('input[name="appMode"][value="dashboard"]');
-    await expect(page.locator("#labActions")).toBeHidden();
-    await expect(page.locator("#dashboardActions")).toBeVisible();
-  });
-
-  test("Lab mode shows simulation and initializes worker", async ({ page }) => {
-    await page.click('input[name="appMode"][value="lab"]');
-    await expect(page.locator("#labActions")).toBeVisible();
-    await expect(page.locator("#dashboardActions")).toBeHidden();
-
-    // Play button should be visible
-    await expect(page.locator("#simPlay")).toBeVisible();
-  });
-
   test("Map grid is default layer", async ({ page }) => {
     const mapLayerValue = await page.$eval("#mapLayer", (el) => el.value);
     expect(mapLayerValue).toBe("none");

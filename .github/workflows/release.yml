@@ -50,9 +50,18 @@ jobs:
       - name: Test release source
         working-directory: components/archiver
         run: python -m pytest -q
+      - name: Install WebAssembly compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y emscripten
       - name: Test browser application
         working-directory: components/web-app
-        run: npm test
+        run: |
+          npm ci
+          npm run build
+          npx playwright install --with-deps chromium
+          npm test
+          npm run package
       - name: Build and package every supported firmware target
         env:
           VERSION: ${{ steps.version.outputs.version }}
