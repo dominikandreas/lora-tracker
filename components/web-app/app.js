@@ -132,7 +132,7 @@ els.bleGetConfig.addEventListener("click", async () => {
   try {
     appendBleOutput("Fetching config...");
     const result = await onboardingManager.getConfig();
-    appendBleOutput(result);
+    appendBleOutput(JSON.stringify(result, null, 2));
     loadConfigIntoForm(result);
   } catch (e) {
     appendBleOutput(`Error: ${e.message}`);

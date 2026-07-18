@@ -194,7 +194,8 @@ export class OnboardingManager {
   }
 
   async getConfig() {
-    this.lastConfig = await this.transport.sendCommand("GET CONFIG");
+    const response = await this.transport.sendCommand("GET CONFIG");
+    this.lastConfig = JSON.parse(response);
     return this.lastConfig;
   }
 
