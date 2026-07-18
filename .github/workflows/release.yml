@@ -62,6 +62,11 @@ jobs:
           npx playwright install --with-deps chromium
           npm test
           npm run package
+      - name: Build simulator-web
+        working-directory: components/simulator-web
+        run: |
+          npm ci
+          npm run build
       - name: Build and package every supported firmware target
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -77,6 +82,8 @@ jobs:
           python tools/package_firmware.py --target repeater-heltec-lora32 --version "$VERSION" --output dist --download-base "$BASE"
           pio run -d components/repeater-firmware -e heltec_wireless_tracker
           python tools/package_firmware.py --target repeater-wireless-tracker --version "$VERSION" --output dist --download-base "$BASE"
+          (cd components/web-app/dist && zip -r ../../../dist/lora-tracker-web-app.zip .)
+          (cd components/simulator-web/app && zip -r ../../../dist/lora-tracker-network-lab.zip .)
           (cd dist && sha256sum * > SHA256SUMS)
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
