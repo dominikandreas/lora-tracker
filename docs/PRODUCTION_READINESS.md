@@ -34,6 +34,9 @@ delivery guarantees and hardware qualification and cannot be papered over.
   only after every new point has a durable SQLite receipt.
 - Enforced the Germany band-48 channel, 14 dBm conducted-power cap and 1% rolling-hour airtime ceiling on every transmitter.
 - Preserved unacknowledged points across daily rollover and stopped queue-full overwrite; new samples now fail closed when RTC storage is full.
+- Added consistent live archive backups, integrity and foreign-key checks,
+  guarded atomic restore with pre-restore snapshots, and dry-run retention
+  pruning.
 
 ## Release blockers
 
@@ -45,7 +48,7 @@ delivery guarantees and hardware qualification and cannot be papered over.
 | Tracker queue durability | Unacknowledged telemetry currently survives deep sleep only, not power loss or hard reset | Wear-levelled flash-journal fault injection with zero sequence reuse or silent point loss |
 | Hardware | Current gateway board port, qualified tracker design and installed repeater power/RF design | HIL CI, RF/power/environmental reports and factory tests |
 | Repeater RF | Hidden-node/capture behavior, multi-hop ACK timing and regulatory airtime remain unqualified | Multi-node installed-topology tests at maximum traffic and worst radio profile |
-| Operations | Monitoring, backup/restore, alerting and credential rotation | Runbooks exercised in a staging deployment |
+| Operations | Fleet monitoring, closed-app alerting and credential rotation remain missing; backup/restore tooling is implemented but still needs scheduled staging exercises | Monitoring evidence and runbooks exercised in a staging deployment |
 | Compliance | Germany radio limits are enforced in software, but installed ERP, RED/FuAG, privacy, battery and product obligations remain unqualified | Accredited RF/EMC/safety evidence and legal review for the exact product and installation |
 
 ## Field-trial gate

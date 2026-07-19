@@ -6,6 +6,7 @@
 # Build and tooling output
 .pio/
 components/.pio-build/
+.venv/
 **/__pycache__/
 *.egg-info/
 .pytest_cache/

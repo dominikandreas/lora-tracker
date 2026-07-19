@@ -30,7 +30,7 @@ hardware support or multiple public interfaces.
 ## P1 — reliability and operations
 
 - [ ] Add fleet health metrics, structured logs and alerting for stale devices, low battery and storage failures.
-- [ ] Add database backup/restore, integrity checking and configurable retention tooling.
+- [x] Add database backup/restore, integrity checking and configurable retention tooling.
 - [ ] Add configuration export/import with encrypted secrets and an auditable device inventory.
 - [ ] Add safe firmware rollout groups, rollback metadata and minimum-version enforcement.
 - [ ] Add factory acceptance tests for GNSS, radio, current draw, battery gauge and enclosure seals.

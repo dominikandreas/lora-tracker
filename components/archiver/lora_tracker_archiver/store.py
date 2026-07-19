@@ -249,6 +249,23 @@ class HistoryStore:
             )
             return cursor.rowcount
 
+    def count_before(self, cutoff_unix_ms: int) -> int:
+        with self._lock:
+            row = self._db.execute(
+                """
+                SELECT COUNT(*) AS count FROM points
+                WHERE (CASE
+                  WHEN timestamp_valid = 1 AND fix_time_unix_ms > 0
+                  THEN fix_time_unix_ms ELSE received_at_ms END) < ?
+                """,
+                (cutoff_unix_ms,),
+            ).fetchone()
+            return int(row["count"])
+
+    def checkpoint(self) -> None:
+        with self._lock:
+            self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+
     def count(self) -> int:
         with self._lock:
             row = self._db.execute(

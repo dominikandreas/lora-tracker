@@ -54,6 +54,39 @@ window, and toggle BLE debug logs respectively. See
 [Tracker button controls](ONBOARDING.md#tracker-button-controls) for timing and
 safety details.
 
+## Archive backup, verification and restore
+
+Use the archiver's SQLite backup command for online backups; copying only the
+main database file can omit committed WAL transactions. Verify every backup
+before moving it off-host:
+
+```bash
+python -m lora_tracker_archiver backup \
+  --database /data/lora-tracker-history.sqlite3 \
+  --output /backups/history-$(date -u +%F).sqlite3
+python -m lora_tracker_archiver check \
+  --database /backups/history-$(date -u +%F).sqlite3
+```
+
+Schedule backups to storage with independent credentials and retention. Alert
+on a nonzero exit status, rotate backups only after a new backup passes both
+SQLite quick-check and foreign-key validation, and periodically restore one in
+staging.
+
+Pruning previews its match count by default. Add `--apply` only after checking
+the reported cutoff and count:
+
+```bash
+python -m lora_tracker_archiver prune --retention-days 30
+python -m lora_tracker_archiver prune --retention-days 30 --apply
+```
+
+For restore, stop every archiver process that can access the database, retain
+the source backup, then use `restore --force`. The command validates the source,
+creates a timestamped pre-restore backup of the current archive, atomically
+replaces the database and removes stale WAL sidecars. Run `check` and a history
+query before restarting MQTT ingestion.
+
 ## BLE behavior
 
 BLE debugging is intentionally bounded. Lifecycle changes are deferred outside

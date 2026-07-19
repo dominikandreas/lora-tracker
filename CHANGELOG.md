@@ -36,6 +36,8 @@
 - Replaced the tracker’s hidden global button-hold ladder with visible per-page
   actions for distance reset, duration-scaled GNSS acquisition, immediate
   airtime-limited transmission with ACK countdown, and BLE debug-log toggling.
+- Added machine-readable archiver backup, integrity-check, guarded restore and
+  dry-run retention-pruning commands with automated recovery tests.
 
 ## Initial implementation
 

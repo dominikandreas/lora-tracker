@@ -15,6 +15,8 @@ paginated history requests over MQTT.
 - Optional allowlist of tracker hashes.
 - Chunked MQTT history-schema v2 responses.
 - Retained availability and status topics.
+- Consistent live backup, integrity checking, guarded restore and dry-run
+  retention maintenance commands.
 - Runs directly with Python or in Docker.
 
 ## Run locally
@@ -27,6 +29,41 @@ cp .env.example .env
 set -a; . ./.env; set +a
 python -m lora_tracker_archiver
 ```
+
+## Database maintenance
+
+Create a consistent backup while the archiver is running; SQLite's backup API
+includes committed WAL data without copying `-wal` or `-shm` files:
+
+```bash
+python -m lora_tracker_archiver backup \
+  --database /data/lora-tracker-history.sqlite3 \
+  --output /backups/history-$(date -u +%F).sqlite3
+python -m lora_tracker_archiver check \
+  --database /backups/history-$(date -u +%F).sqlite3
+```
+
+Retention pruning is a preview unless `--apply` is present:
+
+```bash
+python -m lora_tracker_archiver prune --retention-days 30
+python -m lora_tracker_archiver prune --retention-days 30 --apply
+```
+
+Stop the archiver before restoring. Restoring over an existing database
+requires `--force` and automatically creates a timestamped, integrity-checked
+`*.pre-restore-*` snapshot first:
+
+```bash
+python -m lora_tracker_archiver restore \
+  --database /data/lora-tracker-history.sqlite3 \
+  --input /backups/history-2026-07-19.sqlite3 \
+  --force
+```
+
+Every maintenance command emits one machine-readable JSON result and exits
+nonzero on validation or safety failures. Exercise backup and restore on a
+staging copy before relying on the runbook.
 
 ## Run the end-to-end simulator
 
