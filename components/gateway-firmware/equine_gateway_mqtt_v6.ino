@@ -351,10 +351,10 @@ void initializeAdminCredential() {
   Preferences credentials;
   if (!credentials.begin("ltcred", false)) return;
   const bool factory_valid = factory_admin_password &&
-    strlen(factory_admin_password) >= 12 &&
+    strlen(factory_admin_password) >= 8 &&
     strlen(factory_admin_password) < sizeof(admin_password);
   String stored = credentials.getString("admin", "");
-  if (stored.length() >= 12 && stored.length() < sizeof(admin_password)) {
+  if (stored.length() >= 8 && stored.length() < sizeof(admin_password)) {
     strlcpy(admin_password, stored.c_str(), sizeof(admin_password));
   } else if (factory_valid) {
     strlcpy(admin_password, factory_admin_password, sizeof(admin_password));
@@ -374,7 +374,7 @@ void initializeAdminCredential() {
 bool replaceAdminCredential(const char* replacement) {
   if (!replacement) return false;
   const size_t length = strlen(replacement);
-  if (length < 12 || length >= sizeof(admin_password)) return false;
+  if (length < 8 || length >= sizeof(admin_password)) return false;
   for (size_t index = 0; index < length; index++) {
     const uint8_t c = static_cast<uint8_t>(replacement[index]);
     if (c < 0x21 || c > 0x7e) return false;
@@ -1328,7 +1328,7 @@ void setupRemoteLogging() {
 }
 
 bool requireWebAuthentication() {
-  if (strlen(admin_password) < 12) {
+  if (strlen(admin_password) < 8) {
     webServer.send(503, "application/json", "{\"error\":\"admin_credentials_not_configured\"}");
     return false;
   }
@@ -1401,8 +1401,8 @@ void setupWebInterface() {
       html += "<input type='hidden' name='reboot' value='1'><button>Validate, save and reboot</button></form>";
       html += "<h2>Gateway access</h2><p>Replace the generated setup credential with one you choose. This also becomes the fallback AP password after reboot.</p>";
       html += "<form action='/api/v1/credentials' method='POST'>";
-      html += "New credential (12–24 characters): <input type='password' minlength='12' maxlength='24' name='new_password' autocomplete='new-password' required><br>";
-      html += "Confirm credential: <input type='password' minlength='12' maxlength='24' name='confirm_password' autocomplete='new-password' required><br>";
+      html += "New credential (8-24 characters): <input type='password' minlength='8' maxlength='24' name='new_password' autocomplete='new-password' required><br>";
+      html += "Confirm credential: <input type='password' minlength='8' maxlength='24' name='confirm_password' autocomplete='new-password' required><br>";
       html += "<button>Replace credential and reboot</button></form>";
     }
     html += "<p>Full registry and radio configuration uses <code>POST /api/v1/config</code>; tracker fields are named <code>tracker.0.id</code>, <code>tracker.0.name</code>, and so on.</p>";
@@ -1498,7 +1498,7 @@ void setupWebInterface() {
     }
     if (!replaceAdminCredential(replacement.c_str())) {
       webServer.send(400, "application/json",
-        "{\"ok\":false,\"error\":\"credential_must_be_12_to_24_printable_non_space_characters\"}");
+        "{\"ok\":false,\"error\":\"credential_must_be_8_to_24_printable_non_space_characters\"}");
       return;
     }
     webServer.send(200, "text/html",
@@ -1807,8 +1807,8 @@ void startGatewayFallbackAp() {
   WiFi.disconnect(false, false);
   WiFi.mode(WIFI_AP);
   String ap_name = "LoRaGateway-" + String(GATEWAY_ID);
-  if (strlen(admin_password) < 12) {
-    logPrintln("Fallback AP disabled: onboarding password must be at least 12 characters.");
+  if (strlen(admin_password) < 8) {
+    logPrintln("Fallback AP disabled: onboarding password must be at least 8 characters.");
   } else if (WiFi.softAP(ap_name.c_str(), admin_password)) {
     gateway_ap_active = true;
     gateway_network_ip = WiFi.softAPIP().toString();
