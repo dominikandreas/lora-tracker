@@ -31,6 +31,14 @@ struct TrackerPolicy {
   uint32_t retry_backoff_s[4];
 };
 
+enum class TrackerDisplayAction : uint8_t {
+  NEXT_PAGE = 0,
+  RESET_DISTANCE = 1,
+  ACQUIRE_GPS = 2,
+  TRANSMIT_RADIO = 3,
+  TOGGLE_BLE_LOGS = 4,
+};
+
 bool validateGermanyRadio(const RadioConfig& radio);
 uint32_t estimateAirtimeMs(
     size_t packet_size, const RadioConfig& radio, bool crc_enabled = true);
@@ -56,6 +64,12 @@ bool trackerBatchDue(
     uint32_t seconds_since_ack,
     uint16_t history_capacity,
     uint16_t reserve_points = 16);
+TrackerDisplayAction trackerDisplayAction(
+    uint8_t page, uint32_t hold_ms, uint32_t action_hold_ms = 900);
+uint32_t trackerGpsListenDurationMs(
+    uint32_t hold_ms,
+    uint32_t minimum_ms = 15000,
+    uint32_t maximum_ms = 180000);
 uint64_t mix64(uint64_t value);
 uint32_t forwardingDelayMs(
     uint64_t device_hash,

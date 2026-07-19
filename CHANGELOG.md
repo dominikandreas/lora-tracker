@@ -33,6 +33,9 @@
 - Added a shared relay-clear ACK guard after simulation exposed collisions between fast archive-backed ACKs and still-airborne repeater HISTORY frames.
 - Added relay link protocol v2 with selected reverse ACK routes, atomic HISTORY+ACK airtime reservations and packet-airtime-sized relay arbitration slots.
 - Fixed the browser simulator accepting ACKs after the tracker timeout; timeout now closes the receive window and puts the virtual radio to sleep.
+- Replaced the tracker’s hidden global button-hold ladder with visible per-page
+  actions for distance reset, duration-scaled GNSS acquisition, immediate
+  airtime-limited transmission with ACK countdown, and BLE debug-log toggling.
 
 ## Initial implementation
 

@@ -193,6 +193,14 @@ void testPortableCore() {
   assert(trackerBatchDue(policy, 3, 0, 100));
   assert(trackerBatchDue(policy, 1, 300, 100));
   assert(!trackerBatchDue(policy, 1, 299, 100));
+  assert(trackerDisplayAction(0, 899) == TrackerDisplayAction::NEXT_PAGE);
+  assert(trackerDisplayAction(0, 900) == TrackerDisplayAction::RESET_DISTANCE);
+  assert(trackerDisplayAction(1, 900) == TrackerDisplayAction::ACQUIRE_GPS);
+  assert(trackerDisplayAction(2, 900) == TrackerDisplayAction::TRANSMIT_RADIO);
+  assert(trackerDisplayAction(3, 900) == TrackerDisplayAction::TOGGLE_BLE_LOGS);
+  assert(trackerGpsListenDurationMs(900) == 15000);
+  assert(trackerGpsListenDurationMs(2000) == 30000);
+  assert(trackerGpsListenDurationMs(20000) == 180000);
 }
 
 void testConfiguration() {

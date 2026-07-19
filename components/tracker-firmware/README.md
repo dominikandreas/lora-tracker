@@ -11,6 +11,16 @@ per point.
 The tracker and gateway must use the same current protocol schema. Unsupported
 packet and history schemas are deliberately not accepted.
 
+## Display controls
+
+Tap the user button to move through the status, GPS, radio and debug pages.
+Hold for at least 0.9 seconds and release to run the action named on that page:
+reset distance (with confirmation), acquire GPS for the displayed duration,
+send queued history and wait for an ACK, or toggle BLE debug logs. Manual radio
+sends remain constrained by the configured Germany airtime budget. See the
+[onboarding guide](../../docs/ONBOARDING.md#tracker-button-controls) for the
+complete interaction and recovery notes.
+
 ## PlatformIO
 
 The included `platformio.ini` provides two pinned ESP32 Arduino builds:

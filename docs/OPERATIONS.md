@@ -47,6 +47,13 @@ The tracker’s GPIO0 user button is a boot-strapping pin. Do not hold it while
 applying power or pressing reset; the ESP32-S3 may enter the ROM downloader
 instead of running the firmware. Use the post-boot interaction window.
 
+During normal operation, tap to change display pages and hold for the action
+printed on the selected page. The status, GPS, radio and debug actions reset
+distance, request a GNSS acquisition, transmit queued history with an ACK
+window, and toggle BLE debug logs respectively. See
+[Tracker button controls](ONBOARDING.md#tracker-button-controls) for timing and
+safety details.
+
 ## BLE behavior
 
 BLE debugging is intentionally bounded. Lifecycle changes are deferred outside

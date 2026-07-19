@@ -43,13 +43,24 @@ sequences before mounting the device.
 
 - After a hard boot, release GPIO 0, then hold it for 1.5 seconds during the
   five-second on-screen setup window to start Wi-Fi onboarding.
-- A short press wakes the display and advances through status, GNSS, radio and debug pages.
-- Hold 4–8 seconds, release, then short-press within ten seconds to reset distance and queued history.
-- Hold 8–12 seconds, release, then confirm to toggle the bounded BLE debug session.
-- Hold at least 12 seconds, release, then confirm to factory-reset configuration and runtime state.
+- A short press wakes the display and advances through status, GNSS, radio and
+  debug pages.
+- Hold for at least 0.9 seconds and release to run the action printed at the
+  bottom of the current page:
+  - **Status:** request a distance reset, then short-press within ten seconds
+    to confirm. Unacknowledged tracking history is retained.
+  - **GPS:** acquire a position. One second requests a 15-second acquisition;
+    longer holds increase the requested powered acquisition window up to three
+    minutes. Release when the displayed duration is sufficient.
+  - **Radio:** immediately try to transmit queued history and listen for an
+    authenticated ACK. The ACK countdown is shown on this page. Manual sends
+    bypass batching and retry backoff, but never the Germany airtime limiter.
+  - **Debug:** toggle persistent BLE debug logging. Enabling BLE performs a
+    clean one-second restart before opening the bounded connection window.
 
-The confirmation step prevents a single accidental long press from erasing
-state. Never hold GPIO 0 while powering or resetting an ESP32-S3 because it can
+Distance confirmation prevents an accidental hold from clearing the daily
+counter. Factory reset remains available through the authenticated onboarding
+API. Never hold GPIO 0 while powering or resetting an ESP32-S3 because it can
 enter the ROM downloader instead of the application.
 
 BLE requires LE Secure Connections with MITM protection, then an application

@@ -159,6 +159,9 @@ const uint32_t DISPLAY_REFRESH_MS = 5000;
 const uint32_t DISPLAY_PAGE_INTERVAL_MS = 10000;
 const uint32_t DISPLAY_BATTERY_REFRESH_MS = 5000;
 const uint32_t BUTTON_DEBOUNCE_MS = 30;
+const uint32_t BUTTON_ACTION_HOLD_MS = 900;
+const uint32_t GPS_ACTION_MIN_LISTEN_MS = 15000;
+const uint32_t GPS_ACTION_MAX_LISTEN_MS = 180000;
 const uint32_t WIFI_SETUP_POST_BOOT_WINDOW_MS = 5000;
 const uint8_t DISPLAY_PAGE_COUNT = 4;
 const uint32_t BLE_CONNECTION_WINDOW_MS = 60000;
@@ -410,8 +413,13 @@ uint32_t cached_battery_read_ms = 0;
 uint32_t button_press_start_ms = 0;
 bool button_is_held = false;
 uint32_t button_hold_duration_ms = 0;
+uint32_t manual_gps_listen_request_ms = 0;
+bool manual_radio_request = false;
+bool manual_action_in_progress = false;
+bool ack_window_active = false;
+uint32_t ack_window_deadline_ms = 0;
 
-enum class ConfirmationState { NONE, DISTANCE_RESET, BLE_TOGGLE, FACTORY_RESET };
+enum class ConfirmationState { NONE, DISTANCE_RESET };
 ConfirmationState pending_confirmation = ConfirmationState::NONE;
 uint32_t confirmation_timeout_ms = 0;
 
@@ -2659,6 +2667,34 @@ void renderDisplayLines(char lines[5][18]) {
 #endif
 }
 
+uint32_t gpsListenDurationForHold(uint32_t hold_ms) {
+  return LoraTrackerCore::trackerGpsListenDurationMs(
+    hold_ms, GPS_ACTION_MIN_LISTEN_MS, GPS_ACTION_MAX_LISTEN_MS);
+}
+
+bool requestBleDebugToggle() {
+  const bool enable_ble = !ble_debug_enabled;
+  ble_debug_enabled = enable_ble;
+  tracker_config.ble_debug_enabled = enable_ble ? 1 : 0;
+  if (!saveTrackerConfig(true)) {
+    ble_debug_enabled = !enable_ble;
+    tracker_config.ble_debug_enabled = ble_debug_enabled ? 1 : 0;
+    setLastError("Config save fail");
+    logPrintln("BLE toggle cancelled because config save failed.");
+    return false;
+  }
+
+  setLastError(enable_ble ? "BLE Debug ON" : "BLE Debug OFF");
+  logPrintf("BLE debug logs %s from the debug page.\n",
+            enable_ble ? "enabled" : "disabled");
+  if (enable_ble) {
+    ble_enable_transition_requested = true;
+  } else {
+    ble_disable_transition_requested = true;
+  }
+  return true;
+}
+
 void renderStatusPage() {
   char lines[5][18] = {};
   refreshDisplayBatteryCache(false);
@@ -2672,10 +2708,6 @@ void renderStatusPage() {
       uint32_t remaining_s = (confirmation_timeout_ms - now + 999) / 1000;
       if (pending_confirmation == ConfirmationState::DISTANCE_RESET) {
         snprintf(lines[0], sizeof(lines[0]), "CONFIRM DIST");
-      } else if (pending_confirmation == ConfirmationState::FACTORY_RESET) {
-        snprintf(lines[0], sizeof(lines[0]), "CONFIRM RESET");
-      } else if (pending_confirmation == ConfirmationState::BLE_TOGGLE) {
-        snprintf(lines[0], sizeof(lines[0]), "CONFIRM BLE");
       }
       snprintf(lines[1], sizeof(lines[1]), "Press = OK");
       snprintf(lines[2], sizeof(lines[2]), "Wait = Cancel");
@@ -2686,33 +2718,29 @@ void renderStatusPage() {
   }
 
   // Check button hold progress
-  if (button_is_held && button_hold_duration_ms > 500) {
-    if (button_hold_duration_ms >= 12000) {
-      snprintf(lines[0], sizeof(lines[0]), "HOLD: FacRst");
-      snprintf(lines[1], sizeof(lines[1]), "Release = OK");
-      snprintf(lines[3], sizeof(lines[3]), "[==========]");
-    } else if (button_hold_duration_ms >= 8000) {
-      snprintf(lines[0], sizeof(lines[0]), "HOLD: BLE Tgl");
-      snprintf(lines[1], sizeof(lines[1]), "Wait %lus FacRst", (unsigned long)((12000 - button_hold_duration_ms)/1000));
-      int bars = (button_hold_duration_ms - 8000) * 10 / 4000;
-      char pb[13] = "[          ]";
-      for (int i=0; i<bars; i++) pb[i+1] = '=';
-      snprintf(lines[3], sizeof(lines[3]), "%s", pb);
-    } else if (button_hold_duration_ms >= 4000) {
-      snprintf(lines[0], sizeof(lines[0]), "HOLD: DistRst");
-      snprintf(lines[1], sizeof(lines[1]), "Wait %lus BLE", (unsigned long)((8000 - button_hold_duration_ms)/1000));
-      int bars = (button_hold_duration_ms - 4000) * 10 / 4000;
-      char pb[13] = "[          ]";
-      for (int i=0; i<bars; i++) pb[i+1] = '=';
-      snprintf(lines[3], sizeof(lines[3]), "%s", pb);
+  if (button_is_held && button_hold_duration_ms > 300) {
+    const bool armed = button_hold_duration_ms >= BUTTON_ACTION_HOLD_MS;
+    snprintf(lines[0], sizeof(lines[0]), "%s",
+             armed ? "RELEASE: ACTION" : "HOLD FOR ACTION");
+    if (display_page == 0) {
+      snprintf(lines[1], sizeof(lines[1]), "Reset distance");
+    } else if (display_page == 1) {
+      const uint32_t listen_s =
+        gpsListenDurationForHold(button_hold_duration_ms) / 1000U;
+      snprintf(lines[1], sizeof(lines[1]), "GPS listen %lus",
+               (unsigned long)listen_s);
+      snprintf(lines[2], sizeof(lines[2]), "Hold = longer");
+    } else if (display_page == 2) {
+      snprintf(lines[1], sizeof(lines[1]), "Send + wait ACK");
     } else {
-      snprintf(lines[0], sizeof(lines[0]), "HOLDING...");
-      snprintf(lines[1], sizeof(lines[1]), "Wait %lus Dist", (unsigned long)((4000 - button_hold_duration_ms)/1000));
-      int bars = button_hold_duration_ms * 10 / 4000;
-      char pb[13] = "[          ]";
-      for (int i=0; i<bars; i++) pb[i+1] = '=';
-      snprintf(lines[3], sizeof(lines[3]), "%s", pb);
+      snprintf(lines[1], sizeof(lines[1]), "BLE logs: %s",
+               ble_debug_enabled ? "OFF" : "ON");
     }
+    const uint32_t progress = min(button_hold_duration_ms, BUTTON_ACTION_HOLD_MS);
+    const int bars = progress * 10 / BUTTON_ACTION_HOLD_MS;
+    char pb[13] = "[          ]";
+    for (int i = 0; i < bars; i++) pb[i + 1] = '=';
+    snprintf(lines[3], sizeof(lines[3]), "%s", pb);
     renderDisplayLines(lines);
     return;
   }
@@ -2734,7 +2762,7 @@ void renderStatusPage() {
           snprintf(lines[1], sizeof(lines[1]), "%.13s", last_wifi_ip.c_str());
           snprintf(lines[2], sizeof(lines[2]), "%.13s", wifi_ap_active ? "LoRaTracker" : "Searching...");
           snprintf(lines[3], sizeof(lines[3]), "B:%u%% %.1fV", cached_battery_percentage, cached_battery_voltage);
-          snprintf(lines[4], sizeof(lines[4]), "1/4 -> press");
+          snprintf(lines[4], sizeof(lines[4]), "Tap next Hold rst");
         }
       } else {
         // Tracking Mode
@@ -2742,7 +2770,7 @@ void renderStatusPage() {
         snprintf(lines[1], sizeof(lines[1]), "D:%.1fm", total_distance_meters);
         snprintf(lines[2], sizeof(lines[2]), "B:%u%% %.1fV", cached_battery_percentage, cached_battery_voltage);
         snprintf(lines[3], sizeof(lines[3]), "Fix:%s", has_initial_fix ? "YES" : "NO");
-        snprintf(lines[4], sizeof(lines[4]), "1/4 -> press");
+        snprintf(lines[4], sizeof(lines[4]), "Tap next Hold rst");
       }
       break;
 
@@ -2755,7 +2783,7 @@ void renderStatusPage() {
         snprintf(lines[1], sizeof(lines[1]), "Sats: %lu", (unsigned long)sats);
         snprintf(lines[2], sizeof(lines[2]), "Spd: %.1f", speed);
         snprintf(lines[3], sizeof(lines[3]), "FixAge:%lus", (unsigned long)seconds_since_last_fix);
-        snprintf(lines[4], sizeof(lines[4]), "Q: %u pt", history_count);
+        snprintf(lines[4], sizeof(lines[4]), "Hold: acquire GPS");
       }
       break;
 
@@ -2763,12 +2791,18 @@ void renderStatusPage() {
       // Network/Radio
       snprintf(lines[0], sizeof(lines[0]), "RADIO (3/4)");
       snprintf(lines[1], sizeof(lines[1]), "LoRa: %s", lora_initialized ? "OK" : "NO");
-      snprintf(lines[2], sizeof(lines[2]), "BLE: %s", ble_debug_enabled ? "ON" : "OFF");
+      snprintf(lines[2], sizeof(lines[2]), "Q:%u Hold=send", history_count);
       snprintf(lines[3], sizeof(lines[3]), "TX:%.2s AK:%.2s", triStateName(last_tx_status), triStateName(last_ack_status));
-      if (!isnan(last_ack_rssi)) {
+      if (ack_window_active) {
+        const uint32_t remaining_ms =
+          (int32_t)(ack_window_deadline_ms - millis()) > 0 ?
+          ack_window_deadline_ms - millis() : 0;
+        snprintf(lines[4], sizeof(lines[4]), "ACK wait: %lus",
+                 (unsigned long)((remaining_ms + 999U) / 1000U));
+      } else if (!isnan(last_ack_rssi)) {
         snprintf(lines[4], sizeof(lines[4]), "Ak %.0fdBm", last_ack_rssi);
       } else {
-        snprintf(lines[4], sizeof(lines[4]), "Ak -- dBm");
+        snprintf(lines[4], sizeof(lines[4]), "Hold: send now");
       }
       break;
 
@@ -2781,7 +2815,8 @@ void renderStatusPage() {
         snprintf(lines[1], sizeof(lines[1]), "Up: %.9s", uptime);
         snprintf(lines[2], sizeof(lines[2]), "Rst: %.8s", resetReasonName(last_reset_reason));
         snprintf(lines[3], sizeof(lines[3]), "Err: %.8s", last_error);
-        snprintf(lines[4], sizeof(lines[4]), "Wake: %lu", (unsigned long)wakeup_counter);
+        snprintf(lines[4], sizeof(lines[4]), "Hold: BLE %s",
+                 ble_debug_enabled ? "OFF" : "ON");
       }
       break;
   }
@@ -2849,64 +2884,37 @@ void serviceDisplayAndButton(bool force_refresh) {
           total_distance_meters = 0.0;
           prefs.putDouble("dist", 0.0);
           setLastError("Dist Reset!");
-        } else if (pending_confirmation == ConfirmationState::FACTORY_RESET) {
-          logPrintln("User confirmed factory reset via button!");
-          turnOnDisplay();
-          char lines[5][18] = {"FACTORY RESET", "IN PROGRESS", "Wiping NVS...", "Rebooting...", ""};
-          renderDisplayLines(lines);
-          prefs.clear();
-          clearTrackerConfigStorage();
-          delay(2000);
-          ESP.restart();
-        } else if (pending_confirmation == ConfirmationState::BLE_TOGGLE) {
-          logPrintln("User confirmed BLE toggle via button!");
-          const bool enable_ble = !ble_debug_enabled;
-          ble_debug_enabled = enable_ble;
-          tracker_config.ble_debug_enabled = enable_ble ? 1 : 0;
-          if (!saveTrackerConfig(true)) {
-            ble_debug_enabled = !enable_ble;
-            tracker_config.ble_debug_enabled = ble_debug_enabled ? 1 : 0;
-            setLastError("Config save fail");
-            logPrintln("BLE toggle cancelled because config save failed.");
-            pending_confirmation = ConfirmationState::NONE;
-            force_refresh = true;
-            return;
-          }
-          setLastError(enable_ble ? "BLE Debug ON" : "BLE Debug OFF");
-
-          // Defer all BLE stack work until after this input handler has
-          // cleared the confirmation state and returned.
-          if (enable_ble) {
-            ble_enable_transition_requested = true;
-          } else {
-            ble_disable_transition_requested = true;
-          }
         }
         pending_confirmation = ConfirmationState::NONE;
       } else {
-        // No pending confirmation. Process hold duration.
-        if (button_hold_duration_ms >= 12000) {
-          pending_confirmation = ConfirmationState::FACTORY_RESET;
-          confirmation_timeout_ms = now + 10000;
-          requestDisplayWake(DISPLAY_BUTTON_TIMEOUT_MS, false);
-        } else if (button_hold_duration_ms >= 8000) {
-          pending_confirmation = ConfirmationState::BLE_TOGGLE;
-          confirmation_timeout_ms = now + 10000;
-          requestDisplayWake(DISPLAY_BUTTON_TIMEOUT_MS, false);
-        } else if (button_hold_duration_ms >= 4000) {
-          pending_confirmation = ConfirmationState::DISTANCE_RESET;
-          confirmation_timeout_ms = now + 10000;
+        // A short press navigates. A deliberate hold executes the action shown
+        // on the current page, so users never have to memorize global timings.
+        const LoraTrackerCore::TrackerDisplayAction action =
+          LoraTrackerCore::trackerDisplayAction(
+            display_page, button_hold_duration_ms, BUTTON_ACTION_HOLD_MS);
+        if (action != LoraTrackerCore::TrackerDisplayAction::NEXT_PAGE) {
+          if (manual_action_in_progress) {
+            setLastError("Action busy");
+          } else if (action == LoraTrackerCore::TrackerDisplayAction::RESET_DISTANCE) {
+            pending_confirmation = ConfirmationState::DISTANCE_RESET;
+            confirmation_timeout_ms = now + 10000;
+          } else if (action == LoraTrackerCore::TrackerDisplayAction::ACQUIRE_GPS) {
+            manual_gps_listen_request_ms =
+              gpsListenDurationForHold(button_hold_duration_ms);
+            logPrintf("Manual GPS acquisition requested for %lu ms.\n",
+                      (unsigned long)manual_gps_listen_request_ms);
+          } else if (action == LoraTrackerCore::TrackerDisplayAction::TRANSMIT_RADIO) {
+            manual_radio_request = true;
+            logPrintln("Manual LoRa transmission requested from radio page.");
+          } else {
+            (void)requestBleDebugToggle();
+          }
           requestDisplayWake(DISPLAY_BUTTON_TIMEOUT_MS, false);
         } else {
           // Every detected, debounced short press advances exactly one page.
           // Rendering is done once here, after classification, so a normal
           // refresh cannot overwrite or swallow the page transition.
-          if (pending_confirmation == ConfirmationState::NONE) {
-            requestDisplayWake(DISPLAY_BUTTON_TIMEOUT_MS, true);
-          } else {
-            pending_confirmation = ConfirmationState::NONE;
-            requestDisplayWake(DISPLAY_BUTTON_TIMEOUT_MS, false);
-          }
+          requestDisplayWake(DISPLAY_BUTTON_TIMEOUT_MS, true);
         }
       }
       button_hold_duration_ms = 0;
@@ -2935,8 +2943,9 @@ void serviceDisplayAndButton(bool force_refresh) {
     force_refresh = true;
   }
 
+  const uint32_t refresh_interval_ms = ack_window_active ? 250 : DISPLAY_REFRESH_MS;
   if (force_refresh ||
-      (uint32_t)(now - display_last_refresh_ms) >= DISPLAY_REFRESH_MS) {
+      (uint32_t)(now - display_last_refresh_ms) >= refresh_interval_ms) {
     renderStatusPage();
     display_last_refresh_ms = now;
   }
@@ -3489,8 +3498,24 @@ void setup() {
     while ((int32_t)(display_on_until_ms - millis()) > 0 ||
            isBleConnectionWindowActive()) {
       serviceDisplayAndButton();
-      if (deviceConnected) break;
+      if (deviceConnected || manual_gps_listen_request_ms > 0 ||
+          manual_radio_request || ble_enable_transition_requested ||
+          ble_disable_transition_requested) break;
       delay(10);
+    }
+
+    if (ble_disable_transition_requested) {
+      ble_disable_transition_requested = false;
+      stopBleDebug();
+      requestDisplayWake(DISPLAY_BUTTON_TIMEOUT_MS, false);
+    }
+    if (ble_enable_transition_requested) {
+      ble_enable_transition_requested = false;
+      restartThroughDeepSleepForBle();
+    }
+    if (manual_gps_listen_request_ms > 0 || manual_radio_request) {
+      performTrackingCycle();
+      return;
     }
     turnOffDisplay();
 
@@ -3566,24 +3591,38 @@ void setup() {
 
 void performTrackingCycle() {
   const uint32_t cycle_start_ms = millis();
-  if (!gps_powered) {
-    setTrackerPhase("GNSS power-up");
-    wakeupGPS();
-#if defined(BOARD_WIRELESS_TRACKER)
-    sendUc6580Assistance();
-#endif
-  }
-  setTrackerPhase("GPS acquisition");
-  serviceDisplayAndButton(true);
+  const uint32_t requested_gps_listen_ms = manual_gps_listen_request_ms;
+  const bool manual_gps_action = requested_gps_listen_ms > 0;
+  const bool manual_radio_action = manual_radio_request;
+  manual_gps_listen_request_ms = 0;
+  manual_radio_request = false;
+  // The tracking cycle owns GNSS and LoRa. Reject additional page actions
+  // until it has released those peripherals to avoid nested radio sessions.
+  manual_action_in_progress = true;
 
-  // =====================================================
-  // GPS ACQUISITION
-  // =====================================================
   const uint32_t fix_age_at_cycle_start = seconds_since_last_fix;
-  const uint32_t acquisition_start_ms = millis();
+  uint32_t acquisition_start_ms = millis();
   bool cycle_fix_found = false;
   bool cycle_movement_accepted = false;
   bool cycle_position_accepted = false;
+  uint32_t current_elapsed_s = fix_age_at_cycle_start;
+
+  if (!manual_radio_action) {
+    if (!gps_powered) {
+      setTrackerPhase("GNSS power-up");
+      wakeupGPS();
+#if defined(BOARD_WIRELESS_TRACKER)
+      sendUc6580Assistance();
+#endif
+    }
+    setTrackerPhase(requested_gps_listen_ms > 0 ?
+                    "Manual GPS" : "GPS acquisition");
+    serviceDisplayAndButton(true);
+
+    // =====================================================
+    // GPS ACQUISITION
+    // =====================================================
+    acquisition_start_ms = millis();
 
   if (has_initial_fix && fix_age_at_cycle_start > MAX_FIX_AGE_S) {
     logPrintf("WARNING: Last fix is %u seconds old. Discarding it!\n",
@@ -3591,7 +3630,8 @@ void performTrackingCycle() {
     has_initial_fix = false;
   }
 
-  const uint32_t gps_timeout_ms = chooseGpsAcquisitionTimeoutMs();
+  const uint32_t gps_timeout_ms = requested_gps_listen_ms > 0 ?
+    requested_gps_listen_ms : chooseGpsAcquisitionTimeoutMs();
   logPrintf("GNSS acquisition policy -> no_fix=%u, full_retry_age=%u s, deadline=%u ms.\n",
             consecutive_no_fix_cycles,
             seconds_since_last_full_gnss_attempt,
@@ -3652,15 +3692,19 @@ void performTrackingCycle() {
   }
 
   const uint32_t acquisition_elapsed_ms = millis() - acquisition_start_ms;
-  uint32_t current_elapsed_s = 0;
   if (!cycle_fix_found) {
     current_elapsed_s =
       fix_age_at_cycle_start + acquisition_elapsed_ms / 1000U;
     logPrintf("No confident GNSS fix before the %u ms deadline.\n",
               gps_timeout_ms);
   }
+  } else {
+    setTrackerPhase("Manual LoRa");
+    serviceDisplayAndButton(true);
+  }
 
-  const uint64_t next_sleep_duration_us =
+  const uint64_t next_sleep_duration_us = manual_radio_action ?
+    SLEEP_DURATION_US :
     chooseNextSleepDurationUs(cycle_fix_found, cycle_movement_accepted);
   const uint32_t next_sleep_s =
     (uint32_t)(next_sleep_duration_us / 1000000ULL);
@@ -3712,12 +3756,15 @@ void performTrackingCycle() {
   const bool lora_retry_ready =
     consecutive_lora_failures == 0 ||
     seconds_since_last_lora_attempt >= lora_retry_backoff_s;
-  const bool tx_due = lora_batch_ready && lora_retry_ready;
+  const bool tx_due = manual_gps_action ? false :
+    (manual_radio_action ? history_count > 0 :
+     lora_batch_ready && lora_retry_ready);
 
   if (tx_due) {
     setTrackerPhase("LoRa transmit");
     serviceDisplayAndButton(true);
-    logPrintf("LoRa batch due: %u queued points, %u s since last ACK.\n",
+    logPrintf("%s LoRa batch: %u queued points, %u s since last ACK.\n",
+              manual_radio_action ? "Manual" : "Scheduled",
               history_count, seconds_since_last_tx);
 
     seconds_since_last_lora_attempt = 0;
@@ -3831,9 +3878,14 @@ void performTrackingCycle() {
                 payload_len, points_packed, LORA_ACK_TIMEOUT_MS);
 
       uint8_t rx_buffer[255];
+      ack_window_active = true;
+      ack_window_deadline_ms = millis() + LORA_ACK_TIMEOUT_MS;
+      serviceDisplayAndButton(true);
       const int rx_result = receiveLoRaAck(
         rx_buffer, sizeof(rx_buffer), LORA_ACK_TIMEOUT_MS
       );
+      ack_window_active = false;
+      ack_window_deadline_ms = 0;
       bool ack_received = false;
 
       const size_t expected_ack_size =
@@ -3948,6 +4000,10 @@ void performTrackingCycle() {
     }
 
     sleepLoRaRadio();
+  } else if (manual_gps_action) {
+    setTrackerPhase(cycle_fix_found ? "Manual GPS OK" : "Manual GPS timeout");
+    logPrintf("Manual GPS acquisition %s; radio transmission was not requested.\n",
+              cycle_fix_found ? "succeeded" : "timed out");
   } else if (history_count > 0) {
     if (lora_batch_ready && !lora_retry_ready) {
       setTrackerPhase("LoRa backoff");
@@ -3964,7 +4020,12 @@ void performTrackingCycle() {
     }
   } else {
     setTrackerPhase("No queued points");
-    logPrintln("No valid history points available.");
+    if (manual_radio_action) {
+      setLastError("No points to send");
+      logPrintln("Manual transmission skipped: no queued history points.");
+    } else {
+      logPrintln("No valid history points available.");
+    }
   }
 
   last_cycle_duration_ms = millis() - cycle_start_ms;
@@ -3976,6 +4037,7 @@ void performTrackingCycle() {
   if (!isDebugModeActive()) {
     setTrackerPhase("Deep sleep");
     serviceDisplayAndButton(true);
+    manual_action_in_progress = false;
     turnOffDisplay();
     stopBleDebug();
     prefs.end();
@@ -4025,6 +4087,7 @@ void performTrackingCycle() {
   } else {
     setTrackerPhase("Debug idle");
     serviceDisplayAndButton(true);
+    manual_action_in_progress = false;
     logPrintln("Tracking cycle completed; BLE client remains connected.");
 
     const uint32_t time_awake_s =
@@ -4095,6 +4158,12 @@ void loop() {
   if (ble_enable_transition_requested) {
     ble_enable_transition_requested = false;
     restartThroughDeepSleepForBle();
+  }
+
+  if ((manual_gps_listen_request_ms > 0 || manual_radio_request) &&
+      !manual_action_in_progress) {
+    performTrackingCycle();
+    return;
   }
 
   if (isDebugModeActive()) {

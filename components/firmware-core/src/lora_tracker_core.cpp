@@ -142,6 +142,26 @@ bool trackerBatchDue(
          queued_points >= pressure_threshold;
 }
 
+TrackerDisplayAction trackerDisplayAction(
+    uint8_t page, uint32_t hold_ms, uint32_t action_hold_ms) {
+  if (hold_ms < action_hold_ms) return TrackerDisplayAction::NEXT_PAGE;
+  switch (page % 4U) {
+    case 0: return TrackerDisplayAction::RESET_DISTANCE;
+    case 1: return TrackerDisplayAction::ACQUIRE_GPS;
+    case 2: return TrackerDisplayAction::TRANSMIT_RADIO;
+    default: return TrackerDisplayAction::TOGGLE_BLE_LOGS;
+  }
+}
+
+uint32_t trackerGpsListenDurationMs(
+    uint32_t hold_ms, uint32_t minimum_ms, uint32_t maximum_ms) {
+  if (minimum_ms > maximum_ms) return 0;
+  uint64_t listen_ms = static_cast<uint64_t>(hold_ms) * 15ULL;
+  if (listen_ms < minimum_ms) listen_ms = minimum_ms;
+  if (listen_ms > maximum_ms) listen_ms = maximum_ms;
+  return static_cast<uint32_t>(listen_ms);
+}
+
 uint64_t mix64(uint64_t value) {
   value ^= value >> 30;
   value *= 0xbf58476d1ce4e5b9ULL;
