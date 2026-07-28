@@ -73,7 +73,8 @@ trusted NTP-synchronized clock fails closed.
 
 ## Repeater defaults
 
-- Unique MAC-derived ID and generated 20-character administrator credential.
+- Unique MAC-derived ID and an app-generated 256-bit owner key installed during
+  the one-time, passwordless setup-AP claim.
 - Two-hop local forwarding cap; 40 ms base delay and eight deterministic 45 ms priority slots.
 - Eight queued frames and a 120-second history duplicate cache; ACKs use five seconds.
 - Rolling-hour 36,000 ms airtime ceiling with fail-safe cold start and 14 dBm maximum requested conducted TX power.

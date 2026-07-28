@@ -1,145 +1,144 @@
-# Onboarding and configuration
+# Onboarding and device ownership
 
-## Prepare a device
+LoRa Tracker devices do not use a Bluetooth PIN, OS Bluetooth bond,
+administrator password, setup password, or separate OTA password. The app owns
+devices with a random 256-bit **owner key**. The same key authorizes the custom
+BLE protocol, local HTTP API, and configuration-mode OTA.
 
-1. Copy `secrets.example.h` to `secrets.h` in the relevant firmware directory,
-   or install a generic release with the [browser flasher](FLASHING.md).
-2. Leave `factory_admin_password` empty for a generic image. On erased flash,
-   the device generates a unique 20-character credential. Trackers and gateways
-   show it on their local display during attended setup; diagnostic serial also
-   records it. A factory may inject a different 12+ character value into each
-   device build instead. Record the final credential in the protected device
-   inventory.
-3. Set `ota_password_hash` to the 64-character lowercase or uppercase SHA-256
-   hash of a separate password. Leave it empty to keep OTA disabled.
-4. For a gateway, set a TLS broker port (normally 8883) and paste the broker root
-   CA into the runtime `mqtt_ca_certificate` field. A source build may seed the
-   same field from `secrets.h`. Leave `allow_insecure_mqtt=false`.
-5. Build, flash and label the device ID, hardware revision, firmware commit,
-   region/frequency and provisioning-record identifier.
+Anyone who obtains an owner key has full device authority. Android stores keys
+in Keystore-backed secure storage. The PWA stores them in origin-scoped
+`localStorage`, which is convenient but less protected. Exported access QR codes
+must be handled like physical master keys.
 
-Never commit `secrets.h`, `.env`, broker CA private keys or provisioning exports.
-The CA certificate is public; client and signing keys are not.
+## Factory-reset claim
 
-## Tracker first boot
+A factory-reset device is intentionally claimable without authentication. Keep
+it physically attended until the app confirms the claim.
 
-An unprovisioned tracker derives a setup ID from the low 24 bits of its eFuse
-MAC, generates a random 256-bit LoRa AEAD key, then exposes
-`LoRaTracker-<device_id>` and BLE name `LT-<device_id>`. Its display shows
-the temporary AP credential, the current BLE pairing PIN and the setup address.
-Connect a phone to the AP and open `http://192.168.4.1`, or connect over BLE
-using the displayed PIN. The generated credential no longer has to be obtained
-from a serial console or retained permanently. Replace it from **Device access**
-before mounting the tracker; the replacement becomes both the HTTP credential
-for user `admin` and the fallback AP password after reboot.
+1. Flash the correct release image and boot the device.
+2. Open **Manage devices** in the Android app.
+3. For a tracker or gateway, select it under **Nearby devices**. The app reads
+   public device state before deciding whether to claim or authenticate. Do not
+   pair it in Android Settings; the app uses GATT directly and Android must not
+   show a PIN or bonding dialog.
+4. Alternatively, join the device's open setup network and enter its IP in the
+   app. Trackers use `LoRaTracker-<suffix>`, gateways use
+   `LoRaGateway-<suffix>`, and repeaters use `lora-repeater-<suffix>`.
+5. The app generates a 64-hex-character owner key, stores it securely, and
+   sends `CLAIM`. If that one-way operation is interrupted, reconnecting reuses
+   the staged key and retries `CLAIM` while the device still reports itself as
+   unclaimed.
+6. Configure station Wi-Fi and all role-specific settings. With an empty SSID,
+   firmware skips station association entirely; it does not call
+   `WiFi.begin()` or enter a reconnect loop.
 
-Read `GET /api/v1/config`, retain its `revision`, and submit a transactional
-`POST /api/v1/config` with `expected_revision`. Configure identity, Wi-Fi, the
-regional LoRa parameters, GNSS thresholds, transmission policy and sleep
-intervals. Reboot, then verify normal GNSS fixes, LoRa ACKs and increasing point
-sequences before mounting the device.
+The setup AP has no password because factory-reset claim is already open by
+design. After claim, all management API mutations require the owner key even
+while the open configuration AP is active.
 
-### Tracker button controls
+## Tracker completion
 
-- After a hard boot, release GPIO 0, then hold it for 1.5 seconds during the
-  five-second on-screen setup window to start Wi-Fi onboarding.
-- A short press wakes the display and advances through status, GNSS, radio and
-  debug pages.
-- Hold for at least 0.9 seconds and release to run the action printed at the
-  bottom of the current page:
-  - **Status:** request a distance reset, then short-press within ten seconds
-    to confirm. Unacknowledged tracking history is retained.
-  - **GPS:** acquire a position. One second requests a 15-second acquisition;
-    longer holds increase the requested powered acquisition window up to three
-    minutes. Release when the displayed duration is sufficient.
-  - **Radio:** immediately try to transmit queued history and listen for an
-    authenticated ACK. The ACK countdown is shown on this page. Manual sends
-    bypass batching and retry backoff, but never the Germany airtime limiter.
-  - **Debug:** toggle persistent BLE debug logging. Enabling BLE performs a
-    clean one-second restart before opening the bounded connection window.
+Configure the tracker first, but it remains in setup and does not enter tracking
+mode until all of these are true:
 
-Distance confirmation prevents an accidental hold from clearing the daily
-counter. Factory reset remains available through the authenticated onboarding
-API. Never hold GPIO 0 while powering or resetting an ESP32-S3 because it can
-enter the ROM downloader instead of the application.
+- its transactional configuration validates and includes station Wi-Fi;
+- the selected gateway has registered the tracker ID, name, and LoRa AEAD key;
+- the tracker has recorded the gateway confirmation.
 
-BLE requires LE Secure Connections with MITM protection, then an application
-session before any configuration or debug logs are exposed. Each bounded setup
-window generates a new random six-digit BLE pairing PIN and shows it on the
-tracker. On an unprovisioned tracker, `CLAIM <new-credential>` both replaces the
-generated credential and authenticates that BLE session. A provisioned tracker
-uses `AUTH <admin-password>`. `CLAIM` is rejected outside the physically opened
-setup/onboarding window. The Pages-hosted Tracker Console provides a supported
-Chromium Web Bluetooth client for these commands. BLE still lacks QR bootstrap,
-owner-key enrollment, a purpose-separated provisioning key and fleet
-key-rotation workflow. An authenticated, physically opened BLE session can use
-`SET_CREDENTIAL` to replace the administrator credential. Disable BLE debug
-after setup.
+Use **Register and finish pairing**. The app commits the gateway registry first
+and confirms the gateway on the still-connected tracker second. Both operations
+are idempotent, so retrying after a timeout is safe. If mDNS is unavailable,
+enter the gateway's current LAN IP beside the gateway selector.
 
-## Gateway first boot
+A tracker may confirm more than one gateway. Changing either its canonical
+device ID or LoRa AEAD key invalidates every existing gateway confirmation and
+returns it to setup mode; register the new identity/key before pairing again.
 
-An unprovisioned gateway derives its setup ID from its eFuse MAC and exposes
-`LoRaGateway-<gateway_id>` with an empty tracker allowlist. Authenticate as
-`admin` using the temporary credential shown on its OLED. Connect a phone to
-that AP and open `http://192.168.4.1`; no serial console is needed. Configure
-Wi-Fi, TLS MQTT settings, the same regional LoRa settings as the trackers, and a
-registry entry for every allowed tracker. Replace the generated credential from
-**Gateway access** while the physical write window is open. IDs must be unique
-canonical lowercase strings.
+Tracker button actions are page-specific:
 
-For each tracker registry entry, copy `lora_aead_key` from the tracker's
-authenticated `GET /api/v1/config` response into
-`tracker.<index>.lora_aead_key` on the gateway. The value is exactly 64 hex
-characters. Treat it as a secret: it authenticates and decrypts that tracker's
-history and ACK traffic. Never reuse a key between trackers.
+- **Status:** reset the daily distance after the on-screen confirmation.
+- **GPS:** acquire a fix; a longer hold requests a longer listen window. Live
+  satellite count, HDOP, and remaining time are displayed before acceptance.
+- **Radio:** transmit queued history and show the live ACK countdown.
+- **Debug:** toggle bounded BLE debug logging.
 
-On a provisioned gateway, hold the USER button for five seconds to open the
-ten-minute write window. Authentication is still required. Read-only HTTP routes
-also require authentication so status, logs and device inventory are not
-available anonymously on the LAN.
+After hard boot, release GPIO 0 and hold it for 1.5 seconds during the displayed
+five-second window to enter configuration mode. Never hold GPIO 0 while applying
+power or reset to an ESP32-S3, because that can select the ROM downloader.
 
-## Transaction rules
+## Gateway and repeater
 
-- Credential replacement is deliberately outside the revisioned device config;
-  it is write-only, requires current authentication, and takes effect after reboot.
+The gateway's custom BLE management service remains discoverable so a saved
+owner key can authenticate without an OS bond. Station Wi-Fi is preferred for
+normal management. Holding USER for five seconds opens configuration mode and
+the setup AP for ten minutes.
 
-- Always read immediately before writing and send `expected_revision`.
-- On HTTP 409, reload, merge and retry; never blindly increment a guessed revision.
-- Omit a secret, send an empty value, or send `__KEEP__` to retain it.
-- Send `__CLEAR__` only when intentionally erasing a secret.
-- A valid update backs up the previous configuration and increments the revision.
-- Rollback restores the backup as a new revision; it never moves the counter backwards.
-- Factory reset requires `confirm=FACTORY_RESET` and returns the device to onboarding.
+Repeaters do not need tracker LoRa keys and do not expose BLE. Claim and manage
+them through their open, attended setup AP. Repeating remains disabled until a
+valid radio/forwarding configuration has been saved.
 
-The complete endpoint and field reference is in
-[`protocols/ONBOARDING_API.md`](protocols/ONBOARDING_API.md).
+## Transfer access by QR
 
-## Repeater first boot
+Open a saved device and choose **Show access QR**. On another phone choose
+**Import access QR** and scan it or select its image. The versioned payload
+contains the device ID, role, optional LAN address, and owner key. BLE IDs are
+not exported because they are platform-local identifiers.
 
-An erased repeater exposes `lora-repeater-<suffix>` and prints its generated
-administrator password and AP address at 115200 baud. Authenticate as `admin`,
-then configure a unique ID and the exact radio settings used by the tracker and
-gateway. Configure the local hop cap, priority delay/slots, duplicate lifetime,
-airtime budget and heartbeat interval. Repeating remains disabled until the
-configuration validates and is saved.
+There is no server-side recovery and firmware never returns the owner key. If
+every stored/exported copy is lost, physically factory-reset and claim the
+device again. To revoke a transferred key, factory-reset and reclaim the device.
 
-To reopen the portal, hold USER for at least 1.5 seconds during boot. A
-configured repeater closes it after ten minutes. Repeaters do not receive any
-tracker AEAD key. Placement, power and end-to-end acceptance requirements are
-in [repeaters](REPEATERS.md).
+## Configuration mode and remote OTA
 
-## Post-onboarding acceptance checklist
+OTA is disabled during ordinary operation. Enable it for ten minutes using one
+of these paths:
 
-- Device has a unique generated or factory-injected admin credential; any
-  first-boot log containing it has been closed and handled as a secret.
-- Gateway reports verified TLS and rejects plaintext when the test override is false.
-- Tracker and gateway have identical frequency, bandwidth, spreading factor,
-  coding rate, preamble and sync word; every repeater matches them.
-- Relay hop limits are the minimum needed, the tracker ACK window covers the
-  measured round trip, and repeater queue-drop/airtime-deferral counters remain acceptable.
-- Only registered tracker hashes with matching per-device AEAD keys are accepted.
-- `timestamp_valid`, location, battery and sequence values are plausible.
-- Archiver availability is online, gateway archive-confirmation ACLs are correct,
-  and a history request ends with `final=true`.
-- Factory-reset and rollback procedure has been tested on a spare unit.
-- Provisioning record, recovery credentials and firmware commit are stored securely.
+- **Enable config + OTA** in the app over authenticated BLE or Wi-Fi;
+- open `http://<device-ip>/enable-config`, paste the owner key, and choose
+  **Enable for 10 minutes**;
+- `POST /api/v1/config-mode` with the owner key;
+- `ENTER_CONFIG_MODE` in an authenticated BLE session;
+- the documented boot/button action.
+
+The dependency-free device page exchanges a valid Bearer key for a random,
+memory-only, HttpOnly browser session cookie lasting at most ten minutes. Its
+forms and live-log requests use that cookie; the owner key is not placed in a
+URL or form field.
+
+Set the owner key in the shell, then select the matching OTA environment and
+device IP. The app exposes **Copy owner key for PlatformIO** inside the access
+QR panel; the clipboard grants full device control, so clear it after use:
+
+```powershell
+$env:LORA_TRACKER_OWNER_KEY = "<64-hex-owner-key>"
+pio run -d components/tracker-firmware -e heltec_wireless_tracker_ota `
+  -t upload --upload-port 192.168.1.42
+```
+
+Gateway example:
+
+```powershell
+$env:LORA_TRACKER_OWNER_KEY = "<64-hex-owner-key>"
+pio run -d components/gateway-firmware -e heltec_wifi_lora_32_v2_ota `
+  -t upload --upload-port 192.168.1.103
+```
+
+Use the corresponding repeater OTA environment for repeaters. ArduinoOTA
+performs its challenge/response using the owner key. OTA is authenticated but
+images are not yet cryptographically signed; Secure Boot, flash encryption, and
+signed update enforcement remain production-hardening tasks.
+
+## Acceptance checklist
+
+- Android Settings shows no bond/PIN flow for the device.
+- The device can be reclaimed only after factory reset.
+- A wrong/missing owner key cannot read configuration or mutate state.
+- An empty SSID produces no station association attempts.
+- Tracker, gateway, and repeaters have identical legal Germany radio settings.
+- Tracker setup cannot finish before gateway registration and confirmation.
+- QR import can manage the device from a second test installation.
+- OTA is rejected outside configuration mode and succeeds inside it with the
+  owner key.
+
+See [the onboarding API](protocols/ONBOARDING_API.md) for protocol details and
+[Germany radio compliance](RADIO_COMPLIANCE_DE.md) before deployment.

@@ -1,143 +1,68 @@
-# Onboarding and configuration API
+# Device ownership and configuration API
 
-This document defines the provisioning transport over the versioned,
-CRC-protected configuration blobs in [`CONFIGURATION.md`](CONFIGURATION.md).
+## Owner-key model
 
-## Transaction model
+Every claimed device stores one random 256-bit owner key encoded as 64
+hexadecimal characters. There is no PIN, password, OS Bluetooth bond, or
+separate OTA credential.
 
-Configuration changes never mutate the live blob field-by-field. The device:
+- Factory reset erases the owner key and opens attended claim.
+- `CLAIM` succeeds exactly once while an unclaimed device is in configuration
+  mode.
+- BLE and HTTP use the same key.
+- Firmware never returns the key.
+- QR transfer is an application record, not a firmware endpoint.
 
-1. copies the current configuration into a candidate;
-2. checks `expected_revision` against the active revision;
-3. applies all supplied fields to the candidate;
-4. finalizes its header and CRC with revision + 1;
-5. validates all individual and cross-field constraints;
-6. copies the previous active blob to the backup slot;
-7. writes the candidate as the new active blob.
+Discovery is public so the app can decide whether to claim or authenticate.
+Configuration remains secret-bearing and requires authorization.
 
-Invalid or stale requests leave the active configuration unchanged. A successful rollback is stored as a new revision rather than moving the revision backwards.
+## HTTP transport
 
-The gateway's broker root CA is stored in a dedicated active/backup NVS pair
-because a PEM bundle does not fit the compact configuration blob. It is
-validated and committed with the same revisioned transaction; rollback restores
-the matching previous CA value.
+Bodies use `application/x-www-form-urlencoded`.
 
-Wi-Fi and MQTT passwords are never returned by the read API;
-`wifi_password_set` and `mqtt.password_set` expose only whether a value exists.
-The gateway similarly reports `mqtt.ca_certificate_set` without returning the
-PEM contents. The certificate is public trust material, but omitting it from
-routine reads keeps configuration responses compact.
-The tracker returns its `lora_aead_key` through this authenticated local
-interface because an operator must transfer it to the gateway. Treat the full
-response as a provisioning secret and do not save it in logs.
+### Public routes
 
-For secret fields:
+`GET /enable-config` serves a local, dependency-free page that accepts the
+owner key in memory and calls the authenticated configuration-mode endpoint.
+It does not save or transmit the key anywhere except directly to that device.
+After validation, firmware issues a random, memory-only, HttpOnly session
+cookie so normal form submissions and log polling remain authorized. The
+cookie and configuration/OTA window expire after ten minutes.
 
-- omitted, empty, or `__KEEP__`: retain the existing secret;
-- `__CLEAR__`: erase it;
-- any other value: replace it.
+`GET /api/v1/onboarding` returns:
 
-`mqtt_ca_certificate` uses `__KEEP__` to retain, an empty value to clear, or a
-PEM certificate bundle up to 4096 bytes to replace. Clearing it while TLS is
-enabled fails validation.
+- `api_version`, `role`, `device_id`, and `revision`;
+- `onboarding_required` and role-specific completion state;
+- `config_mode` where applicable;
+- `owner_key_configured`;
+- supported transports.
 
-## Wi-Fi HTTP API
+`POST /api/v1/claim` accepts `owner_key=<64-hex>`. It returns `409` if the
+device is already claimed or not in an attended claim window.
 
-All mutation bodies use `application/x-www-form-urlencoded`. Every HTTP route
-requires Basic authentication with username `admin` and the device's unique
-admin credential. The credential is also the WPA2 password of the fallback
-access point and must be at least 12 characters.
+### Owner-authorized routes
 
-### Discovery
+Send `Authorization: Bearer <owner-key>`:
 
-`GET /api/v1/onboarding`
+- `GET /api/v1/config`
+- `POST /api/v1/config`
+- `POST /api/v1/config/rollback`
+- `POST /api/v1/config-mode`
+- `POST /api/v1/reboot`
+- `POST /api/v1/factory-reset`
+- tracker `POST`/`DELETE /api/v1/gateway-pairing`
+- gateway `GET`/`POST /api/v1/trackers`
 
-Returns the role, API version, current revision, onboarding state, available transports, and whether gateway write access is physically unlocked.
+`POST /api/v1/config-mode` enables configuration OTA for ten minutes. Tracker
+configuration mode is already bounded by its setup lifecycle; gateway and
+repeater responses include `duration_s=600`.
 
-### Read configuration
+Factory reset requires `confirm=FACTORY_RESET`. Rollback and configuration
+patches require `expected_revision=<current revision>`.
 
-`GET /api/v1/config`
+## BLE transport
 
-Returns all non-secret configuration values in JSON.
-
-### Transactional patch
-
-`POST /api/v1/config`
-
-Required field:
-
-- `expected_revision=<current revision>`
-
-Optional control field:
-
-- `reboot=1`: reboot even if the changed fields do not inherently require it.
-
-A `409` response means the app must reload the configuration and merge/retry. A successful response reports the new revision and `reboot_required`.
-
-Example:
-
-```text
-expected_revision=4&device_name=Wera&moving_sleep_s=45&max_hdop=1.8&reboot=1
-```
-
-### Rollback
-
-`POST /api/v1/config/rollback`
-
-```text
-expected_revision=5
-```
-
-Restores the validated backup as a new revision and requires reboot.
-
-### Factory reset
-
-`POST /api/v1/factory-reset`
-
-```text
-confirm=FACTORY_RESET
-```
-
-The next boot enters onboarding automatically.
-
-### Reboot
-
-`POST /api/v1/reboot`
-
-
-### Replace the administrator credential
-
-`POST /api/v1/credentials`
-
-```text
-new_password=<12-to-24-printable-non-space-characters>
-confirm_password=<same-value>
-```
-
-This write-only operation requires the current HTTP authentication. A gateway
-also requires its physical write window. The credential is stored separately
-from the revisioned configuration because it protects access to that
-configuration; it becomes both the HTTP Basic password and fallback AP WPA2
-password after reboot. Factory reset removes it and generates a new value.
-
-## Tracker onboarding
-
-After factory reset, or after an explicit post-boot Wi-Fi setup gesture, the tracker provides both transports concurrently:
-
-- Wi-Fi AP: `LoRaTracker-<device_id>`
-- BLE name: `LT-<device_id>`
-
-An erased generic release generates a unique 20-character admin credential and
-shows it on the tracker display during onboarding. A factory may instead set a
-unique `factory_admin_password` in each device's `secrets.h`. The firmware
-refuses to start the AP or authorize HTTP with fewer than 12 characters. The
-phone UI can replace it through `POST /api/v1/credentials`.
-
-The tracker also tries station mode during an explicit setup session when it is already provisioned. Timer wake-ups never expose configuration services.
-
-## Tracker BLE protocol
-
-The tracker reuses the Nordic UART-style BLE service:
+Trackers and gateways expose the Nordic-UART-style service:
 
 ```text
 Service: 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
@@ -145,133 +70,90 @@ RX/write: 6E400002-B5A3-F393-E0A9-E50E24DCCA9E
 TX/notify: 6E400003-B5A3-F393-E0A9-E50E24DCCA9E
 ```
 
-Commands are UTF-8 text terminated by `\n`. Responses are JSON terminated by `\n`. The tracker emits responses in 18-byte notifications, so clients concatenate notifications until the newline.
-
-Commands:
+The RX characteristic is a normal GATT write characteristic. It deliberately
+does not request encryption, MITM, pairing, or bonding from the OS. Commands
+are UTF-8 terminated by `\n`; JSON responses are newline-terminated and may be
+split into 18-byte notifications.
 
 ```text
-CLAIM <new-admin-password>
-AUTH <admin-password>
+INFO
+CLAIM <64-hex-owner-key>
+AUTH <64-hex-owner-key>
 HELLO
 GET CONFIG
 PATCH expected_revision=4&device_name=Wera&moving_sleep_s=45
-SET_CREDENTIAL <new-admin-password>
+ENTER_CONFIG_MODE
+PAIR_GATEWAY <gateway-id>             # tracker
+UNPAIR_GATEWAY                        # tracker
+REGISTER_TRACKER device_id=...&device_name=...&lora_aead_key=... # gateway
 ROLLBACK 5
 FACTORY_RESET FACTORY_RESET
 REBOOT
 ```
 
-The RX characteristic requires LE Secure Connections with MITM protection. A
-fresh random pairing PIN is generated for each bounded BLE session and shown on
-the tracker display. While `onboarding_required=true`, `CLAIM` is allowed only
-inside that physically opened provisioning window; it validates and stores the
-new credential and authenticates the current session. Otherwise `AUTH` is
-mandatory before responses or debug logs are exposed. The PATCH body uses the
-same URL-encoded fields and secret semantics as HTTP. A claim alone does not
-mark configuration complete; a successful transactional PATCH still does that.
-After authentication, `SET_CREDENTIAL` replaces the write-only administrator
-credential and reboots so the fallback AP adopts the new password.
+`INFO` is public. `CLAIM` is allowed only for an unclaimed device during the
+attended setup window. Every other command except `AUTH` requires the current
+BLE session to be authenticated. Disconnect clears session authentication.
 
-## Gateway onboarding and write protection
+The key is a bearer secret on local HTTP and the custom BLE protocol. Operate
+configuration networks in physical proximity/on a trusted LAN. QR exports and
+PWA local storage must be protected accordingly.
 
-An unprovisioned gateway automatically starts:
+## Transaction model
 
-```text
-SSID: LoRaGateway-<gateway_id>
-Password: the gateway's unique onboarding password
-```
+Configuration changes never mutate the live blob field-by-field. Firmware:
 
-For a provisioned gateway, configuration reads remain available on the local network, but writes are locked. Holding the gateway USER button for five seconds unlocks writes for ten minutes. If Wi-Fi is unavailable, the gateway exposes its fallback AP; it remains read-only until that physical hold unless it is unprovisioned.
+1. copies active configuration to a candidate;
+2. checks `expected_revision`;
+3. applies all fields;
+4. finalizes CRC and revision + 1;
+5. validates individual and cross-field constraints;
+6. stores the previous active value in the backup slot;
+7. atomically activates the candidate.
 
-The erased gateway generates its unique admin credential and displays it with
-the setup address on the Heltec V2 OLED; a factory may inject
-`factory_admin_password` per device before first flash. Replace it through the
-phone UI while the physical write window is open.
+A rollback restores the validated backup as a new revision. A stale request
+returns HTTP `409` or BLE `revision_conflict` and leaves active state unchanged.
 
-## Tracker patch fields
+Secret fields use these semantics:
 
-Identity and local setup:
+- omitted, empty, or `__KEEP__`: retain;
+- `__CLEAR__`: erase;
+- any other value: replace.
 
-```text
-device_id, device_name, wifi_ssid, wifi_password, lora_aead_key,
-ble_debug_enabled, battery_sense_enabled
-```
+Wi-Fi/MQTT passwords are never returned. The tracker LoRa AEAD key is returned
+only through an owner-authorized configuration session because gateway
+registration needs it.
 
-LoRa:
+## Role completion rules
 
-```text
-lora_frequency_hz, lora_bandwidth_hz, lora_tx_power_dbm,
-lora_sf, lora_coding_rate, lora_preamble_length, lora_sync_word,
-lora_relay_hop_limit
-```
+A tracker is not operational until configuration is complete and at least one
+gateway confirmation exists. Register the tracker on the gateway first, then
+send `PAIR_GATEWAY`; this two-device transaction is idempotent and retryable.
+The response identifies the gateway requested by that operation, while a
+configuration read returns the complete confirmed-gateway list. Changing the
+tracker ID or LoRa AEAD key clears that list and requires registration again.
 
-Tracker communication policy:
+A gateway is operational after validated Wi-Fi/MQTT/radio configuration. A
+repeater is operational after validated radio/forwarding configuration and is
+managed through Wi-Fi because it has no BLE service.
 
-```text
-lora_tx_interval_s, lora_tx_min_points, lora_ack_timeout_ms,
-lora_retry_backoff_1_s ... lora_retry_backoff_4_s
-```
+## OTA
 
-GNSS and movement:
+ArduinoOTA starts only in configuration mode and uses the owner key through its
+challenge/response mechanism. PlatformIO OTA environments read
+`LORA_TRACKER_OWNER_KEY` and require `--upload-port <device-ip>`. OTA
+authentication does not replace signed firmware/Secure Boot.
 
-```text
-min_distance_m, min_speed_kmph, max_hdop, min_satellites,
-max_speed_mps, max_fix_age_s,
-gps_timeout_1_ms ... gps_timeout_4_ms,
-gps_full_retry_interval_s, gps_initial_listen_ms,
-gps_light_sleep_chunk_ms, gps_listen_window_ms,
-movement_speed_threshold_kmph, movement_displacement_threshold_m,
-movement_evidence_distance_m, movement_evidence_step_m,
-movement_direction_tolerance_deg, movement_evidence_required
-```
+## Configuration field groups
 
-Storage and sleep:
+Tracker fields cover identity, station Wi-Fi, LoRa AEAD/radio settings, GNSS
+quality/timeouts, movement policy, batching/ACK/retry policy, history storage,
+sleep intervals, battery sensing, and BLE debug enablement.
 
-```text
-history_point_spacing_m, save_distance_threshold_m, nvs_save_interval_s,
-moving_sleep_s, stationary_sleep_s, long_stationary_sleep_s,
-no_fix_sleep_1_s ... no_fix_sleep_4_s,
-stationary_fixes_for_long_sleep, stationary_fixes_for_max_sleep
-```
+Gateway fields cover identity, station Wi-Fi, MQTT/TLS/CA settings, Germany
+LoRa profile, retry intervals, dedup persistence, and up to twelve tracker
+registry entries.
 
-## Gateway patch fields
-
-Gateway and network:
-
-```text
-gateway_id, gateway_name, wifi_ssid, wifi_password,
-mqtt_host, mqtt_port, mqtt_tls_enabled, mqtt_username,
-mqtt_password, mqtt_ca_certificate, mqtt_base_topic, mqtt_buffer_size,
-dedup_save_interval, wifi_retry_interval_ms, mqtt_retry_interval_ms
-```
-
-Gateway LoRa fields are identical to the tracker radio field names; tracker
-batching, ACK timeout and retry fields do not apply to the gateway.
-
-Registry:
-
-```text
-tracker_count
-tracker.0.id
-tracker.0.name
-tracker.0.lora_aead_key
-tracker.0.enabled
-...
-tracker.11.*
-```
-
-The complete candidate is validated after all fields are applied, so `tracker_count` and the corresponding entries can be sent in any order.
-
-## Security scope
-
-HTTP has per-device password authentication and gateway mutations additionally
-require a physical unlock. BLE uses Secure Connections/MITM and an authenticated
-application session. A tracker may establish its first authenticated session
-with `CLAIM` only during unprovisioned physical setup. Remaining provisioning
-work includes:
-
-- a random per-device cryptographic provisioning secret distinct from the AP password;
-- purpose-separated provisioning/session keys rather than deriving pairing from the admin credential;
-- QR transfer of public identity and provisioning material;
-- encrypted export/import bundles;
-- automated LoRa key rotation, revocation and recovery.
+Repeater fields cover identity, Germany LoRa profile, hop cap, priority delay
+and slots, duplicate-cache lifetime, continuous-hour airtime budget, and
+heartbeat interval.

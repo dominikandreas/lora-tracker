@@ -14,17 +14,18 @@ delivery guarantees and hardware qualification and cannot be papered over.
 - Added certificate-verified TLS and transactional runtime root-CA provisioning
   to gateway MQTT; plaintext requires explicit test opt-in.
 - Made archiver TLS the default and added CA/config validation.
-- Required unique 12+ character onboarding credentials and HTTP authentication.
-- Disabled OTA unless a password hash is provisioned and disabled telnet by default.
+- Added random 256-bit app-managed owner keys shared by BLE, HTTP, and
+  configuration-mode OTA; removed PIN/password/bond onboarding.
+- Disabled OTA outside an owner-authorized configuration window and disabled telnet by default.
 - Strengthened SQLite foreign-key, timeout and durability settings.
 - Added strict browser point validation, text-only rendering, automatic history pagination, bounded IndexedDB retention and update-first offline caching.
 - Added pinned PlatformIO projects and native tracker/gateway/repeater contract simulation.
 - Added onboarding, hardware, operations and simulation documentation.
 - Added per-tracker AES-256-GCM history/ACK protection, per-encryption nonce
   counters and monotonic point replay rejection.
-- Added BLE Secure Connections plus application-session authentication.
-- Added generated first-boot credentials and random per-tracker radio keys.
-- Added on-device first-boot credentials, random per-session BLE PINs, bounded BLE claiming and authenticated credential replacement.
+- Added no-bond custom BLE application-session authentication.
+- Added attended BLE/Wi-Fi owner-key claim and random per-tracker radio keys.
+- Added QR owner-key transfer and bounded BLE/Wi-Fi configuration.
 - Fresh tracker and gateway onboarding no longer requires an attached serial console.
 - Added RTC history metadata/bounds/CRC validation.
 - Added CI, tagged release packaging, checksums, provenance and browser-flash images.
@@ -42,8 +43,8 @@ delivery guarantees and hardware qualification and cannot be papered over.
 
 | Area | Missing production behavior | Acceptance evidence |
 |---|---|---|
-| Key lifecycle | Random public IDs, purpose-separated keys, QR bootstrap, rotation/revocation and reduced gateway key exposure | Provision/rotate/revoke/recover tests and key-custody records |
-| BLE provisioning | QR bootstrap, fleet recovery/rotation workflow and a qualified phone/browser support matrix beyond the authenticated Tracker Console | Pairing/replay/recovery tests on supported phones |
+| Key lifecycle | Random public IDs, purpose-separated keys, owner-key rotation/revocation and reduced gateway key exposure | Provision/rotate/revoke/recover tests and key-custody records |
+| BLE provisioning | Fleet recovery/rotation workflow, app-layer confidentiality and a broader qualified phone matrix | Claim/auth/replay/recovery tests on supported phones |
 | Firmware trust | Signed OTA, Secure Boot v2, flash/NVS encryption and key custody | Factory provisioning record and failed unsigned-image tests |
 | Tracker queue durability | Unacknowledged telemetry currently survives deep sleep only, not power loss or hard reset | Wear-levelled flash-journal fault injection with zero sequence reuse or silent point loss |
 | Hardware | Current gateway board port, qualified tracker design and installed repeater power/RF design | HIL CI, RF/power/environmental reports and factory tests |
@@ -54,7 +55,7 @@ delivery guarantees and hardware qualification and cannot be papered over.
 ## Field-trial gate
 
 A controlled field trial may proceed only on a private isolated broker/network,
-with unique credentials/keys, TLS, no public HTTP exposure and attended BLE
+with unique keys, TLS, no public HTTP exposure and attended device
 onboarding. Radio traffic is encrypted and authenticated, but traffic analysis
 remains possible and a compromised gateway exposes its registered tracker keys.
 Repeaters are keyless but can still amplify structurally valid hostile traffic

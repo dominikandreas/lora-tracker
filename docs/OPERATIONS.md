@@ -142,3 +142,31 @@ The app needs an MQTT WebSocket listener. Browser mixed-content rules block
 are requested automatically with a 100-page safety bound. Local history is
 pruned after 180 days and capped at 250,000 points. Clear site data to reset
 IndexedDB and saved broker preferences.
+
+The Android application can connect to a private `ws://` broker after an
+explicit warning. This enables certificate-free home deployments, but it sends
+the MQTT username/password and gateway-decoded tracker data without transport
+encryption. Use an isolated trusted LAN or VPN, and migrate to `wss://` when
+practical.
+MQTT connection failures remain visible alongside the retry countdown. Verify
+that the configured port is an MQTT-over-WebSocket listener, not the broker's
+raw MQTT listener on port 1883. If omitted, the application supplies port 1884
+for `ws://` or 8884 for `wss://`; enter a port explicitly when the broker uses a
+different listener.
+Android saves the MQTT password automatically in Keystore-backed encrypted
+storage. The hosted browser app saves it in origin-scoped localStorage; use a
+trusted browser profile and a dedicated least-privilege MQTT account.
+
+## Tracker-to-gateway pairing recovery
+
+Pairing always commits the gateway registry first and the tracker confirmation
+second. If the app reports that gateway registration was saved but tracker
+confirmation failed, reconnect the tracker and press **Register and finish
+pairing** again; the gateway upsert is idempotent. If the gateway cannot be
+reached by its saved `.local` name, enter the LAN IP shown by the router or the
+gateway display in the pairing panel. Do not manually copy LoRa keys.
+
+The app stores a device owner key under the canonical device ID and local BLE
+identifier. Export a full-authority access QR before clearing app data. If no
+stored/exported copy remains, recovery requires factory reset and a new attended
+claim; firmware never returns the owner key.

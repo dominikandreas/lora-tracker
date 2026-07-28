@@ -9,13 +9,13 @@ hardware support or multiple public interfaces.
 - [x] Implement AES-256-GCM authenticated encryption for LoRa history and ACK frames.
 - [x] Provision a random per-device LoRa key and reject monotonic boot/sequence replays.
 - [ ] Replace the routing hash with a random public identifier and derive purpose-separated keys.
-- [ ] Add QR bootstrap, automated key rotation/revocation and a gateway-blind ciphertext design.
-- [x] Require BLE Secure Connections/MITM and an authenticated application session.
-- [x] Show temporary first-boot credentials and random per-session BLE PINs on-device instead of requiring serial access.
-- [x] Add physically bounded BLE first-claim and authenticated phone UI credential replacement.
+- [ ] Add automated owner-key rotation/revocation and a gateway-blind ciphertext design.
+- [x] Replace OS Bluetooth pairing/PINs with a no-bond custom GATT protocol and authenticated application session.
+- [x] Add physically bounded BLE/Wi-Fi claim with random 256-bit owner keys.
 - [x] Add a supported authenticated BLE onboarding client with claiming,
-      credential replacement, transactional configuration and recovery actions.
-- [ ] Add QR bootstrap and fleet credential/key recovery and rotation policy.
+      transactional configuration and recovery actions.
+- [x] Add QR owner-key transfer between app installations.
+- [ ] Add fleet recovery, auditable key rotation and revocation policy.
 - [ ] Replace password-only ArduinoOTA with signed images, Secure Boot v2, flash/NVS encryption and documented eFuse/key custody.
 - [x] Require an application-level archiver receipt before gateway dedup advancement and tracker ACK; retries remain idempotent across QoS-0 loss.
 - [ ] Port the gateway to a current ESP32-S3/SX1262 board and share its RadioLib driver with the tracker.
@@ -41,13 +41,17 @@ hardware support or multiple public interfaces.
 
 ## P1 — application
 
-- [x] Build an authenticated onboarding UI for tracker BLE (gateway provisioning remains on its captive portal).
+- [x] Build an authenticated BLE-first onboarding and complete configuration UI for trackers and gateways, with local-IP reconnect.
 - [x] Add automatic bounded history pagination; background synchronization and export remain future work.
 - [x] Add a geographical map with an offline grid, opt-in online tiles and imported local raster PMTiles.
-- [ ] Add encrypted local secret storage protected by platform biometrics or PIN (currently session-only).
+- [x] Add Android Keystore-backed MQTT and device-secret storage; browser device credentials persist in origin-scoped localStorage.
 - [x] Add open-app alerts for stale trackers, low battery and unusual movement.
 - [ ] Add server-backed closed-app push and explicit gateway heartbeat/fleet-health alerts.
-- [ ] Build the deferred mobile app from generated shared schemas.
+- [x] Package the shared dashboard, offline map and tracker/gateway device manager as a native Android app.
+- [ ] Add the custom BLE management protocol and persistent station-Wi-Fi
+      management to repeaters; current repeater management requires its
+      attended setup AP.
+- [ ] Generate shared application models and test vectors from the canonical schemas.
 
 ## P2 — maintainability and expansion
 

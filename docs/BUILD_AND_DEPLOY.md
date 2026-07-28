@@ -4,17 +4,18 @@
 
 - PlatformIO Core for embedded builds
 - Python 3.11+ for the archiver and system simulator
-- Node.js 20+ for browser tests
+- Node.js 22+ for browser tests and Capacitor tooling
 - Emscripten and GNU Make for the WebAssembly Network Lab
+- Java 21 plus the Android SDK for the native Android application
 - A private MQTT broker with TLS TCP and WebSocket listeners
 
 ## Secrets
 
 Copy `secrets.example.h` to `secrets.h` in each firmware directory. These files
-are git-ignored. Generic release builds leave `factory_admin_password` empty;
-each erased device generates and persists a unique 20-character credential.
-A factory may instead inject a unique 12+ character value per device. For the
-gateway, provision the TLS port and PEM root CA during authenticated onboarding;
+are git-ignored. Generic devices receive a random 256-bit owner key from the
+app during attended BLE or setup-AP claim; no factory password, PIN, Bluetooth
+bond, or OTA-only credential is compiled into the image or printed. For the gateway, provision the TLS port
+and PEM root CA during authenticated onboarding;
 `mqtt_ca_certificate` in `secrets.h` is only an optional factory seed. Leave
 `allow_insecure_mqtt=false` outside an isolated test network.
 
@@ -34,8 +35,8 @@ The second supports the Heltec Wireless Tracker ESP32-S3/SX1262/UC6580/TFT
 branch. Never upload until the exact board, region, antenna and serial port have
 been checked.
 
-An unprovisioned tracker starts `LoRaTracker-<device_id>` and requires HTTP user
-`admin` plus its unique onboarding password. See [onboarding](ONBOARDING.md).
+An unprovisioned tracker starts an open `LoRaTracker-<suffix>` setup AP and a
+no-bond BLE claim service. See [onboarding](ONBOARDING.md).
 
 ## Gateway firmware
 
@@ -49,7 +50,9 @@ current ESP32-S3/SX1262 board is a production TODO.
 
 An unprovisioned gateway starts `LoRaGateway-<gateway_id>`. Once provisioned,
 hold USER for five seconds to unlock writes for ten minutes; HTTP authentication
-is still required.
+is still required. The saved owner key can also open
+`http://<gateway-ip>/enable-config` or the app can enable the same window over
+BLE/Wi-Fi before a PlatformIO OTA upload.
 
 ## Repeater firmware
 
@@ -58,8 +61,8 @@ pio run -d components/repeater-firmware -e heltec_wifi_lora_32_v2
 pio run -d components/repeater-firmware -e heltec_wireless_tracker
 ```
 
-An erased repeater starts a protected setup AP and prints its generated admin
-credential on serial. It does not need or store tracker AEAD keys. See
+An erased repeater starts an open, attended setup AP and is claimed with an app-
+generated owner key. It does not need or store tracker AEAD keys. See
 [repeaters](REPEATERS.md) for forwarding policy, placement and qualification.
 
 ## Archiver
@@ -97,10 +100,47 @@ npm run build
 python3 -m http.server 8080
 ```
 
-The app persists broker URL, namespace and username but not the password. Run
-`npm run package` to assemble the self-contained `dist/` artifact. The public
+The browser app persists broker URL, namespace, username, MQTT password and
+per-device owner keys in origin-scoped localStorage so reconnects require no
+manual entry. Use a trusted browser profile and a least-privilege broker account.
+Android stores them in Keystore-backed storage and can transfer them through an
+explicit full-authority QR export. Run `npm run package` to assemble the self-contained
+`dist/` artifact. The public
 documentation deploys that artifact at `/app/` and the Network Lab at
 `/simulator/`.
+
+## Android application
+
+The Android application reuses the exact web-app source and embeds its built
+assets with Capacitor. It adds native BLE, native local-device HTTP, secure
+broker/per-device credential storage, SQLite and
+notifications; no remote application bundle is loaded at runtime.
+
+Install Android Studio (including the current SDK), Java 21 and Node.js. Then:
+
+```bash
+cd components/web-app
+npm ci
+npm run native:build
+```
+
+The command selects `gradlew` or `gradlew.bat` for the host. If several JDKs are
+installed, set `JAVA_HOME` to Android Studio's Java 21 runtime or another Java
+21 installation first. The debug APK is created at
+`android/app/build/outputs/apk/debug/app-debug.apk`. Install it only on a test device;
+store signing, release signing-key custody and app publication are deliberately
+out of scope for now.
+
+`native:sync` rebuilds the dashboard and bundled Network Lab before updating
+Android assets and plugin configuration. Android accepts `wss://` and, after an
+explicit warning, `ws://` for private-network brokers. Plaintext WebSockets
+expose MQTT credentials and gateway-decoded telemetry; LoRa frame encryption
+does not extend beyond the gateway. Non-secret connection settings use
+Preferences, telemetry uses bounded SQLite storage, and MQTT and per-device
+credentials use Android Keystore-backed secure storage. Closed-app alerts still
+require a future server-backed push
+service; native local notifications are generated while the application process
+is running.
 
 ## Browser Network Lab
 
@@ -164,7 +204,8 @@ Use `lora-tracker.code-workspace` to open all PlatformIO projects in VS Code.
 
 `.github/workflows/ci.yml` tests Python and both browser applications,
 compiles the shared core to WASM, runs native/WASM parity plus headless Chromium,
-uploads the static Network Lab artifact and compiles every firmware target on
+builds an Android debug APK with Java 21, uploads the static application and
+Android artifacts, and compiles every firmware target on
 pushes and pull requests. `.github/workflows/release.yml`
 runs the same gates for `v*` tags, checks that the tag matches `VERSION`, builds
 secret-free generic firmware, creates merged ESP Web Tools images, publishes

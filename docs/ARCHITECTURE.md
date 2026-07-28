@@ -13,8 +13,8 @@
                     +-------------------+-------------------+------------------+
                     |                   |                                      |
              +------+-------+    +------+--------+                      +------+------+
-             | Archiver     |    | Web app      |                      | Home/other  |
-             | SQLite       |    | MQTT WS/PWA  |                      | consumers   |
+             | Archiver     |    | User app     |                      | Home/other  |
+             | SQLite       |    | Web/Android  |                      | consumers   |
              +--------------+    +---------------+                      +-------------+
 
 * LoRa payloads are end-to-end AES-256-GCM encrypted between tracker and
@@ -102,17 +102,42 @@ APIs are not emulated in a browser. Their decisions move into the portable core
 when practical, while hardware effects remain explicit simulator adapters or
 physical tests.
 
-## Web application
+## Web and Android application
 
-The web app is a static PWA. It implements MQTT 3.1.1 over WebSocket directly,
-stores non-secret broker settings in localStorage, keeps bounded point history
-in IndexedDB, and restores cached tracker state after an offline reload. Leaflet
+One web codebase is built as both a static PWA and a Capacitor Android app. It
+implements MQTT 3.1.1 over WebSocket directly and restores cached tracker state
+after an offline reload. Browsers store settings, MQTT credentials and device
+owner keys in origin-scoped localStorage and bounded point history in IndexedDB. Android
+uses Preferences for non-secrets, SQLite for bounded telemetry and opt-in
+Keystore-backed secure storage for broker credentials and per-device owner
+keys. Android owner keys use Keystore; the PWA uses persistent,
+origin-scoped localStorage and therefore has a weaker local security boundary. Leaflet
 renders an offline grid, an explicitly selected OpenStreetMap layer, or a local
-raster PMTiles archive retained in OPFS. MQTT passwords remain session-only.
-An attended Web Bluetooth client supports authenticated tracker claiming,
-configuration, rollback, reboot and factory reset. Gateway configuration stays
-on the gateway's own captive portal because a Pages origin cannot safely reach
-an arbitrary local HTTP gateway.
+raster PMTiles archive retained in OPFS.
+
+The device manager supports no-bond custom BLE or setup-AP claiming and complete
+configuration for trackers, gateways, and repeaters. It inventories saved
+devices, tries authenticated local HTTP first, and falls back to GATT for BLE-
+capable roles. Android
+uses native HTTP to avoid browser CORS/mixed-content restrictions. Tracker
+activation is a two-device transaction: register the tracker key on a gateway,
+then persist that gateway confirmation on the tracker. Native notifications
+replace the browser Notification API while a small platform adapter keeps the
+application logic shared.
+
+The gateway registration API is a narrow idempotent upsert, and the app keeps
+the tracker transport alive between gateway registration and tracker-side
+confirmation. Firmware GATT callbacks only frame incoming bytes. Complete commands are copied
+and processed by the Arduino application task; JSON construction, NVS writes and
+notification bursts must never run on the small ESP-IDF `BTC_TASK` stack.
+
+The Android WebView permits cleartext `ws://` solely to support private brokers
+without a trusted certificate and displays an explicit warning before each such
+connection. This is a transport-security compromise, not a consequence-free
+use of LoRa end-to-end encryption: the gateway terminates LoRa encryption and
+publishes decoded telemetry to MQTT, so plaintext MQTT exposes credentials,
+locations, history and commands on the IP network. The hosted HTTPS PWA remains
+subject to browser mixed-content blocking and therefore requires `wss://`.
 
 ## Identity and trust
 
@@ -129,9 +154,11 @@ The routing hash must never be treated as a password or encryption key.
 
 - Tracker: unacknowledged history/state in RTC plus selected NVS checkpoints and configuration. Power-loss-safe history journalling remains a release blocker.
 - Gateway: NVS configuration and per-tracker deduplication cursors.
-- Repeater: CRC-protected NVS forwarding/radio configuration and admin credential.
+- Repeater: CRC-protected NVS forwarding/radio configuration and owner key.
 - Archiver: SQLite point and reception tables.
-- Web app: IndexedDB point cache and localStorage connection preferences.
+- Browser app: IndexedDB point cache and localStorage connection preferences,
+  MQTT credentials and owner keys.
+- Android app: SQLite point cache, Preferences and opt-in secure credential storage.
 
 ## Versioning
 

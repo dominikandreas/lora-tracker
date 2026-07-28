@@ -1,7 +1,7 @@
 # LoRa Tracker
 
 LoRa Tracker is a low-power GNSS tracking system with battery-powered tracker
-firmware, a Wi-Fi/MQTT gateway, a SQLite history service, a browser PWA and a
+firmware, a Wi-Fi/MQTT gateway, a SQLite history service, a browser/Android app and a
 deterministic cross-component simulator. Optional keyless repeaters extend
 encrypted history traffic and receiver ACKs across bounded multi-hop paths.
 
@@ -9,8 +9,8 @@ encrypted history traffic and receiver ACKs across bounded multi-hop paths.
 
 The repository is suitable for development and controlled field trials, but
 is not approved for unattended production deployment. LoRa telemetry/ACKs now
-use per-tracker AES-256-GCM and tracker BLE configuration requires an encrypted,
-authenticated session. Gateway ACKs now require a durable archiver receipt,
+use per-tracker AES-256-GCM and device management requires an owner-key-
+authenticated custom BLE or local HTTP session. Gateway ACKs now require a durable archiver receipt,
 and all transmitters enforce the supported Germany radio profile. Remaining
 release blockers include signed firmware with ESP32 secure boot, a power-loss-safe
 tracker queue, key custody/rotation and hardware-in-the-loop qualification. See [production readiness](https://dominikandreas.github.io/lora-tracker-docs/reference/production-readiness.html)
@@ -24,7 +24,7 @@ and [security](https://dominikandreas.github.io/lora-tracker-docs/reference/secu
 | `components/gateway-firmware` | Multi-tracker LoRa reception, ACKs, deduplication and MQTT routing |
 | `components/repeater-firmware` | Keyless bounded forwarding of encrypted history and ACK frames |
 | `components/archiver` | Validated MQTT ingestion, SQLite retention and paginated history |
-| `components/web-app` | Installable MQTT-over-WebSocket monitoring PWA |
+| `components/web-app` | Shared MQTT-over-WebSocket PWA and Android application |
 | `components/firmware-core` | Portable C++ policies shared by firmware and WebAssembly |
 | `components/firmware-simulator` | Native embedded contract tests |
 | `components/simulator-web` | Interactive deterministic WASM network lab |
@@ -64,8 +64,9 @@ pio run -d components/repeater-firmware -e heltec_wireless_tracker
 ```
 
 Copy `secrets.example.h` to git-ignored `secrets.h` for tracker and gateway
-source builds; the repeater has no factory secret header. Generic builds generate their admin credential on erased
-first boot; a factory seed and OTA password hash are optional. Provision the
+source builds; the repeater has no factory secret header. Generic devices are
+claimed with a 256-bit app-generated owner key after erased first boot; no PIN,
+password, bond, or OTA-only secret is generated. Provision the
 gateway broker's PEM root CA through the authenticated setup API or a per-device
 factory build. Plain MQTT is disabled by default.
 

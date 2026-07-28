@@ -37,12 +37,13 @@ the operator's responsibility.
 5. Start the install and do not unplug the board until verification and reset
    complete. If automatic bootloader entry fails, hold BOOT, tap RESET, release
    BOOT after the connection starts, and retry.
-6. Open the flasher's serial console at 115200 baud. On an erased device, record
-   the generated `admin` credential shown in the first-boot output. It is unique
-   to that device and is not embedded in the release image.
-7. Connect to the role's setup AP (`LoRaTracker-<id>`, `LoRaGateway-<id>` or
-   `lora-repeater-<suffix>`), authenticate as `admin`, and complete
-   [onboarding](ONBOARDING.md).
+6. Open the LoRa Tracker app and claim a nearby tracker or gateway over the
+   custom BLE service. Do not pair it in Android Bluetooth settings: there is no
+   PIN or operating-system bond. The app generates and stores the owner key.
+7. Enter Wi-Fi and role configuration in the app. A repeater currently uses its
+   open, attended setup AP (`lora-repeater-<suffix>`): connect to it, add
+   `192.168.4.1` in the app, and claim it there. Complete
+   [onboarding](ONBOARDING.md) before leaving setup mode.
 
 The official [esptool-js project](https://github.com/espressif/esptool-js)
 documents the underlying Web Serial transport. ESP Web Tools requires a merged

@@ -5,11 +5,13 @@
 
 # Build and tooling output
 .pio/
+.platformio/
 components/.pio-build/
 .venv/
 **/__pycache__/
 *.egg-info/
 .pytest_cache/
+components/*-firmware/*.ino.cpp
 node_modules/
 dist/
 !components/simulation-engine/dist/

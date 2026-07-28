@@ -71,17 +71,18 @@ clear of metal, wet foliage, people and animals.
 
 ## Onboarding
 
-On erased flash, the repeater derives a unique ID, generates and persists a
-20-character administrator password, and starts
-`lora-repeater-<suffix>`. Serial output at 115200 baud shows the AP address and
-credential. Authenticate as `admin`, configure the radio and forwarding
-policy, save, and let the device reboot. Repeating remains disabled until a
-valid configuration has been saved.
+On erased flash, the repeater derives a unique ID and starts the open, attended
+`lora-repeater-<suffix>` configuration AP. Enter its IP in the app. The app
+generates and installs the same 256-bit owner-key format used by trackers and
+gateways; there is no AP password, HTTP Basic password, PIN, or BLE bond.
+Configure the radio and forwarding policy, save, and let the device reboot.
+Repeating remains disabled until a valid configuration has been saved.
 
 To reopen configuration, hold USER for at least 1.5 seconds during boot. A
-configured device closes the AP after ten minutes. The AP is WPA2 protected and
-the HTTP interface also uses Basic authentication; configure it only during an
-attended maintenance session and power-cycle afterward.
+configured device closes the AP after ten minutes. The AP is intentionally open,
+but every operation after first claim requires the owner key. Use an attended
+maintenance session and close or power-cycle it afterward. The same window can
+enable owner-key-authenticated PlatformIO OTA.
 
 Radio frequency, bandwidth, spreading factor, coding rate, preamble and sync
 word must exactly match every tracker and receiver in the radio cell. The
