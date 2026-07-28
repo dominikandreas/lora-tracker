@@ -3,6 +3,7 @@
 #include <SPI.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <ArduinoOTA.h>
 
 #if defined(BOARD_WIRELESS_TRACKER)
   #include <RadioLib.h>
@@ -24,7 +25,7 @@ constexpr size_t RECENT_CACHE_SIZE = 48;
 constexpr size_t ACK_RESERVATION_SIZE = 8;
 constexpr uint32_t ACK_RESERVATION_TTL_MS = 35000;
 constexpr uint32_t FORWARD_TURNAROUND_GUARD_MS = 50;
-constexpr size_t ADMIN_PASSWORD_SIZE = 21;
+constexpr size_t OWNER_KEY_HEX_LENGTH = 64;
 
 #if defined(BOARD_WIRELESS_TRACKER)
 constexpr int LORA_SCK = 9;
@@ -84,7 +85,10 @@ bool restart_requested = false;
 bool radio_ready = false;
 uint32_t config_portal_deadline_ms = 0;
 uint64_t repeater_hash = 0;
-char admin_password[ADMIN_PASSWORD_SIZE]{};
+char owner_key[OWNER_KEY_HEX_LENGTH + 1]{};
+char repeater_web_session_token[33]{};
+uint32_t repeater_web_session_deadline_ms = 0;
+bool ota_active = false;
 char repeater_hash_text[17]{};
 
 double airtime_tokens_ms = 0.0;
@@ -113,6 +117,15 @@ String htmlEscape(const char* value) {
   escaped.replace(">", "&gt;");
   escaped.replace("\"", "&quot;");
   escaped.replace("'", "&#39;");
+  return escaped;
+}
+
+String jsonEscape(const char* value) {
+  String escaped(value ? value : "");
+  escaped.replace("\\", "\\\\");
+  escaped.replace("\"", "\\\"");
+  escaped.replace("\r", "\\r");
+  escaped.replace("\n", "\\n");
   return escaped;
 }
 
@@ -150,31 +163,91 @@ void generateDefaultIdentity(char* output, size_t output_size) {
            static_cast<unsigned long>(chip & 0xffffUL));
 }
 
-void clearAdminPassword() {
+bool isValidOwnerKey(const char* value) {
+  if (!value || strlen(value) != OWNER_KEY_HEX_LENGTH) return false;
+  for (size_t index = 0; index < OWNER_KEY_HEX_LENGTH; index++) {
+    const char c = value[index];
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+          (c >= 'A' && c <= 'F'))) return false;
+  }
+  return true;
+}
+
+bool repeaterOwnerKeyMatches(const String& authorization) {
+  constexpr const char* prefix = "Bearer ";
+  uint8_t difference = authorization.length() == 7 + OWNER_KEY_HEX_LENGTH ? 0 : 1;
+  for (size_t index = 0; index < OWNER_KEY_HEX_LENGTH; index++) {
+    const uint8_t supplied = index + 7 < authorization.length()
+      ? static_cast<uint8_t>(authorization[index + 7])
+      : 0;
+    difference |= supplied ^ static_cast<uint8_t>(owner_key[index]);
+  }
+  for (size_t index = 0; index < 7; index++) {
+    const uint8_t supplied = index < authorization.length()
+      ? static_cast<uint8_t>(authorization[index])
+      : 0;
+    difference |= supplied ^ static_cast<uint8_t>(prefix[index]);
+  }
+  return difference == 0;
+}
+
+bool repeaterWebSessionActive() {
+  return repeater_web_session_token[0] != '\0' &&
+    (int32_t)(repeater_web_session_deadline_ms - millis()) > 0;
+}
+
+bool repeaterRequestHasWebSession() {
+  if (!repeaterWebSessionActive()) return false;
+  const String cookie = web_server.header("Cookie");
+  const String needle = "lt_session=" + String(repeater_web_session_token);
+  const int position = cookie.indexOf(needle);
+  if (position < 0) return false;
+  const int end = position + needle.length();
+  const bool starts_at_boundary = position == 0 || cookie[position - 1] == ' ' ||
+    cookie[position - 1] == ';';
+  const bool ends_at_boundary = end == cookie.length() || cookie[end] == ';';
+  return starts_at_boundary && ends_at_boundary;
+}
+
+void issueRepeaterWebSession() {
+  uint8_t random_bytes[16];
+  esp_fill_random(random_bytes, sizeof(random_bytes));
+  for (size_t index = 0; index < sizeof(random_bytes); index++) {
+    snprintf(repeater_web_session_token + index * 2, 3, "%02x", random_bytes[index]);
+  }
+  repeater_web_session_deadline_ms = millis() + CONFIG_WINDOW_MS;
+  web_server.sendHeader("Set-Cookie",
+    "lt_session=" + String(repeater_web_session_token) +
+    "; Max-Age=600; Path=/; HttpOnly; SameSite=Strict");
+}
+
+void clearOwnerKey() {
   Preferences credentials;
   if (credentials.begin("ltrepcred", false)) {
     credentials.clear();
     credentials.end();
   }
+  memset(owner_key, 0, sizeof(owner_key));
 }
 
-void initializeAdminPassword() {
+void initializeOwnerKey() {
   Preferences credentials;
-  credentials.begin("ltrepcred", false);
-  const String stored = credentials.getString("admin", "");
-  if (stored.length() >= 12 && stored.length() < ADMIN_PASSWORD_SIZE) {
-    strlcpy(admin_password, stored.c_str(), sizeof(admin_password));
-  } else {
-    static const char alphabet[] =
-      "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
-    for (size_t index = 0; index < 20; index++) {
-      admin_password[index] =
-        alphabet[esp_random() % (sizeof(alphabet) - 1)];
-    }
-    admin_password[20] = '\0';
-    credentials.putString("admin", admin_password);
-  }
+  if (!credentials.begin("ltrepcred", false)) return;
+  const String stored = credentials.getString("owner_key", "");
+  if (isValidOwnerKey(stored.c_str()))
+    strlcpy(owner_key, stored.c_str(), sizeof(owner_key));
   credentials.end();
+}
+
+bool replaceOwnerKey(const char* replacement) {
+  if (!isValidOwnerKey(replacement)) return false;
+  Preferences credentials;
+  if (!credentials.begin("ltrepcred", false)) return false;
+  const size_t written = credentials.putString("owner_key", replacement);
+  credentials.end();
+  if (written != OWNER_KEY_HEX_LENGTH) return false;
+  strlcpy(owner_key, replacement, sizeof(owner_key));
+  return true;
 }
 
 bool readStoredConfig(
@@ -234,8 +307,16 @@ void loadConfig() {
 }
 
 bool requireAuthentication() {
-  if (web_server.authenticate("admin", admin_password)) return true;
-  web_server.requestAuthentication(BASIC_AUTH, "LoRa Tracker repeater");
+  if (!isValidOwnerKey(owner_key)) {
+    web_server.send(503, "application/json", "{\"error\":\"owner_key_not_configured\"}");
+    return false;
+  }
+  if (repeaterRequestHasWebSession()) return true;
+  if (repeaterOwnerKeyMatches(web_server.header("Authorization"))) {
+    issueRepeaterWebSession();
+    return true;
+  }
+  web_server.send(401, "application/json", "{\"error\":\"owner_key_required\"}");
   return false;
 }
 
@@ -264,8 +345,83 @@ String statusJson() {
   return out;
 }
 
+String repeaterConfigJson() {
+  String out;
+  out.reserve(900);
+  out = "{\"role\":\"repeater\",\"revision\":" +
+    String(config.header.revision) +
+    ",\"onboarding_required\":" + String(onboarding_required ? "true" : "false") +
+    ",\"repeater_id\":\"" + jsonEscape(config.repeater_id) +
+    "\",\"repeater_name\":\"" + jsonEscape(config.repeater_name) +
+    "\",\"lora\":{\"frequency_hz\":" + String(config.lora.frequency_hz) +
+    ",\"bandwidth_hz\":" + String(config.lora.bandwidth_hz) +
+    ",\"tx_power_dbm\":" + String(config.lora.tx_power_dbm) +
+    ",\"sf\":" + String(config.lora.spreading_factor) +
+    ",\"coding_rate\":" + String(config.lora.coding_rate_denominator) +
+    ",\"preamble_length\":" + String(config.lora.preamble_length) +
+    ",\"sync_word\":" + String(config.lora.sync_word) +
+    ",\"relay_hop_limit\":" + String(config.lora.relay_hop_limit) +
+    "},\"forwarding\":{\"base_delay_ms\":" + String(config.forwarding_base_delay_ms) +
+    ",\"slot_width_ms\":" + String(config.forwarding_slot_width_ms) +
+    ",\"slot_count\":" + String(config.forwarding_slot_count) +
+    ",\"cache_ttl_s\":" + String(config.duplicate_cache_ttl_s) +
+    ",\"airtime_budget_ms\":" + String(config.airtime_budget_ms_per_hour) +
+    ",\"heartbeat_s\":" + String(config.heartbeat_interval_s) + "}}";
+  return out;
+}
+
 void setupWebPortal() {
+  const char* auth_headers[] = {"Authorization", "Cookie"};
+  web_server.collectHeaders(auth_headers, 2);
+  web_server.on("/enable-config", HTTP_GET, []() {
+    web_server.send(200, "text/html",
+      "<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<title>Enable repeater configuration</title><style>body{font:16px sans-serif;max-width:42rem;margin:3rem auto;padding:0 1rem}input,button{box-sizing:border-box;font:inherit;padding:.75rem;width:100%;margin:.4rem 0}#result{white-space:pre-wrap}</style>"
+      "<h1>Enable configuration and OTA</h1><p>Paste this repeater's owner key. It remains in this page only and is sent directly to the repeater.</p>"
+      "<input id='key' autocomplete='off' autocapitalize='none' spellcheck='false' placeholder='64-character owner key'>"
+      "<button id='enable'>Enable for 10 minutes</button><p id='result'></p>"
+      "<script>enable.onclick=async()=>{let k=key.value.trim(),o=result;o.textContent='Enabling...';try{let r=await fetch('/api/v1/config-mode',{method:'POST',headers:{Authorization:'Bearer '+k}}),t=await r.text();if(r.ok){location.replace('/')}else{o.textContent='Request failed: '+t}}catch(e){o.textContent='Request failed: '+e.message}}</script>");
+  });
+  web_server.on("/api/v1/onboarding", HTTP_GET, []() {
+    String out = "{\"api_version\":1,\"role\":\"repeater\",\"device_id\":\"" +
+      String(config.repeater_id) + "\",\"onboarding_required\":" +
+      String(onboarding_required ? "true" : "false") +
+      ",\"config_mode\":true,\"owner_key_configured\":" +
+      String(owner_key[0] ? "true" : "false") +
+      ",\"revision\":" + String(config.header.revision) +
+      ",\"transports\":[\"wifi\"]}";
+    web_server.send(200, "application/json", out);
+  });
+  web_server.on("/api/v1/claim", HTTP_POST, []() {
+    if (!config_portal_active || owner_key[0]) {
+      web_server.send(409, "application/json", "{\"ok\":false,\"error\":\"claim_not_allowed\"}");
+      return;
+    }
+    if (!replaceOwnerKey(web_server.arg("owner_key").c_str())) {
+      web_server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_owner_key\"}");
+      return;
+    }
+    ArduinoOTA.setPassword(owner_key);
+    ArduinoOTA.begin();
+    ota_active = true;
+    web_server.send(200, "application/json", "{\"ok\":true,\"claimed\":true}");
+  });
+  web_server.on("/api/v1/config-mode", HTTP_POST, []() {
+    if (!requireAuthentication()) return;
+    config_portal_deadline_ms = millis() + CONFIG_WINDOW_MS;
+    if (!ota_active) {
+      ArduinoOTA.setPassword(owner_key);
+      ArduinoOTA.begin();
+      ota_active = true;
+    }
+    web_server.send(200, "application/json", "{\"ok\":true,\"config_mode\":true,\"ota_enabled\":true,\"duration_s\":600}");
+  });
   web_server.on("/", HTTP_GET, []() {
+    if (!repeaterRequestHasWebSession() && web_server.header("Authorization").isEmpty()) {
+      web_server.sendHeader("Location", "/enable-config");
+      web_server.send(302, "text/plain", "Open /enable-config");
+      return;
+    }
     if (!requireAuthentication()) return;
     String html;
     html.reserve(6500);
@@ -279,6 +435,8 @@ void setupWebPortal() {
     html += "<p><strong>Repeating is " +
       String(onboarding_required ? "disabled until a valid configuration is saved" : "active") +
       ".</strong></p><form action='/save' method='post'>";
+    html += "<input type='hidden' name='expected_revision' value='" +
+      String(config.header.revision) + "'>";
     html += "<label>Repeater ID<input name='repeater_id' value='" + htmlEscape(config.repeater_id) + "'></label>";
     html += "<label>Name<input name='repeater_name' value='" + htmlEscape(config.repeater_name) + "'></label>";
     html += "<label>Frequency (Hz)<input name='frequency_hz' value='" + String(config.lora.frequency_hz) + "'></label>";
@@ -306,8 +464,25 @@ void setupWebPortal() {
     web_server.send(200, "application/json", statusJson());
   });
 
+  web_server.on("/api/v1/config", HTTP_GET, []() {
+    if (!requireAuthentication()) return;
+    web_server.send(200, "application/json", repeaterConfigJson());
+  });
+
   web_server.on("/save", HTTP_POST, []() {
     if (!requireAuthentication()) return;
+    uint32_t expected_revision = 0;
+    if (!parseUnsignedArg("expected_revision", 1, UINT32_MAX, expected_revision)) {
+      web_server.send(400, "application/json",
+        "{\"ok\":false,\"error\":\"expected_revision_required\"}");
+      return;
+    }
+    if (expected_revision != config.header.revision) {
+      web_server.send(409, "application/json",
+        "{\"ok\":false,\"error\":\"revision_conflict\",\"revision\":" +
+        String(config.header.revision) + "}");
+      return;
+    }
     EquineConfig::RepeaterConfigV1 candidate = config;
     const String id = web_server.arg("repeater_id");
     const String name = web_server.arg("repeater_name");
@@ -365,7 +540,9 @@ void setupWebPortal() {
       web_server.send(400, "text/plain", "Configuration failed validation or storage");
       return;
     }
-    web_server.send(200, "text/plain", "Saved; rebooting");
+    web_server.send(200, "application/json",
+      "{\"ok\":true,\"changed\":true,\"reboot_required\":true,\"revision\":" +
+      String(config.header.revision) + "}");
     restart_requested = true;
   });
 
@@ -376,8 +553,26 @@ void setupWebPortal() {
       return;
     }
     config_preferences.clear();
-    clearAdminPassword();
+    clearOwnerKey();
     web_server.send(200, "text/plain", "Factory reset; rebooting");
+    restart_requested = true;
+  });
+
+  web_server.on("/api/v1/factory-reset", HTTP_POST, []() {
+    if (!requireAuthentication()) return;
+    if (web_server.arg("confirm") != "FACTORY_RESET") {
+      web_server.send(400, "application/json", "{\"ok\":false,\"error\":\"confirmation_required\"}");
+      return;
+    }
+    config_preferences.clear();
+    clearOwnerKey();
+    web_server.send(200, "application/json", "{\"ok\":true,\"factory_reset\":true}");
+    restart_requested = true;
+  });
+
+  web_server.on("/api/v1/reboot", HTTP_POST, []() {
+    if (!requireAuthentication()) return;
+    web_server.send(200, "application/json", "{\"ok\":true,\"rebooting\":true}");
     restart_requested = true;
   });
 }
@@ -388,7 +583,7 @@ void startConfigPortal() {
            static_cast<unsigned long>(repeater_hash & 0xffffUL));
   WiFi.persistent(false);
   WiFi.mode(WIFI_AP);
-  if (!WiFi.softAP(ssid, admin_password)) {
+  if (!WiFi.softAP(ssid)) {
     Serial.println("Failed to start configuration AP.");
     return;
   }
@@ -399,8 +594,14 @@ void startConfigPortal() {
     ? 0
     : millis() + CONFIG_WINDOW_MS;
   Serial.printf("Configuration AP: %s\n", ssid);
-  Serial.printf("Open http://%s and authenticate as admin / %s\n",
-                WiFi.softAPIP().toString().c_str(), admin_password);
+  Serial.printf("Open http://%s. Factory-reset claim requires no PIN or password.\n",
+                WiFi.softAPIP().toString().c_str());
+  if (isValidOwnerKey(owner_key)) {
+    ArduinoOTA.setHostname(config.repeater_id);
+    ArduinoOTA.setPassword(owner_key);
+    ArduinoOTA.begin();
+    ota_active = true;
+  }
 }
 
 bool initializeRadio() {
@@ -790,7 +991,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
-  initializeAdminPassword();
+  initializeOwnerKey();
   loadConfig();
   repeater_hash = EquineProtocol::deviceIdHash(config.repeater_id);
   EquineProtocol::formatDeviceHash(
@@ -838,9 +1039,14 @@ void loop() {
   }
   if (config_portal_active) {
     web_server.handleClient();
+    if (ota_active) ArduinoOTA.handle();
     if (!onboarding_required && config_portal_deadline_ms != 0 &&
         timeReached(millis(), config_portal_deadline_ms)) {
       web_server.stop();
+      if (ota_active) {
+        ArduinoOTA.end();
+        ota_active = false;
+      }
       WiFi.softAPdisconnect(true);
       WiFi.mode(WIFI_OFF);
       config_portal_active = false;

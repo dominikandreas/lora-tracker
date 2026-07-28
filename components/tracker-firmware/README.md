@@ -21,6 +21,20 @@ sends remain constrained by the configured Germany airtime budget. See the
 [onboarding guide](../../docs/ONBOARDING.md#tracker-button-controls) for the
 complete interaction and recovery notes.
 
+During Android onboarding, selecting a tracker opens a Bluetooth connection
+without a PIN or operating-system bond. The first app to connect to a factory-reset device generates and stores
+a random 256-bit owner key. That key is required for later Bluetooth and
+local-network configuration sessions; factory reset clears it so any app can
+claim the device again.
+
+The status page shows the latest effective speed. During a manual GPS action,
+the GPS page refreshes live satellite count and HDOP from incoming NMEA data
+and displays the remaining acquisition window; these values are visible before
+a candidate meets the configured acceptance thresholds. `GPS WAIT NMEA` means
+the receiver has not yet produced a checksum-valid sentence. After three
+seconds in that state the firmware performs one bounded GNSS power/UART restart
+and continues the same acquisition window.
+
 ## PlatformIO
 
 The included `platformio.ini` provides two pinned ESP32 Arduino builds:

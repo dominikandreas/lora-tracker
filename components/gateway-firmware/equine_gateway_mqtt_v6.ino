@@ -11,7 +11,13 @@
 #include <stdarg.h>
 #include <time.h>
 #include <WebServer.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <string>
 #include <memory>
+#include <new>
 #include <U8g2lib.h>
 #include "secrets.h"
 #include "equine_protocol.h"
@@ -26,7 +32,10 @@
 // ==========================================
 EquineConfig::GatewayConfigV1 gateway_config{};
 Preferences configPrefs;
-char admin_password[25]{};
+constexpr size_t OWNER_KEY_HEX_LENGTH = 64;
+char owner_key[OWNER_KEY_HEX_LENGTH + 1]{};
+char gateway_web_session_token[33]{};
+uint32_t gateway_web_session_deadline_ms = 0;
 String runtime_mqtt_ca_certificate;
 U8G2_SSD1306_128X64_NONAME_F_SW_I2C gateway_display(U8G2_R0, 15, 4, 16);
 
@@ -36,11 +45,34 @@ bool gateway_config_mode = false;
 bool gateway_ap_active = false;
 bool gateway_config_reboot_requested = false;
 bool gateway_factory_reset_requested = false;
+bool gateway_ota_active = false;
 uint32_t gateway_config_mode_deadline_ms = 0;
 String gateway_network_ip = "off";
 bool gateway_button_previous = false;
 bool gateway_button_hold_handled = false;
 uint32_t gateway_button_press_start_ms = 0;
+
+void setupOTA();
+
+constexpr const char* CONFIG_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
+constexpr const char* CONFIG_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
+constexpr const char* CONFIG_TX_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
+constexpr size_t BLE_CONFIG_COMMAND_MAX = 16384;
+BLEServer* gateway_ble_server = nullptr;
+BLECharacteristic* gateway_ble_tx = nullptr;
+BLECharacteristic* gateway_ble_rx = nullptr;
+bool gateway_ble_initialized = false;
+bool gateway_ble_connected = false;
+bool gateway_ble_authenticated = false;
+char gateway_ble_command[BLE_CONFIG_COMMAND_MAX]{};
+size_t gateway_ble_command_length = 0;
+volatile bool gateway_ble_command_pending = false;
+
+void processGatewayBleCommand(char* command);
+void startGatewayBleConfiguration();
+void stopGatewayBleConfiguration();
+bool gatewayConfigWritesAllowed();
+void showGatewayOnboardingDisplay();
 
 
 #define GATEWAY_ID                  (gateway_config.gateway_id)
@@ -211,14 +243,62 @@ bool reserveGatewayAirtime(size_t packet_size, uint32_t& estimated_ms) {
     gateway_airtime_tokens_ms, estimated_ms);
 }
 
-bool isValidSha256Hex(const char* value) {
-  if (!value || strlen(value) != 64) return false;
-  for (size_t i = 0; i < 64; i++) {
+bool isValidOwnerKey(const char* value) {
+  if (!value || strlen(value) != OWNER_KEY_HEX_LENGTH) return false;
+  for (size_t i = 0; i < OWNER_KEY_HEX_LENGTH; i++) {
     const char c = value[i];
     if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
           (c >= 'A' && c <= 'F'))) return false;
   }
   return true;
+}
+
+bool gatewayOwnerKeyMatches(const String& authorization) {
+  constexpr const char* prefix = "Bearer ";
+  uint8_t difference = authorization.length() == 7 + OWNER_KEY_HEX_LENGTH ? 0 : 1;
+  for (size_t index = 0; index < OWNER_KEY_HEX_LENGTH; index++) {
+    const uint8_t supplied = index + 7 < authorization.length()
+      ? static_cast<uint8_t>(authorization[index + 7])
+      : 0;
+    difference |= supplied ^ static_cast<uint8_t>(owner_key[index]);
+  }
+  for (size_t index = 0; index < 7; index++) {
+    const uint8_t supplied = index < authorization.length()
+      ? static_cast<uint8_t>(authorization[index])
+      : 0;
+    difference |= supplied ^ static_cast<uint8_t>(prefix[index]);
+  }
+  return difference == 0;
+}
+
+bool gatewayWebSessionActive() {
+  return gateway_web_session_token[0] != '\0' &&
+    (int32_t)(gateway_web_session_deadline_ms - millis()) > 0;
+}
+
+bool gatewayRequestHasWebSession() {
+  if (!gatewayWebSessionActive()) return false;
+  const String cookie = webServer.header("Cookie");
+  const String needle = "lt_session=" + String(gateway_web_session_token);
+  const int position = cookie.indexOf(needle);
+  if (position < 0) return false;
+  const int end = position + needle.length();
+  const bool starts_at_boundary = position == 0 || cookie[position - 1] == ' ' ||
+    cookie[position - 1] == ';';
+  const bool ends_at_boundary = end == cookie.length() || cookie[end] == ';';
+  return starts_at_boundary && ends_at_boundary;
+}
+
+void issueGatewayWebSession() {
+  uint8_t random_bytes[16];
+  esp_fill_random(random_bytes, sizeof(random_bytes));
+  for (size_t index = 0; index < sizeof(random_bytes); index++) {
+    snprintf(gateway_web_session_token + index * 2, 3, "%02x", random_bytes[index]);
+  }
+  gateway_web_session_deadline_ms = millis() + 600000UL;
+  webServer.sendHeader("Set-Cookie",
+    "lt_session=" + String(gateway_web_session_token) +
+    "; Max-Age=600; Path=/; HttpOnly; SameSite=Strict");
 }
 
 // ==========================================
@@ -347,53 +427,34 @@ bool publishRetainedMessage(const char* topic, const char* payload) {
 // ==========================================
 // CONFIGURATION STORAGE
 // ==========================================
-void initializeAdminCredential() {
+void initializeOwnerKey() {
   Preferences credentials;
   if (!credentials.begin("ltcred", false)) return;
-  const bool factory_valid = factory_admin_password &&
-    strlen(factory_admin_password) >= 8 &&
-    strlen(factory_admin_password) < sizeof(admin_password);
-  String stored = credentials.getString("admin", "");
-  if (stored.length() >= 8 && stored.length() < sizeof(admin_password)) {
-    strlcpy(admin_password, stored.c_str(), sizeof(admin_password));
-  } else if (factory_valid) {
-    strlcpy(admin_password, factory_admin_password, sizeof(admin_password));
-    credentials.putString("admin", admin_password);
-  } else {
-    static const char alphabet[] = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    for (size_t i = 0; i < 20; i++) {
-      admin_password[i] = alphabet[esp_random() % (sizeof(alphabet) - 1)];
-    }
-    admin_password[20] = '\0';
-    credentials.putString("admin", admin_password);
+  String stored = credentials.getString("owner_key", "");
+  if (isValidOwnerKey(stored.c_str())) {
+    strlcpy(owner_key, stored.c_str(), sizeof(owner_key));
   }
   credentials.end();
 }
 
-
-bool replaceAdminCredential(const char* replacement) {
-  if (!replacement) return false;
-  const size_t length = strlen(replacement);
-  if (length < 8 || length >= sizeof(admin_password)) return false;
-  for (size_t index = 0; index < length; index++) {
-    const uint8_t c = static_cast<uint8_t>(replacement[index]);
-    if (c < 0x21 || c > 0x7e) return false;
-  }
+bool replaceOwnerKey(const char* replacement) {
+  if (!isValidOwnerKey(replacement)) return false;
   Preferences credentials;
   if (!credentials.begin("ltcred", false)) return false;
-  const size_t written = credentials.putString("admin", replacement);
+  const size_t written = credentials.putString("owner_key", replacement);
   credentials.end();
-  if (written != length) return false;
-  strlcpy(admin_password, replacement, sizeof(admin_password));
+  if (written != OWNER_KEY_HEX_LENGTH) return false;
+  strlcpy(owner_key, replacement, sizeof(owner_key));
   return true;
 }
-void clearAdminCredential() {
+
+void clearOwnerKey() {
   Preferences credentials;
   if (credentials.begin("ltcred", false)) {
     credentials.clear();
     credentials.end();
   }
-  memset(admin_password, 0, sizeof(admin_password));
+  memset(owner_key, 0, sizeof(owner_key));
 }
 
 constexpr size_t MAX_MQTT_CA_CERTIFICATE_SIZE = 4096;
@@ -597,7 +658,7 @@ void clearGatewayConfigStorage() {
     configPrefs.clear();
     configPrefs.end();
   }
-  clearAdminCredential();
+  clearOwnerKey();
   clearMqttCaCertificateStorage();
 }
 
@@ -618,6 +679,10 @@ bool commitGatewayConfigCandidate(
     snprintf(error, error_size, "candidate violates cross-field validation");
     return false;
   }
+  if (mark_provisioned && candidate.wifi_ssid[0] == '\0') {
+    snprintf(error, error_size, "Wi-Fi SSID is required to complete onboarding");
+    return false;
+  }
   const String previous_ca = runtime_mqtt_ca_certificate;
   const String& next_ca = mqtt_ca_candidate
     ? *mqtt_ca_candidate : runtime_mqtt_ca_certificate;
@@ -629,11 +694,16 @@ bool commitGatewayConfigCandidate(
     snprintf(error, error_size, "plaintext MQTT is disabled by this firmware");
     return false;
   }
+  std::unique_ptr<EquineConfig::GatewayConfigV1> previous(
+    new (std::nothrow) EquineConfig::GatewayConfigV1(gateway_config));
+  if (!previous) {
+    snprintf(error, error_size, "not enough memory to commit configuration safely");
+    return false;
+  }
   if (!writeMqttCaCertificate(next_ca, true)) {
     snprintf(error, error_size, "failed to write MQTT CA certificate");
     return false;
   }
-  std::unique_ptr<EquineConfig::GatewayConfigV1> previous(new EquineConfig::GatewayConfigV1(gateway_config));
   gateway_config = candidate;
   if (!saveGatewayConfig(false)) {
     gateway_config = *previous;
@@ -652,8 +722,90 @@ bool commitGatewayConfigCandidate(
   return true;
 }
 
+// Narrow, authenticated and idempotent registry mutation used by the app's
+// pairing transaction. This avoids exposing the full configuration PATCH path
+// for a routine tracker registration and makes retries safe after a disconnect.
+bool registerGatewayTracker(
+    const char* device_id,
+    const char* device_name,
+    const char* lora_aead_key,
+    bool& changed,
+    uint8_t& slot,
+    char* error,
+    size_t error_size) {
+  changed = false;
+  slot = 0;
+  if (!device_id || !device_name || !lora_aead_key) {
+    snprintf(error, error_size, "device_id, device_name and lora_aead_key are required");
+    return false;
+  }
+
+  std::unique_ptr<EquineConfig::GatewayConfigV1> candidate(
+    new (std::nothrow) EquineConfig::GatewayConfigV1(gateway_config));
+  if (!candidate) {
+    snprintf(error, error_size, "could not allocate registry candidate");
+    return false;
+  }
+
+  bool found = false;
+  for (uint8_t index = 0; index < candidate->tracker_count; index++) {
+    if (strcmp(candidate->trackers[index].device_id, device_id) == 0) {
+      slot = index;
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    for (uint8_t index = 0; index < candidate->tracker_count; index++) {
+      if (!candidate->trackers[index].enabled) {
+        slot = index;
+        found = true;
+        break;
+      }
+    }
+  }
+  if (!found) {
+    if (candidate->tracker_count >= EquineConfig::MAX_GATEWAY_TRACKERS) {
+      snprintf(error, error_size, "gateway tracker registry is full");
+      return false;
+    }
+    slot = candidate->tracker_count++;
+    changed = true;
+  }
+
+  EquineConfigApi::PatchStatus status;
+  auto apply = [&](const char* subfield, const char* value) {
+    char key[48];
+    snprintf(key, sizeof(key), "tracker.%u.%s", slot, subfield);
+    const auto result = EquineConfigApi::applyGatewayField(
+      *candidate, key, value, status);
+    if (result == EquineConfigApi::FieldResult::APPLIED) return true;
+    if (status.error[0] == '\0') {
+      snprintf(status.error, sizeof(status.error), "invalid tracker %s", subfield);
+    }
+    return false;
+  };
+  if (!apply("id", device_id) || !apply("name", device_name) ||
+      !apply("lora_aead_key", lora_aead_key) || !apply("enabled", "1")) {
+    strlcpy(error, status.error, error_size);
+    return false;
+  }
+  changed |= status.changed;
+  if (!changed) return true;
+  if (!commitGatewayConfigCandidate(
+        *candidate, true, error, error_size, &runtime_mqtt_ca_certificate)) {
+    return false;
+  }
+  return true;
+}
+
 bool rollbackGatewayConfig(char* error, size_t error_size) {
-  std::unique_ptr<EquineConfig::GatewayConfigV1> backup(new EquineConfig::GatewayConfigV1());
+  std::unique_ptr<EquineConfig::GatewayConfigV1> backup(
+    new (std::nothrow) EquineConfig::GatewayConfigV1());
+  if (!backup) {
+    snprintf(error, error_size, "not enough memory to load rollback configuration");
+    return false;
+  }
   if (!readGatewayConfigBlob(EquineConfig::BACKUP_CONFIG_KEY, *backup)) {
     snprintf(error, error_size, "no valid rollback configuration");
     return false;
@@ -737,9 +889,409 @@ String gatewayConfigJson() {
   return out;
 }
 
+void sendGatewayBleText(const String& response) {
+  if (!gateway_ble_connected || !gateway_ble_tx) return;
+  String framed = response;
+  if (framed.isEmpty() || framed[framed.length() - 1] != '\n') framed += '\n';
+  constexpr size_t payload_size = 18;
+  for (size_t offset = 0; offset < framed.length(); offset += payload_size) {
+    const size_t length = min(payload_size, framed.length() - offset);
+    gateway_ble_tx->setValue(
+      reinterpret_cast<uint8_t*>(const_cast<char*>(framed.c_str() + offset)),
+      length);
+    gateway_ble_tx->notify();
+    delay(8);
+  }
+}
+
+void sendGatewayBleError(const char* code, const char* detail) {
+  String out = "{\"ok\":false,\"error\":\"";
+  EquineConfigApi::appendJsonEscaped(out, code);
+  out += "\",\"detail\":\"";
+  EquineConfigApi::appendJsonEscaped(out, detail);
+  out += "\"}";
+  sendGatewayBleText(out);
+}
+
+bool applyGatewayUrlPatch(
+    char* encoded,
+    uint32_t& expected_revision,
+    bool& reboot_requested,
+    EquineConfigApi::PatchStatus& status,
+    EquineConfig::GatewayConfigV1& candidate,
+    String& mqtt_ca_candidate) {
+  bool has_revision = false;
+  char parse_error[EquineConfigApi::ERROR_SIZE]{};
+  const bool parsed = EquineConfigApi::forEachUrlEncodedPair(
+    encoded,
+    [&](const char* key, const char* value) {
+      if (strcmp(key, "expected_revision") == 0) {
+        has_revision = EquineConfigApi::parseUnsigned(
+          value, 1, UINT32_MAX, expected_revision);
+        if (!has_revision) EquineConfigApi::setError(status, key, "invalid revision");
+        return has_revision;
+      }
+      if (strcmp(key, "reboot") == 0) {
+        uint8_t parsed_bool = 0;
+        if (!EquineConfigApi::parseBool(value, parsed_bool)) {
+          EquineConfigApi::setError(status, key, "invalid boolean");
+          return false;
+        }
+        reboot_requested = parsed_bool != 0;
+        return true;
+      }
+      if (EquineConfigApi::isControlField(key)) return true;
+      if (strcmp(key, "mqtt_ca_certificate") == 0) {
+        if (strcmp(value, EquineConfigApi::KEEP_SECRET) == 0) return true;
+        const String proposed(value);
+        if (!isValidMqttCaCertificate(proposed, true)) {
+          EquineConfigApi::setError(
+            status, key, "expected a PEM certificate no larger than 4096 bytes");
+          return false;
+        }
+        if (mqtt_ca_candidate != proposed) {
+          mqtt_ca_candidate = proposed;
+          status.changed = true;
+          status.reboot_required = true;
+        }
+        return true;
+      }
+      const auto result = EquineConfigApi::applyGatewayField(
+        candidate, key, value, status);
+      if (result == EquineConfigApi::FieldResult::UNKNOWN) {
+        EquineConfigApi::setError(status, key, "unknown setting");
+        return false;
+      }
+      return result == EquineConfigApi::FieldResult::APPLIED;
+    },
+    parse_error, sizeof(parse_error));
+  if (!parsed && status.error[0] == '\0') {
+    strlcpy(status.error, parse_error, sizeof(status.error));
+  }
+  if (!parsed) return false;
+  if (!has_revision) {
+    EquineConfigApi::setError(status, "expected_revision", "required");
+    return false;
+  }
+  return true;
+}
+
+class GatewayBleConfigCallbacks : public BLECharacteristicCallbacks {
+ public:
+  void onWrite(BLECharacteristic* characteristic) override {
+    if (!characteristic) return;
+    // Keep BTC_TASK bounded to byte framing. Command parsing, NVS and notify
+    // calls execute from loop(), whose stack is sized for application work.
+    if (gateway_ble_command_pending) return;
+    const std::string value = characteristic->getValue();
+    for (char c : value) {
+      if (c == '\r') continue;
+      if (c == '\n') {
+        gateway_ble_command[gateway_ble_command_length] = '\0';
+        if (gateway_ble_command_length > 0) {
+          gateway_ble_command_pending = true;
+        }
+        return;
+      }
+      if (gateway_ble_command_length + 1 >= BLE_CONFIG_COMMAND_MAX) {
+        strlcpy(gateway_ble_command, "__OVERFLOW__",
+                sizeof(gateway_ble_command));
+        gateway_ble_command_length = strlen(gateway_ble_command);
+        gateway_ble_command_pending = true;
+        return;
+      }
+      gateway_ble_command[gateway_ble_command_length++] = c;
+    }
+  }
+};
+
+void serviceGatewayBleCommand() {
+  if (!gateway_ble_command_pending) return;
+  const size_t length = gateway_ble_command_length;
+  std::unique_ptr<char[]> command_copy(
+    new (std::nothrow) char[length + 1]);
+  if (command_copy) memcpy(command_copy.get(), gateway_ble_command, length + 1);
+  gateway_ble_command_length = 0;
+  gateway_ble_command[0] = '\0';
+  gateway_ble_command_pending = false;
+  if (!command_copy) {
+    sendGatewayBleError("out_of_memory", "could not queue BLE command");
+    return;
+  }
+  processGatewayBleCommand(command_copy.get());
+}
+
+class GatewayBleServerCallbacks : public BLEServerCallbacks {
+ public:
+  void onConnect(BLEServer*) override {
+    gateway_ble_connected = true;
+    gateway_ble_authenticated = false;
+  }
+  void onDisconnect(BLEServer* server) override {
+    gateway_ble_connected = false;
+    gateway_ble_authenticated = false;
+    server->startAdvertising();
+  }
+};
+
+bool gatewayBleCredentialMatches(const char* supplied) {
+  const size_t supplied_length = supplied ? strlen(supplied) : 0;
+  const size_t expected_length = strlen(owner_key);
+  uint8_t difference = static_cast<uint8_t>(supplied_length ^ expected_length);
+  const size_t compared = max(supplied_length, expected_length);
+  for (size_t i = 0; i < compared; i++) {
+    const uint8_t left = i < supplied_length ? supplied[i] : 0;
+    const uint8_t right = i < expected_length ? owner_key[i] : 0;
+    difference |= left ^ right;
+  }
+  return difference == 0 && expected_length == OWNER_KEY_HEX_LENGTH;
+}
+
+void processGatewayBleCommand(char* command) {
+  if (!command) return;
+  if (strcmp(command, "__OVERFLOW__") == 0) {
+    sendGatewayBleError("command_too_large", "maximum is 16383 bytes");
+    return;
+  }
+  if (strcmp(command, "INFO") == 0) {
+    String out = "{\"ok\":true,\"api_version\":" +
+      String(EquineConfigApi::API_VERSION) +
+      ",\"role\":\"gateway\",\"revision\":" +
+      String(gateway_config.header.revision) +
+      ",\"device_id\":\"" + String(gateway_config.gateway_id) +
+      "\"" +
+      ",\"onboarding_required\":" +
+      String(gateway_onboarding_required ? "true" : "false") +
+      ",\"config_mode\":" + String(gateway_config_mode ? "true" : "false") +
+      ",\"owner_key_configured\":" + String(owner_key[0] ? "true" : "false") + "}";
+    sendGatewayBleText(out);
+    return;
+  }
+  if (strncmp(command, "CLAIM ", 6) == 0) {
+    if (!gateway_config_mode || owner_key[0]) {
+      sendGatewayBleError("claim_not_allowed", "device has already been claimed");
+      return;
+    }
+    if (!replaceOwnerKey(command + 6)) {
+      sendGatewayBleError("invalid_owner_key", "expected 64 hexadecimal characters");
+      return;
+    }
+    gateway_ble_authenticated = true;
+    setupOTA();
+    sendGatewayBleText("{\"ok\":true,\"claimed\":true,\"authenticated\":true}");
+    return;
+  }
+  if (strncmp(command, "AUTH ", 5) == 0) {
+    gateway_ble_authenticated = gatewayBleCredentialMatches(command + 5);
+    if (gateway_ble_authenticated) sendGatewayBleText("{\"ok\":true,\"authenticated\":true}");
+    else sendGatewayBleError("authentication_failed", "disconnect and try again");
+    return;
+  }
+  if (!gateway_ble_authenticated) {
+    sendGatewayBleError("authentication_required", "claim or authenticate this device first");
+    return;
+  }
+  if (strcmp(command, "HELLO") == 0) {
+    String out = "{\"ok\":true,\"api_version\":" +
+      String(EquineConfigApi::API_VERSION) +
+      ",\"role\":\"gateway\",\"revision\":" +
+      String(gateway_config.header.revision) +
+      ",\"onboarding_required\":" +
+      String(gateway_onboarding_required ? "true" : "false") + "}";
+    sendGatewayBleText(out);
+    return;
+  }
+  if (strcmp(command, "ENTER_CONFIG_MODE") == 0) {
+    gateway_config_mode = true;
+    gateway_config_mode_deadline_ms = millis() + 600000UL;
+    setupOTA();
+    sendGatewayBleText("{\"ok\":true,\"config_mode\":true,\"ota_enabled\":true}");
+    return;
+  }
+  if (strcmp(command, "GET CONFIG") == 0) {
+    sendGatewayBleText(gatewayConfigJson());
+    return;
+  }
+  if (strncmp(command, "REGISTER_TRACKER ", 17) == 0) {
+    char* encoded = command + 17;
+    String device_id;
+    String device_name;
+    String lora_aead_key;
+    char parse_error[EquineConfigApi::ERROR_SIZE]{};
+    const bool parsed = EquineConfigApi::forEachUrlEncodedPair(
+      encoded,
+      [&](const char* key, const char* value) {
+        if (strcmp(key, "device_id") == 0) device_id = value;
+        else if (strcmp(key, "device_name") == 0) device_name = value;
+        else if (strcmp(key, "lora_aead_key") == 0) lora_aead_key = value;
+        else {
+          snprintf(parse_error, sizeof(parse_error), "unknown field: %s", key);
+          return false;
+        }
+        return true;
+      },
+      parse_error, sizeof(parse_error));
+    bool changed = false;
+    uint8_t slot = 0;
+    char error[EquineConfigApi::ERROR_SIZE]{};
+    if (!parsed || !registerGatewayTracker(
+          device_id.c_str(), device_name.c_str(), lora_aead_key.c_str(),
+          changed, slot, error, sizeof(error))) {
+      sendGatewayBleError(
+        "tracker_registration_failed", parsed ? error : parse_error);
+      return;
+    }
+    String out = "{\"ok\":true,\"tracker_id\":\"";
+    EquineConfigApi::appendJsonEscaped(out, device_id.c_str());
+    out += "\",\"slot\":" + String(slot) +
+      ",\"revision\":" + String(gateway_config.header.revision) +
+      ",\"changed\":" + String(changed ? "true" : "false") +
+      ",\"reboot_required\":" + String(changed ? "true" : "false") + "}";
+    sendGatewayBleText(out);
+    gateway_config_reboot_requested |= changed;
+    return;
+  }
+  if (strncmp(command, "PATCH ", 6) == 0) {
+    if (!gatewayConfigWritesAllowed()) {
+      sendGatewayBleError("physical_config_mode_required", "hold USER for 5 seconds");
+      return;
+    }
+    const size_t length = strlen(command + 6);
+    if (length >= BLE_CONFIG_COMMAND_MAX) {
+      sendGatewayBleError("command_too_large", "patch exceeds buffer");
+      return;
+    }
+    char* encoded = command + 6;
+    std::unique_ptr<EquineConfig::GatewayConfigV1> candidate(
+      new (std::nothrow) EquineConfig::GatewayConfigV1(gateway_config));
+    if (!candidate) {
+      sendGatewayBleError("out_of_memory", "could not allocate configuration candidate");
+      return;
+    }
+    String mqtt_ca_candidate = runtime_mqtt_ca_certificate;
+    EquineConfigApi::PatchStatus status;
+    uint32_t expected_revision = 0;
+    bool reboot = false;
+    if (!applyGatewayUrlPatch(encoded, expected_revision, reboot, status,
+                              *candidate, mqtt_ca_candidate)) {
+      sendGatewayBleError("invalid_patch", status.error);
+      return;
+    }
+    if (expected_revision != gateway_config.header.revision) {
+      char detail[96];
+      snprintf(detail, sizeof(detail), "revision conflict: current=%lu",
+               static_cast<unsigned long>(gateway_config.header.revision));
+      sendGatewayBleError("revision_conflict", detail);
+      return;
+    }
+    if (status.changed && !commitGatewayConfigCandidate(
+          *candidate, true, status.error, sizeof(status.error),
+          &mqtt_ca_candidate)) {
+      sendGatewayBleError("commit_failed", status.error);
+      return;
+    }
+    if (!status.changed && gateway_onboarding_required) {
+      if (gateway_config.wifi_ssid[0] == '\0') {
+        sendGatewayBleError("commit_failed",
+                            "Wi-Fi SSID is required to complete onboarding");
+        return;
+      }
+      if (!writeGatewayProvisionedFlag(true)) {
+        sendGatewayBleError("commit_failed", "failed to persist onboarding completion");
+        return;
+      }
+      gateway_onboarding_required = false;
+    }
+    const bool needs_reboot = status.reboot_required || reboot;
+    String out = "{\"ok\":true,\"revision\":" +
+      String(gateway_config.header.revision) +
+      ",\"changed\":" + String(status.changed ? "true" : "false") +
+      ",\"reboot_required\":" + String(needs_reboot ? "true" : "false") + "}";
+    sendGatewayBleText(out);
+    gateway_config_reboot_requested |= needs_reboot;
+    return;
+  }
+  if (strncmp(command, "ROLLBACK ", 9) == 0) {
+    uint32_t expected = 0;
+    if (!gatewayConfigWritesAllowed() ||
+        !EquineConfigApi::parseUnsigned(command + 9, 1, UINT32_MAX, expected) ||
+        expected != gateway_config.header.revision) {
+      sendGatewayBleError("revision_conflict_or_locked", "open setup and send current revision");
+      return;
+    }
+    char error[EquineConfigApi::ERROR_SIZE]{};
+    if (!rollbackGatewayConfig(error, sizeof(error))) {
+      sendGatewayBleError("rollback_failed", error);
+      return;
+    }
+    sendGatewayBleText("{\"ok\":true,\"reboot_required\":true}");
+    gateway_config_reboot_requested = true;
+    return;
+  }
+  if (strcmp(command, "FACTORY_RESET FACTORY_RESET") == 0) {
+    if (!gatewayConfigWritesAllowed()) {
+      sendGatewayBleError("physical_config_mode_required", "hold USER for 5 seconds");
+      return;
+    }
+    sendGatewayBleText("{\"ok\":true,\"factory_reset\":true}");
+    gateway_factory_reset_requested = true;
+    return;
+  }
+  if (strcmp(command, "REBOOT") == 0) {
+    sendGatewayBleText("{\"ok\":true,\"rebooting\":true}");
+    gateway_config_reboot_requested = true;
+    return;
+  }
+  sendGatewayBleError("unknown_command",
+    "use INFO, CLAIM, AUTH, HELLO, GET CONFIG, PATCH, ENTER_CONFIG_MODE, ROLLBACK, FACTORY_RESET or REBOOT");
+}
+
+void startGatewayBleConfiguration() {
+  if (gateway_ble_initialized) return;
+  String name = "LG-" + String(GATEWAY_ID);
+  BLEDevice::init(name.c_str());
+  logPrintln("Gateway BLE uses application-layer owner-key authentication; OS pairing is disabled.");
+  gateway_ble_server = BLEDevice::createServer();
+  gateway_ble_server->setCallbacks(new GatewayBleServerCallbacks());
+  BLEService* service = gateway_ble_server->createService(CONFIG_SERVICE_UUID);
+  gateway_ble_tx = service->createCharacteristic(
+    CONFIG_TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+  gateway_ble_tx->addDescriptor(new BLE2902());
+  gateway_ble_rx = service->createCharacteristic(
+    CONFIG_RX_UUID, BLECharacteristic::PROPERTY_WRITE);
+  gateway_ble_rx->setAccessPermissions(ESP_GATT_PERM_WRITE);
+  gateway_ble_rx->setCallbacks(new GatewayBleConfigCallbacks());
+  service->start();
+  BLEAdvertising* advertising = BLEDevice::getAdvertising();
+  advertising->addServiceUUID(CONFIG_SERVICE_UUID);
+  advertising->setScanResponse(true);
+  BLEDevice::startAdvertising();
+  gateway_ble_initialized = true;
+  logPrintln("Gateway BLE configuration active; awaiting owner-key claim or authentication.");
+  if (gateway_onboarding_required) showGatewayOnboardingDisplay();
+}
+
+void stopGatewayBleConfiguration() {
+  if (!gateway_ble_initialized) return;
+  BLEDevice::deinit(true);
+  gateway_ble_server = nullptr;
+  gateway_ble_tx = nullptr;
+  gateway_ble_rx = nullptr;
+  gateway_ble_initialized = false;
+  gateway_ble_connected = false;
+  gateway_ble_authenticated = false;
+  gateway_ble_command_length = 0;
+  gateway_ble_command_pending = false;
+}
+
 bool applyGatewayWebPatch(EquineConfigApi::PatchStatus& status,
                           bool& reboot_requested) {
-  std::unique_ptr<EquineConfig::GatewayConfigV1> candidate(new EquineConfig::GatewayConfigV1(gateway_config));
+  std::unique_ptr<EquineConfig::GatewayConfigV1> candidate(
+    new (std::nothrow) EquineConfig::GatewayConfigV1(gateway_config));
+  if (!candidate) {
+    EquineConfigApi::setError(status, "configuration", "not enough memory");
+    return false;
+  }
   String mqtt_ca_candidate = runtime_mqtt_ca_certificate;
   uint32_t expected_revision = 0;
   bool has_revision = false;
@@ -803,6 +1355,11 @@ bool applyGatewayWebPatch(EquineConfigApi::PatchStatus& status,
   }
   if (!status.changed) {
     if (gateway_onboarding_required) {
+      if (gateway_config.wifi_ssid[0] == '\0') {
+        snprintf(status.error, sizeof(status.error),
+                 "Wi-Fi SSID is required to complete onboarding");
+        return false;
+      }
       if (!writeGatewayProvisionedFlag(true)) {
         snprintf(status.error, sizeof(status.error),
                  "failed to persist onboarding completion");
@@ -817,7 +1374,11 @@ bool applyGatewayWebPatch(EquineConfigApi::PatchStatus& status,
 }
 
 bool gatewayConfigWritesAllowed() {
-  return gateway_onboarding_required || gateway_config_mode;
+  // HTTP writes already require the owner key. Keep them available on the
+  // trusted local network so a provisioned gateway can be maintained from the
+  // app. The custom BLE service remains discoverable and requires the same
+  // owner key; the narrower configuration-mode window controls OTA only.
+  return true;
 }
 
 
@@ -1277,12 +1838,13 @@ void updateDedupState(TrackerRuntime& tracker, uint32_t boot_id, uint32_t seq) {
 }
 
 void setupOTA() {
+  if (gateway_ota_active || !gateway_config_mode) return;
   ArduinoOTA.setHostname(ota_hostname);
-  if (!isValidSha256Hex(ota_password_hash)) {
-    logPrintln("OTA disabled: configure a 64-character SHA-256 password hash.");
+  if (!isValidOwnerKey(owner_key)) {
+    logPrintln("OTA disabled until the gateway has an owner key.");
     return;
   }
-  ArduinoOTA.setPasswordHash(ota_password_hash);
+  ArduinoOTA.setPassword(owner_key);
 
   ArduinoOTA
     .onStart([]() {
@@ -1311,6 +1873,7 @@ void setupOTA() {
     });
 
   ArduinoOTA.begin();
+  gateway_ota_active = true;
 
   logPrint("OTA ready. Hostname: ");
   logPrintln(ota_hostname);
@@ -1328,17 +1891,50 @@ void setupRemoteLogging() {
 }
 
 bool requireWebAuthentication() {
-  if (strlen(admin_password) < 8) {
-    webServer.send(503, "application/json", "{\"error\":\"admin_credentials_not_configured\"}");
+  if (!isValidOwnerKey(owner_key)) {
+    webServer.send(503, "application/json", "{\"error\":\"owner_key_not_configured\"}");
     return false;
   }
-  if (webServer.authenticate("admin", admin_password)) return true;
-  webServer.requestAuthentication(BASIC_AUTH, "LoRa Tracker gateway");
+  if (gatewayRequestHasWebSession()) return true;
+  const String authorization = webServer.header("Authorization");
+  if (gatewayOwnerKeyMatches(authorization)) {
+    issueGatewayWebSession();
+    return true;
+  }
+  webServer.send(401, "application/json", "{\"error\":\"owner_key_required\"}");
   return false;
 }
 
 void setupWebInterface() {
+  const char* web_auth_headers[] = {"Authorization", "Cookie"};
+  webServer.collectHeaders(web_auth_headers, 2);
+  webServer.on("/enable-config", HTTP_GET, []() {
+    webServer.send(200, "text/html",
+      "<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<title>Enable gateway configuration</title><style>body{font:16px sans-serif;max-width:42rem;margin:3rem auto;padding:0 1rem}input,button{box-sizing:border-box;font:inherit;padding:.75rem;width:100%;margin:.4rem 0}#result{white-space:pre-wrap}</style>"
+      "<h1>Enable configuration and OTA</h1><p>Paste this gateway's owner key. It remains in this page only and is sent directly to the gateway.</p>"
+      "<input id='key' autocomplete='off' autocapitalize='none' spellcheck='false' placeholder='64-character owner key'>"
+      "<button id='enable'>Enable for 10 minutes</button><p id='result'></p>"
+      "<script>enable.onclick=async()=>{let k=key.value.trim(),o=result;o.textContent='Enabling...';try{let r=await fetch('/api/v1/config-mode',{method:'POST',headers:{Authorization:'Bearer '+k}}),t=await r.text();if(r.ok){location.replace('/')}else{o.textContent='Request failed: '+t}}catch(e){o.textContent='Request failed: '+e.message}}</script>");
+  });
+  webServer.on("/api/v1/claim", HTTP_POST, []() {
+    if (!gateway_config_mode || owner_key[0]) {
+      webServer.send(409, "application/json", "{\"ok\":false,\"error\":\"claim_not_allowed\"}");
+      return;
+    }
+    if (!replaceOwnerKey(webServer.arg("owner_key").c_str())) {
+      webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_owner_key\"}");
+      return;
+    }
+    setupOTA();
+    webServer.send(200, "application/json", "{\"ok\":true,\"claimed\":true}");
+  });
   webServer.on("/", HTTP_GET, []() {
+    if (!gatewayRequestHasWebSession() && webServer.header("Authorization").isEmpty()) {
+      webServer.sendHeader("Location", "/enable-config");
+      webServer.send(302, "text/plain", "Open /enable-config");
+      return;
+    }
     if (!requireWebAuthentication()) return;
     logPrintln("Web UI accessed by a client.");
     String html;
@@ -1378,9 +1974,7 @@ void setupWebInterface() {
       html += "</td></tr>";
     }
     html += "</table>";
-    html += "<h2>Configuration</h2><p>Write access: <b>" +
-            String(gatewayConfigWritesAllowed() ? "enabled" : "locked") +
-            "</b>. To unlock an already provisioned gateway, reboot it, release USER, then hold USER for 1.5 seconds during the serial prompt.</p>";
+    html += "<h2>Configuration</h2><p>Authenticated local-network and custom-BLE management: <b>enabled</b>. OTA is available only during a ten-minute configuration window.</p>";
     if (gatewayConfigWritesAllowed()) {
       html += "<form action='/api/v1/config' method='POST'>";
       html += "<input type='hidden' name='expected_revision' value='" + String(gateway_config.header.revision) + "'>";
@@ -1399,11 +1993,6 @@ void setupWebInterface() {
       html += "MQTT root CA (PEM): <textarea name='mqtt_ca_certificate' rows='8' cols='48' placeholder='-----BEGIN CERTIFICATE----- ... -----END CERTIFICATE-----'>__KEEP__</textarea><br>";
       html += "Maximum ACK relay hops (0-4): <input type='number' min='0' max='4' name='lora_relay_hop_limit' value='" + String(gateway_config.lora.relay_hop_limit) + "'><br>";
       html += "<input type='hidden' name='reboot' value='1'><button>Validate, save and reboot</button></form>";
-      html += "<h2>Gateway access</h2><p>Replace the generated setup credential with one you choose. This also becomes the fallback AP password after reboot.</p>";
-      html += "<form action='/api/v1/credentials' method='POST'>";
-      html += "New credential (8-24 characters): <input type='password' minlength='8' maxlength='24' name='new_password' autocomplete='new-password' required><br>";
-      html += "Confirm credential: <input type='password' minlength='8' maxlength='24' name='confirm_password' autocomplete='new-password' required><br>";
-      html += "<button>Replace credential and reboot</button></form>";
     }
     html += "<p>Full registry and radio configuration uses <code>POST /api/v1/config</code>; tracker fields are named <code>tracker.0.id</code>, <code>tracker.0.name</code>, and so on.</p>";
     html += "<h2>Live logs</h2><pre id='logs'>Loading...</pre>";
@@ -1413,13 +2002,14 @@ void setupWebInterface() {
   });
 
   webServer.on("/api/v1/onboarding", HTTP_GET, []() {
-    if (!requireWebAuthentication()) return;
     String out = "{\"api_version\":" + String(EquineConfigApi::API_VERSION) +
-      ",\"role\":\"gateway\",\"onboarding_required\":" +
+      ",\"role\":\"gateway\",\"device_id\":\"" + String(GATEWAY_ID) +
+      "\",\"onboarding_required\":" +
       String(gateway_onboarding_required ? "true" : "false") +
       ",\"config_mode\":" + String(gateway_config_mode ? "true" : "false") +
+      ",\"owner_key_configured\":" + String(owner_key[0] ? "true" : "false") +
       ",\"revision\":" + String(gateway_config.header.revision) +
-      ",\"transports\":[\"wifi\"],\"config_post_content_type\":\"application/x-www-form-urlencoded\"}";
+      ",\"transports\":[\"wifi\",\"ble_nus\"],\"config_post_content_type\":\"application/x-www-form-urlencoded\"}";
     webServer.send(200, "application/json", out);
   });
 
@@ -1483,31 +2073,6 @@ void setupWebInterface() {
     gateway_config_reboot_requested = true;
   });
 
-  webServer.on("/api/v1/credentials", HTTP_POST, []() {
-    if (!requireWebAuthentication()) return;
-    if (!gatewayConfigWritesAllowed()) {
-      webServer.send(403, "application/json",
-        "{\"ok\":false,\"error\":\"physical_config_mode_required\"}");
-      return;
-    }
-    const String replacement = webServer.arg("new_password");
-    if (replacement != webServer.arg("confirm_password")) {
-      webServer.send(400, "application/json",
-        "{\"ok\":false,\"error\":\"credential_confirmation_mismatch\"}");
-      return;
-    }
-    if (!replaceAdminCredential(replacement.c_str())) {
-      webServer.send(400, "application/json",
-        "{\"ok\":false,\"error\":\"credential_must_be_8_to_24_printable_non_space_characters\"}");
-      return;
-    }
-    webServer.send(200, "text/html",
-      "<!doctype html><meta name='viewport' content='width=device-width'>"
-      "<h1>Credential replaced</h1>"
-      "<p>The gateway is restarting. Reconnect using the new credential.</p>");
-    gateway_config_reboot_requested = true;
-  });
-
   webServer.on("/api/v1/factory-reset", HTTP_POST, []() {
     if (!requireWebAuthentication()) return;
     if (!gatewayConfigWritesAllowed()) {
@@ -1534,6 +2099,15 @@ void setupWebInterface() {
     }
     webServer.send(200, "application/json", "{\"ok\":true,\"rebooting\":true}");
     gateway_config_reboot_requested = true;
+  });
+
+  webServer.on("/api/v1/config-mode", HTTP_POST, []() {
+    if (!requireWebAuthentication()) return;
+    gateway_config_mode = true;
+    gateway_config_mode_deadline_ms = millis() + 600000UL;
+    startGatewayBleConfiguration();
+    setupOTA();
+    webServer.send(200, "application/json", "{\"ok\":true,\"config_mode\":true,\"ota_enabled\":true,\"duration_s\":600}");
   });
 
   webServer.on("/api/v1/trackers", HTTP_GET, []() {
@@ -1566,6 +2140,33 @@ void setupWebInterface() {
     }
     out += "]}";
     webServer.send(200, "application/json", out);
+  });
+
+  webServer.on("/api/v1/trackers", HTTP_POST, []() {
+    if (!requireWebAuthentication()) return;
+    bool changed = false;
+    uint8_t slot = 0;
+    char error[EquineConfigApi::ERROR_SIZE]{};
+    if (!registerGatewayTracker(
+          webServer.arg("device_id").c_str(),
+          webServer.arg("device_name").c_str(),
+          webServer.arg("lora_aead_key").c_str(),
+          changed, slot, error, sizeof(error))) {
+      String out = "{\"ok\":false,\"error\":\"";
+      EquineConfigApi::appendJsonEscaped(out, error);
+      out += "\"}";
+      webServer.send(strstr(error, "registry is full") ? 409 : 400,
+                     "application/json", out);
+      return;
+    }
+    String out = "{\"ok\":true,\"tracker_id\":\"";
+    EquineConfigApi::appendJsonEscaped(out, webServer.arg("device_id").c_str());
+    out += "\",\"slot\":" + String(slot) +
+      ",\"revision\":" + String(gateway_config.header.revision) +
+      ",\"changed\":" + String(changed ? "true" : "false") +
+      ",\"reboot_required\":" + String(changed ? "true" : "false") + "}";
+    webServer.send(200, "application/json", out);
+    gateway_config_reboot_requested |= changed;
   });
 
   webServer.on("/logs", HTTP_GET, []() {
@@ -1770,6 +2371,8 @@ void serviceGatewayConfigButton() {
     gateway_config_mode = true;
     gateway_config_mode_deadline_ms = now + 600000UL;
     logPrintln("USER held for 5 s: gateway configuration writes unlocked for 10 minutes.");
+    startGatewayBleConfiguration();
+    setupOTA();
     if (WiFi.status() != WL_CONNECTED && !gateway_ap_active) {
       startGatewayFallbackAp();
     }
@@ -1804,36 +2407,24 @@ bool postBootButtonRequestsGatewayConfig() {
 }
 
 void startGatewayFallbackAp() {
-  WiFi.disconnect(false, false);
+  char ssid[33]{};
+  snprintf(ssid, sizeof(ssid), "LoRaGateway-%04lx",
+           static_cast<unsigned long>(
+             EquineProtocol::deviceIdHash(GATEWAY_ID) & 0xffffUL));
   WiFi.mode(WIFI_AP);
-  String ap_name = "LoRaGateway-" + String(GATEWAY_ID);
-  if (strlen(admin_password) < 8) {
-    logPrintln("Fallback AP disabled: onboarding password must be at least 8 characters.");
-  } else if (WiFi.softAP(ap_name.c_str(), admin_password)) {
-    gateway_ap_active = true;
-    gateway_network_ip = WiFi.softAPIP().toString();
-    logPrintf("Gateway setup AP '%s' active at %s.\n",
-              ap_name.c_str(), gateway_network_ip.c_str());
-    if (gateway_onboarding_required) {
-      logPrintf("FIRST-BOOT ADMIN CREDENTIAL (record securely): admin / %s\n",
-                admin_password);
-      showGatewayOnboardingDisplay();
-    }
-  } else {
-    logPrintln("Failed to start gateway fallback AP.");
-  }
+  gateway_ap_active = WiFi.softAP(ssid);
+  gateway_network_ip = gateway_ap_active ? WiFi.softAPIP().toString() : "off";
+  logPrintf("Gateway configuration AP %s at %s.\n",
+            gateway_ap_active ? ssid : "failed",
+            gateway_network_ip.c_str());
+  if (gateway_onboarding_required) showGatewayOnboardingDisplay();
 }
 
 void setupGatewayNetwork() {
   WiFi.persistent(false);
-  if (gateway_onboarding_required) {
-    logPrintln("Factory/unprovisioned gateway: starting onboarding AP.");
-    startGatewayFallbackAp();
-    return;
-  }
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
   if (gateway_config.wifi_ssid[0] != '\0') {
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(gateway_ble_initialized);
     logPrintf("Connecting gateway to Wi-Fi '%s'...\n",
               gateway_config.wifi_ssid);
     WiFi.begin(gateway_config.wifi_ssid, gateway_config.wifi_password);
@@ -1855,12 +2446,14 @@ void setupGatewayNetwork() {
     return;
   }
 
-  logPrintln("Gateway Wi-Fi unavailable; entering local onboarding AP mode.");
+  logPrintln(gateway_config.wifi_ssid[0] == '\0'
+    ? "No station Wi-Fi configured; skipping association and starting setup AP."
+    : "Gateway Wi-Fi unavailable; entering local configuration AP mode.");
   startGatewayFallbackAp();
 }
 
 void handleWiFiConnection() {
-  if (gateway_ap_active) return;
+  if (gateway_ap_active || gateway_config.wifi_ssid[0] == '\0') return;
   const wl_status_t currentStatus = WiFi.status();
 
   if (currentStatus != lastWiFiStatus) {
@@ -1960,7 +2553,7 @@ void setup() {
   // Cold-start empty: rebooting must not restore a full regulatory burst.
   gateway_airtime_tokens_ms = 0.0;
   gateway_airtime_refill_ms = millis();
-  initializeAdminCredential();
+  initializeOwnerKey();
   initializeMqttCaCertificate();
 
   if (!loadGatewayConfig()) {
@@ -1994,6 +2587,10 @@ void setup() {
 
   pinMode(USER_BTN_PIN, INPUT_PULLUP);
   gateway_config_mode = gateway_onboarding_required || postBootButtonRequestsGatewayConfig();
+  if (gateway_config_mode && !gateway_onboarding_required) {
+    gateway_config_mode_deadline_ms = millis() + 600000UL;
+  }
+  startGatewayBleConfiguration();
   setupGatewayNetwork();
 
   setupOTA();
@@ -2024,6 +2621,7 @@ void setup() {
 }
 
 void loop() {
+  serviceGatewayBleCommand();
   if (gateway_factory_reset_requested) {
     publishGatewayAvailability("offline");
     saveAllDedupStates(true);
@@ -2049,6 +2647,10 @@ void loop() {
       (int32_t)(millis() - gateway_config_mode_deadline_ms) >= 0) {
     gateway_config_mode = false;
     gateway_config_mode_deadline_ms = 0;
+    if (gateway_ota_active) {
+      ArduinoOTA.end();
+      gateway_ota_active = false;
+    }
     logPrintln("Gateway configuration write window closed.");
   }
 
@@ -2545,12 +3147,8 @@ void showGatewayOnboardingDisplay() {
   gateway_display.setFont(u8g2_font_7x14_tr);
   gateway_display.clearBuffer();
   gateway_display.drawStr(0, 12, "PHONE SETUP");
-  char first[14]{};
-  char second[14]{};
-  snprintf(first, sizeof(first), "AP %.10s", admin_password);
-  snprintf(second, sizeof(second), "   %.10s", admin_password + 10);
-  gateway_display.drawStr(0, 28, first);
-  gateway_display.drawStr(0, 42, second);
-  gateway_display.drawStr(0, 58, "Open 192.168.4.1");
+  gateway_display.drawStr(0, 30, "Open tracker app");
+  gateway_display.drawStr(0, 46, "Select nearby");
+  gateway_display.drawStr(0, 62, "Then configure");
   gateway_display.sendBuffer();
 }

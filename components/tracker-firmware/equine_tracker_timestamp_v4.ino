@@ -26,9 +26,9 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
-#include <esp_gap_ble_api.h>
-#include <BLESecurity.h>
 #include <string>
+#include <memory>
+#include <new>
 #include "secrets.h"
 #include "equine_protocol.h"
 #include "equine_relay.h"
@@ -97,6 +97,8 @@ const int32_t DELTA_UNIT_MICRODEG = 10;
 const uint32_t SECONDS_PER_DAY = 86400;
 const float MIN_BATTERY_VOLTAGE = 3.2f;
 const float MAX_BATTERY_VOLTAGE = 4.2f;
+const size_t OWNER_KEY_HEX_LENGTH = 64;
+const size_t MIN_WPA2_PASSWORD_LENGTH = 8;
 
 #define LORA_FREQ                         ((double)tracker_config.lora.frequency_hz)
 #define LORA_TX_POWER_DBM                 ((int)tracker_config.lora.tx_power_dbm)
@@ -151,6 +153,8 @@ const float MAX_BATTERY_VOLTAGE = 4.2f;
 const uint8_t GNSS_CONFIG_VERSION = 1;
 const uint32_t GNSS_COMMAND_TIMEOUT_MS = 500;
 const uint32_t GNSS_ASSISTANCE_MAX_AGE_S = 12UL * 60UL * 60UL;
+const uint32_t GNSS_POWER_STABILIZE_MS = 500;
+const uint32_t GNSS_NMEA_STALL_MS = 3000;
 const uint8_t WIFI_MAX_CONNECT_ATTEMPTS = 5;
 const uint32_t WIFI_CONNECT_TIMEOUT_MS = 10000;
 const uint32_t WEB_CLIENT_IDLE_TIMEOUT_MS = 15000;
@@ -167,8 +171,6 @@ const uint8_t DISPLAY_PAGE_COUNT = 4;
 const uint32_t BLE_CONNECTION_WINDOW_MS = 60000;
 const uint32_t BLE_RECONNECT_WINDOW_MS = 15000;
 const uint32_t WIFI_SETUP_BOOT_HOLD_MS = 1500;
-
-bool isValidSha256Hex(const char* value);
 
 // --- UBX Command to put BN-220 to Sleep ---
 const byte UBX_SLEEP_CMD[] = {
@@ -201,8 +203,7 @@ struct StoredHistoryPoint {
 TinyGPSPlus gps;
 Preferences prefs;
 Preferences configPrefs;
-char admin_password[25]{};
-uint32_t ble_pairing_pin = 0;
+char owner_key[OWNER_KEY_HEX_LENGTH + 1]{};
 
 RTC_DATA_ATTR double total_distance_meters = 0.0;
 RTC_DATA_ATTR double last_lat = 0.0;
@@ -255,6 +256,7 @@ RTC_DATA_ATTR uint32_t seconds_since_last_nvs_save = 0;
 RTC_DATA_ATTR uint32_t seconds_since_last_full_gnss_attempt = 0;
 RTC_DATA_ATTR uint32_t seconds_since_last_accepted_position = 0;
 RTC_DATA_ATTR double last_effective_speed_kmph = 0.0;
+RTC_DATA_ATTR bool force_wifi_setup_on_boot = false;
 
 // Raw-fix history for movement hysteresis. These are deliberately separate
 // from last_lat/last_lng, which represent the last accepted tracking position.
@@ -370,6 +372,9 @@ WebServer webServer(80);
 bool debug_mode = false;
 bool force_tracking_mode = false; // flag to break out of wifi setup mode
 bool wifi_client_connected = false;
+uint32_t tracker_config_mode_deadline_ms = 0;
+char tracker_web_session_token[33]{};
+uint32_t tracker_web_session_deadline_ms = 0;
 uint32_t last_web_activity_ms = 0;
 bool ble_debug_enabled = false;
 
@@ -418,6 +423,11 @@ bool manual_radio_request = false;
 bool manual_action_in_progress = false;
 bool ack_window_active = false;
 uint32_t ack_window_deadline_ms = 0;
+bool gps_live_metrics_active = false;
+uint32_t gps_live_metrics_deadline_ms = 0;
+bool gps_live_nmea_seen = false;
+bool gps_recovery_attempted_this_cycle = false;
+uint32_t gps_uart_bytes_received = 0;
 
 enum class ConfirmationState { NONE, DISTANCE_RESET };
 ConfirmationState pending_confirmation = ConfirmationState::NONE;
@@ -469,39 +479,66 @@ RTC_DATA_ATTR bool ble_open_window_on_next_wake = false;
 // the active CRC-protected blob. Reboot/factory-reset work is deferred outside
 // HTTP and BLE callbacks so responses can finish cleanly.
 bool tracker_onboarding_required = false;
+bool tracker_config_complete = false;
+bool tracker_gateway_paired = false;
+constexpr uint8_t MAX_TRACKER_GATEWAYS = 8;
+uint8_t tracker_paired_gateway_count = 0;
+char tracker_paired_gateway_ids[MAX_TRACKER_GATEWAYS][EquineConfig::DEVICE_ID_SIZE] = {};
+char tracker_paired_gateway_id[EquineConfig::DEVICE_ID_SIZE] = {};
 bool config_reboot_requested = false;
 bool config_factory_reset_requested = false;
 bool ble_provisioning_mode = false;
 BLECharacteristic *pRxCharacteristic = NULL;
-constexpr size_t BLE_CONFIG_COMMAND_MAX = 1536;
+constexpr size_t BLE_CONFIG_COMMAND_MAX = 8192;
 char ble_config_command[BLE_CONFIG_COMMAND_MAX];
 size_t ble_config_command_length = 0;
+volatile bool ble_config_command_pending = false;
 
 
 class BleConfigCallbacks: public BLECharacteristicCallbacks {
  public:
   void onWrite(BLECharacteristic* characteristic) override {
     if (!characteristic) return;
+    // Never parse JSON, touch NVS or send notifications on BTC_TASK. Its stack
+    // is intentionally small; the Arduino loop task processes complete frames.
+    if (ble_config_command_pending) return;
     const std::string value = characteristic->getValue();
     for (char c : value) {
       if (c == '\r') continue;
       if (c == '\n') {
         ble_config_command[ble_config_command_length] = '\0';
         if (ble_config_command_length > 0) {
-          processBleConfigCommand(ble_config_command);
+          ble_config_command_pending = true;
         }
-        ble_config_command_length = 0;
-        continue;
+        return;
       }
       if (ble_config_command_length + 1 >= BLE_CONFIG_COMMAND_MAX) {
-        ble_config_command_length = 0;
-        processBleConfigCommand("__OVERFLOW__");
-        continue;
+        strlcpy(ble_config_command, "__OVERFLOW__",
+                sizeof(ble_config_command));
+        ble_config_command_length = strlen(ble_config_command);
+        ble_config_command_pending = true;
+        return;
       }
       ble_config_command[ble_config_command_length++] = c;
     }
   }
 };
+
+void serviceBleConfigCommand() {
+  if (!ble_config_command_pending) return;
+  const size_t length = ble_config_command_length;
+  std::unique_ptr<char[]> command_copy(
+    new (std::nothrow) char[length + 1]);
+  if (command_copy) memcpy(command_copy.get(), ble_config_command, length + 1);
+  ble_config_command_length = 0;
+  ble_config_command[0] = '\0';
+  ble_config_command_pending = false;
+  if (!command_copy) {
+    sendBleConfigError("out_of_memory", "could not queue BLE command");
+    return;
+  }
+  processBleConfigCommand(command_copy.get());
+}
 
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* server) override {
@@ -529,16 +566,6 @@ class MyServerCallbacks: public BLEServerCallbacks {
 // =====================================================
 bool isDebugModeActive() {
   return debug_mode || deviceConnected;
-}
-
-bool isValidSha256Hex(const char* value) {
-  if (!value || strlen(value) != 64) return false;
-  for (size_t i = 0; i < 64; i++) {
-    const char c = value[i];
-    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
-          (c >= 'A' && c <= 'F'))) return false;
-  }
-  return true;
 }
 
 bool isBleConnectionWindowActive() {
@@ -591,7 +618,7 @@ void logPrint(const T& message) {
   String s = String(message);
   Serial.print(s);
   rememberLogLine(s.c_str());
-  if (deviceConnected && ble_session_authenticated && pTxCharacteristic) {
+  if (deviceConnected && ble_session_authenticated && !ble_provisioning_mode && pTxCharacteristic) {
     pTxCharacteristic->setValue(s.c_str());
     pTxCharacteristic->notify();
     delay(5);
@@ -603,7 +630,7 @@ void logPrintln(const T& message) {
   String s = String(message) + "\n";
   Serial.print(s);
   rememberLogLine(s.c_str());
-  if (deviceConnected && ble_session_authenticated && pTxCharacteristic) {
+  if (deviceConnected && ble_session_authenticated && !ble_provisioning_mode && pTxCharacteristic) {
     String cleanS = s;
     cleanS.replace("\r\n", "\n");
     cleanS.replace("\n", "\r\n");
@@ -626,7 +653,7 @@ void logPrintf(const char* format, ...) {
   if (written <= 0) return;
   Serial.print(buffer);
   rememberLogLine(buffer);
-  if (deviceConnected && ble_session_authenticated && pTxCharacteristic) {
+  if (deviceConnected && ble_session_authenticated && !ble_provisioning_mode && pTxCharacteristic) {
     String cleanS = String(buffer);
     cleanS.replace("\r\n", "\n");
     cleanS.replace("\n", "\r\n");
@@ -640,53 +667,92 @@ void logPrintf(const char* format, ...) {
 // =====================================================
 // CONFIGURATION STORAGE
 // =====================================================
-void initializeAdminCredential() {
-  Preferences credentials;
-  if (!credentials.begin("ltcred", false)) return;
-  const bool factory_valid = factory_admin_password &&
-    strlen(factory_admin_password) >= 12 &&
-    strlen(factory_admin_password) < sizeof(admin_password);
-  String stored = credentials.getString("admin", "");
-  if (stored.length() >= 12 && stored.length() < sizeof(admin_password)) {
-    strlcpy(admin_password, stored.c_str(), sizeof(admin_password));
-  } else if (factory_valid) {
-    strlcpy(admin_password, factory_admin_password, sizeof(admin_password));
-    credentials.putString("admin", admin_password);
-  } else {
-    static const char alphabet[] = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    for (size_t i = 0; i < 20; i++) {
-      admin_password[i] = alphabet[esp_random() % (sizeof(alphabet) - 1)];
-    }
-    admin_password[20] = '\0';
-    credentials.putString("admin", admin_password);
+bool isValidOwnerKey(const char* value) {
+  if (!value || strlen(value) != OWNER_KEY_HEX_LENGTH) return false;
+  for (size_t index = 0; index < OWNER_KEY_HEX_LENGTH; index++) {
+    const char c = value[index];
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+          (c >= 'A' && c <= 'F'))) return false;
   }
-  credentials.end();
-}
-
-bool replaceAdminCredential(const char* replacement) {
-  if (!replacement) return false;
-  const size_t length = strlen(replacement);
-  if (length < 12 || length >= sizeof(admin_password)) return false;
-  for (size_t index = 0; index < length; index++) {
-    const uint8_t c = static_cast<uint8_t>(replacement[index]);
-    if (c < 0x21 || c > 0x7e) return false;
-  }
-  Preferences credentials;
-  if (!credentials.begin("ltcred", false)) return false;
-  const size_t written = credentials.putString("admin", replacement);
-  credentials.end();
-  if (written != length) return false;
-  strlcpy(admin_password, replacement, sizeof(admin_password));
   return true;
 }
 
-void clearAdminCredential() {
+bool trackerOwnerKeyMatches(const String& authorization) {
+  constexpr const char* prefix = "Bearer ";
+  uint8_t difference = authorization.length() == 7 + OWNER_KEY_HEX_LENGTH ? 0 : 1;
+  for (size_t index = 0; index < OWNER_KEY_HEX_LENGTH; index++) {
+    const uint8_t supplied = index + 7 < authorization.length()
+      ? static_cast<uint8_t>(authorization[index + 7])
+      : 0;
+    difference |= supplied ^ static_cast<uint8_t>(owner_key[index]);
+  }
+  for (size_t index = 0; index < 7; index++) {
+    const uint8_t supplied = index < authorization.length()
+      ? static_cast<uint8_t>(authorization[index])
+      : 0;
+    difference |= supplied ^ static_cast<uint8_t>(prefix[index]);
+  }
+  return difference == 0;
+}
+
+bool trackerWebSessionActive() {
+  return tracker_web_session_token[0] != '\0' &&
+    (int32_t)(tracker_web_session_deadline_ms - millis()) > 0;
+}
+
+bool trackerRequestHasWebSession() {
+  if (!trackerWebSessionActive()) return false;
+  const String cookie = webServer.header("Cookie");
+  const String needle = "lt_session=" + String(tracker_web_session_token);
+  const int position = cookie.indexOf(needle);
+  if (position < 0) return false;
+  const int end = position + needle.length();
+  const bool starts_at_boundary = position == 0 || cookie[position - 1] == ' ' ||
+    cookie[position - 1] == ';';
+  const bool ends_at_boundary = end == cookie.length() || cookie[end] == ';';
+  return starts_at_boundary && ends_at_boundary;
+}
+
+void issueTrackerWebSession() {
+  uint8_t random_bytes[16];
+  esp_fill_random(random_bytes, sizeof(random_bytes));
+  for (size_t index = 0; index < sizeof(random_bytes); index++) {
+    snprintf(tracker_web_session_token + index * 2, 3, "%02x", random_bytes[index]);
+  }
+  tracker_web_session_deadline_ms = millis() + 600000UL;
+  webServer.sendHeader("Set-Cookie",
+    "lt_session=" + String(tracker_web_session_token) +
+    "; Max-Age=600; Path=/; HttpOnly; SameSite=Strict");
+}
+
+void initializeProvisioningCredentials() {
+  Preferences credentials;
+  if (!credentials.begin("ltcred", false)) return;
+  String stored = credentials.getString("owner_key", "");
+  if (isValidOwnerKey(stored.c_str())) {
+    strlcpy(owner_key, stored.c_str(), sizeof(owner_key));
+  }
+  credentials.end();
+}
+
+bool replaceOwnerKey(const char* replacement) {
+  if (!isValidOwnerKey(replacement)) return false;
+  Preferences credentials;
+  if (!credentials.begin("ltcred", false)) return false;
+  const size_t written = credentials.putString("owner_key", replacement);
+  credentials.end();
+  if (written != OWNER_KEY_HEX_LENGTH) return false;
+  strlcpy(owner_key, replacement, sizeof(owner_key));
+  return true;
+}
+
+void clearProvisioningCredentials() {
   Preferences credentials;
   if (credentials.begin("ltcred", false)) {
     credentials.clear();
     credentials.end();
   }
-  memset(admin_password, 0, sizeof(admin_password));
+  memset(owner_key, 0, sizeof(owner_key));
 }
 
 void applyTrackerConfigRuntimeState() {
@@ -791,6 +857,116 @@ bool writeTrackerProvisionedFlag(bool provisioned) {
   return written == sizeof(uint8_t);
 }
 
+constexpr const char* TRACKER_GATEWAY_PAIRED_KEY = "gw_paired";
+constexpr const char* TRACKER_GATEWAY_ID_KEY = "gateway_id";
+constexpr const char* TRACKER_GATEWAY_COUNT_KEY = "gw_count";
+
+void refreshTrackerOnboardingState() {
+  tracker_onboarding_required =
+    !tracker_config_complete || !tracker_gateway_paired;
+}
+
+bool readTrackerGatewayPairing() {
+  tracker_gateway_paired = false;
+  tracker_paired_gateway_count = 0;
+  memset(tracker_paired_gateway_ids, 0, sizeof(tracker_paired_gateway_ids));
+  tracker_paired_gateway_id[0] = '\0';
+  if (!configPrefs.begin(EquineConfig::CONFIG_NAMESPACE, true)) return false;
+  const bool paired = configPrefs.getBool(TRACKER_GATEWAY_PAIRED_KEY, false);
+  const uint8_t stored_count = configPrefs.getUChar(TRACKER_GATEWAY_COUNT_KEY, 0);
+  if (paired && stored_count > 0 && stored_count <= MAX_TRACKER_GATEWAYS) {
+    for (uint8_t index = 0; index < stored_count; index++) {
+      const String key = "gw_" + String(index);
+      const String gateway_id = configPrefs.getString(key.c_str(), "");
+      if (!EquineConfig::isValidCanonicalId(
+            gateway_id.c_str(), EquineConfig::DEVICE_ID_SIZE)) continue;
+      strlcpy(tracker_paired_gateway_ids[tracker_paired_gateway_count++],
+              gateway_id.c_str(), EquineConfig::DEVICE_ID_SIZE);
+    }
+  }
+  const String gateway_id = configPrefs.getString(TRACKER_GATEWAY_ID_KEY, "");
+  configPrefs.end();
+  if (tracker_paired_gateway_count == 0 && paired &&
+      EquineConfig::isValidCanonicalId(
+        gateway_id.c_str(), EquineConfig::DEVICE_ID_SIZE)) {
+    strlcpy(tracker_paired_gateway_ids[0], gateway_id.c_str(),
+            EquineConfig::DEVICE_ID_SIZE);
+    tracker_paired_gateway_count = 1;
+  }
+  if (tracker_paired_gateway_count == 0) {
+    return true;
+  }
+  tracker_gateway_paired = true;
+  strlcpy(tracker_paired_gateway_id, tracker_paired_gateway_ids[0],
+          sizeof(tracker_paired_gateway_id));
+  return true;
+}
+
+bool writeTrackerGatewayPairing(const char* gateway_id) {
+  if (!gateway_id || !EquineConfig::isValidCanonicalId(
+        gateway_id, EquineConfig::DEVICE_ID_SIZE)) return false;
+  if (!configPrefs.begin(EquineConfig::CONFIG_NAMESPACE, false)) return false;
+  uint8_t count = tracker_paired_gateway_count;
+  bool already_paired = false;
+  for (uint8_t index = 0; index < count; index++) {
+    if (strcmp(tracker_paired_gateway_ids[index], gateway_id) == 0) {
+      already_paired = true;
+      break;
+    }
+  }
+  if (!already_paired && count >= MAX_TRACKER_GATEWAYS) {
+    configPrefs.end();
+    return false;
+  }
+  if (!already_paired) count++;
+  for (uint8_t index = 0; index < count; index++) {
+    const char* stored_id = index < tracker_paired_gateway_count
+      ? tracker_paired_gateway_ids[index] : gateway_id;
+    const String key = "gw_" + String(index);
+    if (configPrefs.putString(key.c_str(), stored_id) != strlen(stored_id)) {
+      configPrefs.end();
+      return false;
+    }
+  }
+  const size_t count_written = configPrefs.putUChar(TRACKER_GATEWAY_COUNT_KEY, count);
+  const size_t id_written = configPrefs.putString(
+    TRACKER_GATEWAY_ID_KEY, gateway_id);
+  const size_t paired_written = configPrefs.putBool(
+    TRACKER_GATEWAY_PAIRED_KEY, true);
+  configPrefs.end();
+  if (count_written != sizeof(uint8_t) || id_written != strlen(gateway_id) ||
+      paired_written != sizeof(uint8_t)) return false;
+  tracker_gateway_paired = true;
+  if (!already_paired) {
+    strlcpy(tracker_paired_gateway_ids[tracker_paired_gateway_count++], gateway_id,
+            EquineConfig::DEVICE_ID_SIZE);
+  }
+  strlcpy(tracker_paired_gateway_id, tracker_paired_gateway_ids[0],
+          sizeof(tracker_paired_gateway_id));
+  refreshTrackerOnboardingState();
+  return true;
+}
+
+bool clearTrackerGatewayPairing() {
+  if (!configPrefs.begin(EquineConfig::CONFIG_NAMESPACE, false)) return false;
+  const size_t paired_written = configPrefs.putBool(
+    TRACKER_GATEWAY_PAIRED_KEY, false);
+  configPrefs.remove(TRACKER_GATEWAY_ID_KEY);
+  configPrefs.remove(TRACKER_GATEWAY_COUNT_KEY);
+  for (uint8_t index = 0; index < MAX_TRACKER_GATEWAYS; index++) {
+    const String key = "gw_" + String(index);
+    configPrefs.remove(key.c_str());
+  }
+  configPrefs.end();
+  if (paired_written != sizeof(uint8_t)) return false;
+  tracker_gateway_paired = false;
+  tracker_paired_gateway_count = 0;
+  memset(tracker_paired_gateway_ids, 0, sizeof(tracker_paired_gateway_ids));
+  tracker_paired_gateway_id[0] = '\0';
+  refreshTrackerOnboardingState();
+  return true;
+}
+
 bool loadTrackerConfig() {
   const char* source = "active";
   if (!readTrackerConfigBlob(
@@ -811,7 +987,9 @@ bool loadTrackerConfig() {
 
   bool provisioned = false;
   const bool has_provisioned_marker = readTrackerProvisionedFlag(provisioned);
-  tracker_onboarding_required = !has_provisioned_marker || !provisioned;
+  tracker_config_complete = has_provisioned_marker && provisioned;
+  readTrackerGatewayPairing();
+  refreshTrackerOnboardingState();
   applyTrackerConfigRuntimeState();
   logPrintf("Loaded tracker config from %s: schema=%u revision=%lu id=%s name=%s onboarding=%s.\n",
             source,
@@ -828,7 +1006,7 @@ void clearTrackerConfigStorage() {
     configPrefs.clear();
     configPrefs.end();
   }
-  clearAdminCredential();
+  clearProvisioningCredentials();
 }
 
 
@@ -847,8 +1025,22 @@ bool commitTrackerConfigCandidate(
     snprintf(error, error_size, "candidate violates cross-field validation");
     return false;
   }
+  if (mark_provisioned && candidate.wifi_ssid[0] == '\0') {
+    snprintf(error, error_size, "Wi-Fi SSID is required to complete onboarding");
+    return false;
+  }
 
   const EquineConfig::TrackerConfigV1 previous = tracker_config;
+  const bool invalidates_gateway_pairing = tracker_gateway_paired &&
+    (strcmp(previous.device_id, candidate.device_id) != 0 ||
+     memcmp(previous.lora_aead_key, candidate.lora_aead_key,
+            sizeof(previous.lora_aead_key)) != 0);
+  // Gateway registration binds both tracker ID and AEAD key. Fail closed by
+  // clearing the binding before either value is committed.
+  if (invalidates_gateway_pairing && !clearTrackerGatewayPairing()) {
+    snprintf(error, error_size, "failed to invalidate gateway pairing");
+    return false;
+  }
   tracker_config = candidate;
   if (!saveTrackerConfig(false)) {
     tracker_config = previous;
@@ -860,10 +1052,12 @@ bool commitTrackerConfigCandidate(
   if (mark_provisioned) {
     if (!writeTrackerProvisionedFlag(true)) {
       snprintf(error, error_size, "failed to persist onboarding completion");
-      tracker_onboarding_required = true;
+      tracker_config_complete = false;
+      refreshTrackerOnboardingState();
       return false;
     }
-    tracker_onboarding_required = false;
+    tracker_config_complete = true;
+    refreshTrackerOnboardingState();
   }
   return true;
 }
@@ -895,11 +1089,27 @@ String trackerConfigJson() {
         ",\"revision\":" + String(tracker_config.header.revision) +
         ",\"onboarding_required\":" +
         String(tracker_onboarding_required ? "true" : "false") +
-        ",\"device_id\":\"";
+        ",\"config_complete\":" +
+        String(tracker_config_complete ? "true" : "false") +
+        ",\"gateway_paired\":" +
+        String(tracker_gateway_paired ? "true" : "false") +
+        ",\"paired_gateway_id\":\"";
+  appendJsonEscaped(out, tracker_paired_gateway_id);
+  out += "\",\"paired_gateway_ids\":[";
+  for (uint8_t index = 0; index < tracker_paired_gateway_count; index++) {
+    if (index) out += ',';
+    out += "\"";
+    appendJsonEscaped(out, tracker_paired_gateway_ids[index]);
+    out += "\"";
+  }
+  out += "],\"device_id\":\"";
   appendJsonEscaped(out, tracker_config.device_id);
   out += "\",\"device_name\":\"";
   appendJsonEscaped(out, tracker_config.device_name);
   out += "\",\"device_hash\":\"" + String(hash_text) +
+         "\",\"network_ip\":\"" +
+         String(wifi_station_connected && WiFi.status() == WL_CONNECTED
+                  ? WiFi.localIP().toString() : "off") +
          "\",\"wifi_ssid\":\"";
   appendJsonEscaped(out, tracker_config.wifi_ssid);
   out += "\",\"lora_aead_key\":\"" + String(key_text) +
@@ -1107,13 +1317,19 @@ bool applyTrackerWebPatch(EquineConfigApi::PatchStatus& status,
     return false;
   }
   if (!status.changed) {
-    if (tracker_onboarding_required) {
+    if (!tracker_config_complete) {
+      if (tracker_config.wifi_ssid[0] == '\0') {
+        snprintf(status.error, sizeof(status.error),
+                 "Wi-Fi SSID is required to complete onboarding");
+        return false;
+      }
       if (!writeTrackerProvisionedFlag(true)) {
         snprintf(status.error, sizeof(status.error),
                  "failed to persist onboarding completion");
         return false;
       }
-      tracker_onboarding_required = false;
+      tracker_config_complete = true;
+      refreshTrackerOnboardingState();
     }
     return true;
   }
@@ -1124,20 +1340,39 @@ bool applyTrackerWebPatch(EquineConfigApi::PatchStatus& status,
 void processBleConfigCommand(const char* command) {
   if (!command) return;
   if (strcmp(command, "__OVERFLOW__") == 0) {
-    sendBleConfigError("command_too_large", "maximum is 1535 bytes");
+    sendBleConfigError("command_too_large", "maximum is 8191 bytes");
+    return;
+  }
+  if (strcmp(command, "INFO") == 0) {
+    String out = "{\"ok\":true,\"api_version\":" +
+      String(EquineConfigApi::API_VERSION) +
+      ",\"role\":\"tracker\",\"revision\":" +
+      String(tracker_config.header.revision) +
+      ",\"device_id\":\"" + String(tracker_config.device_id) +
+      "\"" +
+      ",\"onboarding_required\":" +
+      String(tracker_onboarding_required ? "true" : "false") +
+      ",\"config_complete\":" +
+      String(tracker_config_complete ? "true" : "false") +
+      ",\"gateway_paired\":" +
+      String(tracker_gateway_paired ? "true" : "false") +
+      ",\"owner_key_configured\":" +
+      String(owner_key[0] ? "true" : "false") + "}";
+    sendBleConfigText(out);
     return;
   }
   if (strncmp(command, "CLAIM ", 6) == 0) {
-    if (!tracker_onboarding_required || !ble_provisioning_mode) {
-      sendBleConfigError("claim_not_allowed",
-                         "factory reset or open the physical setup window");
+    if (!ble_provisioning_mode || owner_key[0]) {
+      sendBleConfigError("claim_not_allowed", "device has already been claimed");
       return;
     }
-    const char* replacement = command + 6;
-    if (!replaceAdminCredential(replacement)) {
-      sendBleConfigError("invalid_credential",
-                         "use 12 to 24 printable non-space characters");
+    if (!replaceOwnerKey(command + 6)) {
+      sendBleConfigError("invalid_owner_key", "expected 64 hexadecimal characters");
       return;
+    }
+    if (wifi_setup_active) {
+      ArduinoOTA.setPassword(owner_key);
+      ArduinoOTA.begin();
     }
     ble_session_authenticated = true;
     sendBleConfigText("{\"ok\":true,\"claimed\":true,\"authenticated\":true}");
@@ -1146,26 +1381,21 @@ void processBleConfigCommand(const char* command) {
   if (strncmp(command, "AUTH ", 5) == 0) {
     const char* supplied = command + 5;
     const size_t supplied_length = strlen(supplied);
-    const size_t expected_length = strlen(admin_password);
+    const size_t expected_length = strlen(owner_key);
     uint8_t difference = static_cast<uint8_t>(supplied_length ^ expected_length);
-    const size_t compared = supplied_length > expected_length
-      ? supplied_length : expected_length;
+    const size_t compared = supplied_length > expected_length ? supplied_length : expected_length;
     for (size_t i = 0; i < compared; i++) {
       const uint8_t left = i < supplied_length ? supplied[i] : 0;
-      const uint8_t right = i < expected_length ? admin_password[i] : 0;
+      const uint8_t right = i < expected_length ? owner_key[i] : 0;
       difference |= left ^ right;
     }
-    if (difference == 0 && expected_length >= 12) {
-      ble_session_authenticated = true;
-      sendBleConfigText("{\"ok\":true,\"authenticated\":true}");
-    } else {
-      ble_session_authenticated = false;
-      sendBleConfigError("authentication_failed", "disconnect and try again");
-    }
+    ble_session_authenticated = difference == 0 && expected_length == OWNER_KEY_HEX_LENGTH;
+    if (ble_session_authenticated) sendBleConfigText("{\"ok\":true,\"authenticated\":true}");
+    else sendBleConfigError("authentication_failed", "disconnect and try again");
     return;
   }
   if (!ble_session_authenticated) {
-    sendBleConfigError("authentication_required", "send AUTH <admin-password> first");
+    sendBleConfigError("authentication_required", "claim or authenticate this device first");
     return;
   }
   if (strcmp(command, "HELLO") == 0) {
@@ -1174,23 +1404,22 @@ void processBleConfigCommand(const char* command) {
       ",\"role\":\"tracker\",\"revision\":" +
       String(tracker_config.header.revision) +
       ",\"onboarding_required\":" +
-      String(tracker_onboarding_required ? "true" : "false") + "}";
+      String(tracker_onboarding_required ? "true" : "false") +
+      ",\"config_complete\":" +
+      String(tracker_config_complete ? "true" : "false") +
+      ",\"gateway_paired\":" +
+      String(tracker_gateway_paired ? "true" : "false") + "}";
     sendBleConfigText(out);
+    return;
+  }
+  if (strcmp(command, "ENTER_CONFIG_MODE") == 0) {
+    force_wifi_setup_on_boot = true;
+    sendBleConfigText("{\"ok\":true,\"config_mode\":true,\"reboot_required\":true}");
+    config_reboot_requested = true;
     return;
   }
   if (strcmp(command, "GET CONFIG") == 0) {
     sendBleConfigText(trackerConfigJson());
-    return;
-  }
-  if (strncmp(command, "SET_CREDENTIAL ", 15) == 0) {
-    if (!replaceAdminCredential(command + 15)) {
-      sendBleConfigError("invalid_credential",
-                         "use 12 to 24 printable non-space characters");
-      return;
-    }
-    sendBleConfigText(
-      "{\"ok\":true,\"credential_replaced\":true,\"reboot_required\":true}");
-    config_reboot_requested = true;
     return;
   }
   if (strncmp(command, "PATCH ", 6) == 0) {
@@ -1199,13 +1428,17 @@ void processBleConfigCommand(const char* command) {
       sendBleConfigError("command_too_large", "patch exceeds buffer");
       return;
     }
-    char encoded[BLE_CONFIG_COMMAND_MAX];
-    memcpy(encoded, command + 6, length + 1);
+    std::unique_ptr<char[]> encoded(new (std::nothrow) char[length + 1]);
+    if (!encoded) {
+      sendBleConfigError("out_of_memory", "could not allocate patch buffer");
+      return;
+    }
+    memcpy(encoded.get(), command + 6, length + 1);
     EquineConfigApi::PatchStatus status;
     EquineConfig::TrackerConfigV1 candidate = tracker_config;
     uint32_t expected_revision = 0;
     bool reboot = false;
-    if (!applyTrackerUrlPatch(encoded, expected_revision, reboot,
+    if (!applyTrackerUrlPatch(encoded.get(), expected_revision, reboot,
                               status, candidate)) {
       sendBleConfigError("invalid_patch", status.error);
       return;
@@ -1223,12 +1456,18 @@ void processBleConfigCommand(const char* command) {
         sendBleConfigError("commit_failed", status.error);
         return;
       }
-    } else if (tracker_onboarding_required) {
+    } else if (!tracker_config_complete) {
+      if (tracker_config.wifi_ssid[0] == '\0') {
+        sendBleConfigError("commit_failed",
+                           "Wi-Fi SSID is required to complete onboarding");
+        return;
+      }
       if (!writeTrackerProvisionedFlag(true)) {
         sendBleConfigError("commit_failed", "failed to persist onboarding completion");
         return;
       }
-      tracker_onboarding_required = false;
+      tracker_config_complete = true;
+      refreshTrackerOnboardingState();
     }
     const bool needs_reboot = status.reboot_required || reboot;
     String out = "{\"ok\":true,\"revision\":" +
@@ -1238,6 +1477,29 @@ void processBleConfigCommand(const char* command) {
       String(needs_reboot ? "true" : "false") + "}";
     sendBleConfigText(out);
     config_reboot_requested |= needs_reboot;
+    return;
+  }
+  if (strncmp(command, "PAIR_GATEWAY ", 13) == 0) {
+    const char* paired_gateway_id = command + 13;
+    if (!writeTrackerGatewayPairing(paired_gateway_id)) {
+      sendBleConfigError("invalid_gateway_id", "use a canonical gateway id");
+      return;
+    }
+    String out = "{\"ok\":true,\"gateway_paired\":true,\"gateway_id\":\"";
+    EquineConfigApi::appendJsonEscaped(out, paired_gateway_id);
+    out += "\",\"onboarding_required\":" +
+      String(tracker_onboarding_required ? "true" : "false") + "}";
+    sendBleConfigText(out);
+    if (!tracker_onboarding_required) force_tracking_mode = true;
+    return;
+  }
+  if (strcmp(command, "UNPAIR_GATEWAY") == 0) {
+    if (!clearTrackerGatewayPairing()) {
+      sendBleConfigError("unpair_failed", "could not persist gateway state");
+      return;
+    }
+    sendBleConfigText(
+      "{\"ok\":true,\"gateway_paired\":false,\"onboarding_required\":true}");
     return;
   }
   if (strncmp(command, "ROLLBACK ", 9) == 0) {
@@ -1267,7 +1529,7 @@ void processBleConfigCommand(const char* command) {
     return;
   }
   sendBleConfigError("unknown_command",
-    "use HELLO, GET CONFIG, PATCH, SET_CREDENTIAL, ROLLBACK, FACTORY_RESET or REBOOT");
+    "use INFO, CLAIM, AUTH, HELLO, GET CONFIG, PATCH, ENTER_CONFIG_MODE, PAIR_GATEWAY, UNPAIR_GATEWAY, ROLLBACK, FACTORY_RESET or REBOOT");
 }
 
 void stopBleDebug() {
@@ -1294,6 +1556,7 @@ void stopBleDebug() {
   ble_connection_window_active = false;
   ble_provisioning_mode = false;
   ble_config_command_length = 0;
+  ble_config_command_pending = false;
 }
 
 void startBleDebugWindow(uint32_t duration_ms, bool force_provisioning) {
@@ -1304,31 +1567,7 @@ void startBleDebugWindow(uint32_t duration_ms, bool force_provisioning) {
     logPrintln("Starting bounded BLE/configuration window...");
     String ble_name = "LT-" + String(TRACKER_ID);
     BLEDevice::init(ble_name.c_str());
-    if (tracker_onboarding_required) {
-      int bond_count = esp_ble_get_bond_device_num();
-      if (bond_count > 0) {
-        auto* bonds = static_cast<esp_ble_bond_dev_t*>(
-          calloc(static_cast<size_t>(bond_count), sizeof(esp_ble_bond_dev_t)));
-        if (bonds) {
-          int listed = bond_count;
-          if (esp_ble_get_bond_device_list(&listed, bonds) == ESP_OK) {
-            for (int index = 0; index < listed; index++) {
-              esp_ble_remove_bond_device(bonds[index].bd_addr);
-            }
-            logPrintf("Removed %d stale BLE bond(s) for unprovisioned setup.\n", listed);
-          }
-          free(bonds);
-        }
-      }
-    }
-    ble_pairing_pin = 100000UL + (esp_random() % 900000UL);
-    BLESecurity* security = new BLESecurity();
-    security->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND);
-    security->setCapability(ESP_IO_CAP_OUT);
-    security->setKeySize(16);
-    security->setStaticPIN(ble_pairing_pin);
-    logPrintf("BLE Secure Connections pairing PIN: %06lu\n",
-              static_cast<unsigned long>(ble_pairing_pin));
+    logPrintln("BLE configuration uses application-layer owner-key authentication; OS pairing is disabled.");
     pServer = BLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
 
@@ -1343,7 +1582,7 @@ void startBleDebugWindow(uint32_t duration_ms, bool force_provisioning) {
       CHARACTERISTIC_UUID_RX,
       BLECharacteristic::PROPERTY_WRITE
     );
-    pRxCharacteristic->setAccessPermissions(ESP_GATT_PERM_WRITE_ENC_MITM);
+    pRxCharacteristic->setAccessPermissions(ESP_GATT_PERM_WRITE);
     pRxCharacteristic->setCallbacks(new BleConfigCallbacks());
 
     pService->start();
@@ -1362,6 +1601,7 @@ void startBleDebugWindow(uint32_t duration_ms, bool force_provisioning) {
 }
 
 void serviceBleDebug() {
+  serviceBleConfigCommand();
   if (ble_connection_window_active && !deviceConnected &&
       !isBleConnectionWindowActive()) {
     logPrintln("BLE connection window expired; shutting BLE down.");
@@ -1683,19 +1923,24 @@ void wakeupGPS() {
   if (gps_powered) return;
 #if defined(BOARD_WIRELESS_TRACKER)
   logPrintln("Powering up GNSS (Wireless Tracker)...");
-  pinMode(VEXT_CTRL_PIN, OUTPUT);
+  // Wireless Tracker V1.1 powers GNSS from GPIO3/VEXT; V1.0 uses GPIO37.
+  // Set each output latch before changing its direction. In particular, this
+  // prevents a short active-low pulse on GNSS_RST every time the receiver is
+  // woken, which otherwise turns a warm start into an unreliable cold reset.
   digitalWrite(VEXT_CTRL_PIN, HIGH);
-  pinMode(GNSS_PWR_PIN, OUTPUT);
+  pinMode(VEXT_CTRL_PIN, OUTPUT);
   digitalWrite(GNSS_PWR_PIN, HIGH);
-  pinMode(GNSS_RST_PIN, OUTPUT);
+  pinMode(GNSS_PWR_PIN, OUTPUT);
   digitalWrite(GNSS_RST_PIN, HIGH);
+  pinMode(GNSS_RST_PIN, OUTPUT);
 #else
   logPrintln("Waking up GNSS (sending wakeup byte)...");
   Serial2.write(0xFF);
 #endif
   gps_powered = true;
-  // Start consuming UART data quickly instead of waiting through a fixed 500 ms delay.
-  responsiveDelay(100);
+  // Give the receiver and UART output time to stabilize. The previous 100 ms
+  // delay was shorter than the observed UC6580 startup on some power cycles.
+  responsiveDelay(GNSS_POWER_STABILIZE_MS);
 }
 
 void sleepGPS() {
@@ -1720,6 +1965,35 @@ void sleepGPS() {
 #endif
   gps_powered = false;
   delay(50);
+}
+
+void recoverGpsUartStream() {
+  if (gps_recovery_attempted_this_cycle) return;
+  gps_recovery_attempted_this_cycle = true;
+  setTrackerPhase("GNSS recovery");
+  logPrintln("No valid NMEA received; restarting GNSS power and UART once.");
+
+  Serial2.end();
+#if defined(BOARD_WIRELESS_TRACKER)
+  digitalWrite(GNSS_PWR_PIN, LOW);
+  pinMode(GNSS_RST_PIN, INPUT);
+  digitalWrite(VEXT_CTRL_PIN, LOW);
+  display_initialized = false;
+  display_awake = false;
+  gps_powered = false;
+  delay(150);
+#else
+  gps_powered = false;
+  delay(50);
+#endif
+
+  Serial2.begin(GPS_BAUD, SERIAL_8N1, RXD2, TXD2);
+  wakeupGPS();
+#if defined(BOARD_WIRELESS_TRACKER)
+  sendUc6580Assistance();
+#endif
+  setTrackerPhase("GPS listen");
+  serviceDisplayAndButton(true);
 }
 
 #if defined(BOARD_WIRELESS_TRACKER)
@@ -1889,13 +2163,15 @@ void runWifiSetupMode() {
   // Configuration BLE is available during an explicit setup/onboarding session
   // even when ordinary BLE debug logging is disabled.
   // CRITICAL: Initialize BLE before WiFi on ESP32-S3 to prevent coex_enable panic.
-  startBleDebugWindow(tracker_onboarding_required ? 600000UL : 120000UL, true);
+  startBleDebugWindow(600000UL, true);
+  tracker_config_mode_deadline_ms = tracker_onboarding_required
+    ? 0
+    : millis() + 600000UL;
 
   // WiFi is only enabled in this bounded hard-boot setup window.
   // WiFi modem sleep MUST be enabled when both WiFi and BLE are active,
   // otherwise the ESP32-S3 Wi-Fi driver will explicitly abort.
   WiFi.persistent(false);
-  WiFi.mode(WIFI_STA);
   WiFi.setSleep(true);
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
 
@@ -1903,7 +2179,8 @@ void runWifiSetupMode() {
   String savedPw = String(tracker_config.wifi_password);
 
   bool connected = false;
-  if (savedSsid.length() > 0 && !tracker_onboarding_required) {
+  if (savedSsid.length() > 0) {
+    WiFi.mode(WIFI_STA);
     for (uint8_t attempt = 1; attempt <= WIFI_MAX_CONNECT_ATTEMPTS && !connected; attempt++) {
       wifi_connect_attempt = attempt;
       setTrackerPhase("WiFi connect");
@@ -1946,57 +2223,81 @@ void runWifiSetupMode() {
       }
     }
   } else {
+    // An empty SSID is not a failed station configuration. Never invoke
+    // WiFi.begin() until the operator has actually supplied station settings.
     setLastError("No WiFi SSID configured");
   }
 
   if (!connected) {
-    setTrackerPhase("WiFi fallback AP");
-    logPrintln("Starting fallback AP mode...");
-    WiFi.disconnect(false, false);
     WiFi.mode(WIFI_AP);
-    String onboarding_ap = "LoRaTracker-" + String(TRACKER_ID);
-    if (strlen(admin_password) < 12) {
-      setLastError("Setup password too short");
-      logPrintln("Fallback AP disabled: onboarding password must be at least 12 characters.");
-    } else if (WiFi.softAP(onboarding_ap.c_str(), admin_password)) {
-      wifi_ap_active = true;
-      wifi_station_connected = false;
-      responsiveDelay(500);
-      last_wifi_ip = WiFi.softAPIP().toString();
-      last_wifi_rssi = 0;
-      setLastError(savedSsid.length() > 0 ? "STA failed; fallback AP" : "No SSID; fallback AP");
-      logPrintf("AP '%s' started at %s.\n",
-                onboarding_ap.c_str(), last_wifi_ip.c_str());
-      if (tracker_onboarding_required) {
-        logPrintf("FIRST-BOOT ADMIN CREDENTIAL (record securely): admin / %s\n",
-                  admin_password);
-      }
-    } else {
-      setLastError("Fallback AP failed");
-      logPrintln("Fallback AP failed.");
-    }
+    char setup_ssid[33]{};
+    snprintf(setup_ssid, sizeof(setup_ssid), "LoRaTracker-%04lx",
+             static_cast<unsigned long>(TRACKER_DEVICE_HASH & 0xffffUL));
+    wifi_ap_active = WiFi.softAP(setup_ssid);
+    if (wifi_ap_active) last_wifi_ip = WiFi.softAPIP().toString();
+    setTrackerPhase(wifi_ap_active ? "WiFi setup AP" : "Bluetooth setup");
+    setLastError(savedSsid.length() > 0 ? "WiFi association failed" : "No WiFi configured");
+    logPrintf("Station Wi-Fi unavailable; configuration AP %s (%s).\n",
+              wifi_ap_active ? setup_ssid : "failed",
+              wifi_ap_active ? last_wifi_ip.c_str() : "BLE only");
   }
 
   String otaHost = "lora-tracker-" + String(TRACKER_ID);
   ArduinoOTA.setHostname(otaHost.c_str());
-  if (isValidSha256Hex(ota_password_hash)) {
-    ArduinoOTA.setPasswordHash(ota_password_hash);
+  if (isValidOwnerKey(owner_key)) {
+    ArduinoOTA.setPassword(owner_key);
     ArduinoOTA.begin();
   } else {
-    logPrintln("OTA disabled: configure a 64-character SHA-256 password hash.");
+    logPrintln("OTA disabled until the device has an owner key.");
   }
 
+  const char* web_auth_headers[] = {"Authorization", "Cookie"};
+  webServer.collectHeaders(web_auth_headers, 2);
   auto requireWebAuthentication = []() -> bool {
-    if (strlen(admin_password) < 12) {
-      webServer.send(503, "application/json", "{\"error\":\"admin_credentials_not_configured\"}");
+    if (!isValidOwnerKey(owner_key)) {
+      webServer.send(503, "application/json", "{\"error\":\"owner_key_not_configured\"}");
       return false;
     }
-    if (webServer.authenticate("admin", admin_password)) return true;
-    webServer.requestAuthentication(BASIC_AUTH, "LoRa Tracker");
+    if (trackerRequestHasWebSession()) return true;
+    const String authorization = webServer.header("Authorization");
+    if (trackerOwnerKeyMatches(authorization)) {
+      issueTrackerWebSession();
+      return true;
+    }
+    webServer.send(401, "application/json", "{\"error\":\"owner_key_required\"}");
     return false;
   };
 
+  webServer.on("/enable-config", HTTP_GET, []() {
+    webServer.send(200, "text/html",
+      "<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<title>Enable tracker configuration</title><style>body{font:16px sans-serif;max-width:42rem;margin:3rem auto;padding:0 1rem}input,button{box-sizing:border-box;font:inherit;padding:.75rem;width:100%;margin:.4rem 0}#result{white-space:pre-wrap}</style>"
+      "<h1>Enable configuration and OTA</h1><p>Paste this tracker's owner key. It remains in this page only and is sent directly to the tracker.</p>"
+      "<input id='key' autocomplete='off' autocapitalize='none' spellcheck='false' placeholder='64-character owner key'>"
+      "<button id='enable'>Enable for 10 minutes</button><p id='result'></p>"
+      "<script>enable.onclick=async()=>{let k=key.value.trim(),o=result;o.textContent='Enabling...';try{let r=await fetch('/api/v1/config-mode',{method:'POST',headers:{Authorization:'Bearer '+k}}),t=await r.text();if(r.ok){location.replace('/')}else{o.textContent='Request failed: '+t}}catch(e){o.textContent='Request failed: '+e.message}}</script>");
+  });
+
+  webServer.on("/api/v1/claim", HTTP_POST, []() {
+    if (!ble_provisioning_mode || owner_key[0]) {
+      webServer.send(409, "application/json", "{\"ok\":false,\"error\":\"claim_not_allowed\"}");
+      return;
+    }
+    if (!replaceOwnerKey(webServer.arg("owner_key").c_str())) {
+      webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_owner_key\"}");
+      return;
+    }
+    ArduinoOTA.setPassword(owner_key);
+    ArduinoOTA.begin();
+    webServer.send(200, "application/json", "{\"ok\":true,\"claimed\":true}");
+  });
+
   webServer.on("/", HTTP_GET, [requireWebAuthentication]() {
+    if (!trackerRequestHasWebSession() && webServer.header("Authorization").isEmpty()) {
+      webServer.sendHeader("Location", "/enable-config");
+      webServer.send(302, "text/plain", "Open /enable-config");
+      return;
+    }
     if (!requireWebAuthentication()) return;
     wifi_client_connected = true;
     last_web_activity_ms = millis();
@@ -2042,11 +2343,6 @@ void runWifiSetupMode() {
             String(tracker_config.lora_ack_timeout_ms) + "'></label>";
     html += "<input type='hidden' name='reboot' value='1'>";
     html += "<button type='submit'>Validate, save and reboot</button></form>";
-    html += "<h2>Device access</h2><p>Replace the generated setup credential with one you choose. This also becomes the fallback AP password after reboot.</p>";
-    html += "<form action='/api/v1/credentials' method='POST'>";
-    html += "<label>New credential (12–24 characters)<input type='password' minlength='12' maxlength='24' name='new_password' autocomplete='new-password' required></label>";
-    html += "<label>Confirm credential<input type='password' minlength='12' maxlength='24' name='confirm_password' autocomplete='new-password' required></label>";
-    html += "<button type='submit'>Replace credential and reboot</button></form>";
     html += "<p>The complete transactional API is available at <code>GET/POST /api/v1/config</code>. POST bodies use <code>application/x-www-form-urlencoded</code> and must include <code>expected_revision</code>.</p>";
     html += "<form action='/start' method='POST'><button>Close setup and start tracking</button></form>";
     html += "<h3>Live logs</h3><pre id='logs'>Loading...</pre>";
@@ -2100,11 +2396,16 @@ void runWifiSetupMode() {
       "Configuration saved and validated. The tracker will reboot shortly.");
   });
 
-  webServer.on("/api/v1/onboarding", HTTP_GET, [requireWebAuthentication]() {
-    if (!requireWebAuthentication()) return;
+  webServer.on("/api/v1/onboarding", HTTP_GET, []() {
     String out = "{\"api_version\":" + String(EquineConfigApi::API_VERSION) +
-      ",\"role\":\"tracker\",\"onboarding_required\":" +
+      ",\"role\":\"tracker\",\"device_id\":\"" + String(TRACKER_ID) +
+      "\",\"onboarding_required\":" +
       String(tracker_onboarding_required ? "true" : "false") +
+      ",\"config_complete\":" +
+      String(tracker_config_complete ? "true" : "false") +
+      ",\"gateway_paired\":" +
+      String(tracker_gateway_paired ? "true" : "false") +
+      ",\"owner_key_configured\":" + String(owner_key[0] ? "true" : "false") +
       ",\"revision\":" + String(tracker_config.header.revision) +
       ",\"transports\":[\"wifi\",\"ble_nus\"],\"config_post_content_type\":\"application/x-www-form-urlencoded\"}";
     webServer.send(200, "application/json", out);
@@ -2139,26 +2440,31 @@ void runWifiSetupMode() {
     config_reboot_requested |= needs_reboot;
   });
 
-  webServer.on("/api/v1/credentials", HTTP_POST, [requireWebAuthentication]() {
+  webServer.on("/api/v1/gateway-pairing", HTTP_POST, [requireWebAuthentication]() {
     if (!requireWebAuthentication()) return;
-    wifi_client_connected = true;
-    last_web_activity_ms = millis();
-    const String replacement = webServer.arg("new_password");
-    if (replacement != webServer.arg("confirm_password")) {
+    const String gateway_id = webServer.arg("gateway_id");
+    if (!writeTrackerGatewayPairing(gateway_id.c_str())) {
       webServer.send(400, "application/json",
-        "{\"ok\":false,\"error\":\"credential_confirmation_mismatch\"}");
+        "{\"ok\":false,\"error\":\"invalid_gateway_id\"}");
       return;
     }
-    if (!replaceAdminCredential(replacement.c_str())) {
-      webServer.send(400, "application/json",
-        "{\"ok\":false,\"error\":\"credential_must_be_12_to_24_printable_non_space_characters\"}");
+    String out = "{\"ok\":true,\"gateway_paired\":true,\"gateway_id\":\"";
+    EquineConfigApi::appendJsonEscaped(out, gateway_id.c_str());
+    out += "\",\"onboarding_required\":" +
+      String(tracker_onboarding_required ? "true" : "false") + "}";
+    webServer.send(200, "application/json", out);
+    if (!tracker_onboarding_required) force_tracking_mode = true;
+  });
+
+  webServer.on("/api/v1/gateway-pairing", HTTP_DELETE, [requireWebAuthentication]() {
+    if (!requireWebAuthentication()) return;
+    if (!clearTrackerGatewayPairing()) {
+      webServer.send(500, "application/json",
+        "{\"ok\":false,\"error\":\"unpair_failed\"}");
       return;
     }
-    webServer.send(200, "text/html",
-      "<!doctype html><meta name='viewport' content='width=device-width'>"
-      "<h1>Credential replaced</h1>"
-      "<p>The tracker is restarting. Reconnect using the new credential.</p>");
-    config_reboot_requested = true;
+    webServer.send(200, "application/json",
+      "{\"ok\":true,\"gateway_paired\":false,\"onboarding_required\":true}");
   });
 
   webServer.on("/api/v1/config/rollback", HTTP_POST, [requireWebAuthentication]() {
@@ -2202,8 +2508,20 @@ void runWifiSetupMode() {
     config_reboot_requested = true;
   });
 
+  webServer.on("/api/v1/config-mode", HTTP_POST, [requireWebAuthentication]() {
+    if (!requireWebAuthentication()) return;
+    tracker_config_mode_deadline_ms = millis() + 600000UL;
+    startBleDebugWindow(600000UL, true);
+    webServer.send(200, "application/json", "{\"ok\":true,\"config_mode\":true,\"ota_enabled\":true}");
+  });
+
   webServer.on("/start", HTTP_POST, [requireWebAuthentication]() {
     if (!requireWebAuthentication()) return;
+    if (tracker_onboarding_required) {
+      webServer.send(409, "application/json",
+        "{\"ok\":false,\"error\":\"complete_configuration_and_gateway_pairing_first\"}");
+      return;
+    }
     wifi_client_connected = true;
     last_web_activity_ms = millis();
     force_tracking_mode = true;
@@ -2232,18 +2550,19 @@ void runWifiSetupMode() {
   setTrackerPhase(connected ? "OTA / web STA" : "OTA / web AP");
   logPrintln("Ready for OTA or Web UI on port 80.");
 
-  const uint32_t ota_start_time = millis();
-  const uint32_t timeout_window =
-    tracker_onboarding_required ? 600000UL : 120000UL;
+  uint32_t last_station_reconnect_ms = 0;
 
   while (!force_tracking_mode) {
     const uint32_t now = millis();
     if (config_reboot_requested || config_factory_reset_requested) break;
-    const bool initial_setup_window = (uint32_t)(now - ota_start_time) < timeout_window;
+    const bool config_window_open = tracker_onboarding_required ||
+      tracker_config_mode_deadline_ms == 0 ||
+      (int32_t)(tracker_config_mode_deadline_ms - now) > 0;
     const bool recent_web_activity = wifi_client_connected &&
       (uint32_t)(now - last_web_activity_ms) < WEB_CLIENT_IDLE_TIMEOUT_MS;
 
-    if (!initial_setup_window && !recent_web_activity) {
+    if (!tracker_onboarding_required &&
+        !config_window_open && !recent_web_activity) {
       wifi_client_connected = false;
       break;
     }
@@ -2257,6 +2576,12 @@ void runWifiSetupMode() {
     }
     if (wifi_station_connected && WiFi.status() == WL_CONNECTED) {
       last_wifi_rssi = WiFi.RSSI();
+    } else if (connected && !wifi_ap_active &&
+               (last_station_reconnect_ms == 0 ||
+                (uint32_t)(millis() - last_station_reconnect_ms) >= 10000UL)) {
+      last_station_reconnect_ms = millis();
+      logPrintln("Setup Wi-Fi disconnected; retrying station connection.");
+      WiFi.reconnect();
     }
     serviceDisplayAndButton();
     delay(10);
@@ -2751,12 +3076,11 @@ void renderStatusPage() {
       // Main Page
       if (wifi_setup_active || wifi_station_connected || wifi_ap_active) {
         if (tracker_onboarding_required) {
-          snprintf(lines[0], sizeof(lines[0]), "BLE PIN %06lu",
-                   static_cast<unsigned long>(ble_pairing_pin));
-          snprintf(lines[1], sizeof(lines[1]), "AP %.10s", admin_password);
-          snprintf(lines[2], sizeof(lines[2]), "   %.10s", admin_password + 10);
-          snprintf(lines[3], sizeof(lines[3]), "%.16s", last_wifi_ip.c_str());
-          snprintf(lines[4], sizeof(lines[4]), "Configure by phone");
+          snprintf(lines[0], sizeof(lines[0]), "PHONE SETUP");
+          snprintf(lines[1], sizeof(lines[1]), "Open tracker app");
+          snprintf(lines[2], sizeof(lines[2]), "Select nearby");
+          snprintf(lines[3], sizeof(lines[3]), "Configure WiFi");
+          snprintf(lines[4], sizeof(lines[4]), "Keep app open");
         } else {
           snprintf(lines[0], sizeof(lines[0]), "WiFi: %s", wifi_station_connected ? "STA" : (wifi_ap_active ? "AP" : "TRY"));
           snprintf(lines[1], sizeof(lines[1]), "%.13s", last_wifi_ip.c_str());
@@ -2769,7 +3093,8 @@ void renderStatusPage() {
         snprintf(lines[0], sizeof(lines[0]), "S:%.11s", tracker_phase);
         snprintf(lines[1], sizeof(lines[1]), "D:%.1fm", total_distance_meters);
         snprintf(lines[2], sizeof(lines[2]), "B:%u%% %.1fV", cached_battery_percentage, cached_battery_voltage);
-        snprintf(lines[3], sizeof(lines[3]), "Fix:%s", has_initial_fix ? "YES" : "NO");
+        snprintf(lines[3], sizeof(lines[3]), "Spd:%.1f km/h",
+                 last_effective_speed_kmph);
         snprintf(lines[4], sizeof(lines[4]), "Tap next Hold rst");
       }
       break;
@@ -2777,13 +3102,40 @@ void renderStatusPage() {
     case 1:
       // GPS
       {
-        const uint32_t sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
-        const double speed = last_effective_speed_kmph;
-        snprintf(lines[0], sizeof(lines[0]), "GPS (2/4)");
-        snprintf(lines[1], sizeof(lines[1]), "Sats: %lu", (unsigned long)sats);
-        snprintf(lines[2], sizeof(lines[2]), "Spd: %.1f", speed);
+        // During an interactive acquisition, only render values received in
+        // the current NMEA stream. TinyGPS++ otherwise retains the previous
+        // acquisition's values while the receiver starts up.
+        const bool satellites_current = gps.satellites.isValid() &&
+          (!gps_live_metrics_active || gps.satellites.age() < 2000U);
+        const bool hdop_current = gps.hdop.isValid() &&
+          (!gps_live_metrics_active || gps.hdop.age() < 2000U);
+        snprintf(lines[0], sizeof(lines[0]), "%s",
+                 gps_live_metrics_active ?
+                   (gps_live_nmea_seen ? "GPS LIVE (2/4)" : "GPS WAIT NMEA") :
+                   "GPS (2/4)");
+        if (satellites_current) {
+          snprintf(lines[1], sizeof(lines[1]), "Sats: %lu",
+                   (unsigned long)gps.satellites.value());
+        } else {
+          snprintf(lines[1], sizeof(lines[1]), "Sats: --");
+        }
+        if (hdop_current) {
+          snprintf(lines[2], sizeof(lines[2]), "HDOP: %.2f", gps.hdop.hdop());
+        } else {
+          snprintf(lines[2], sizeof(lines[2]), "HDOP: --");
+        }
         snprintf(lines[3], sizeof(lines[3]), "FixAge:%lus", (unsigned long)seconds_since_last_fix);
-        snprintf(lines[4], sizeof(lines[4]), "Hold: acquire GPS");
+        if (gps_live_metrics_active && gps_live_metrics_deadline_ms != 0) {
+          const uint32_t remaining_ms =
+            (int32_t)(gps_live_metrics_deadline_ms - millis()) > 0 ?
+            gps_live_metrics_deadline_ms - millis() : 0;
+          snprintf(lines[4], sizeof(lines[4]), "Listening: %lus",
+                   (unsigned long)((remaining_ms + 999U) / 1000U));
+        } else if (gps_live_metrics_active) {
+          snprintf(lines[4], sizeof(lines[4]), "Starting GNSS...");
+        } else {
+          snprintf(lines[4], sizeof(lines[4]), "Hold: acquire GPS");
+        }
       }
       break;
 
@@ -2943,7 +3295,8 @@ void serviceDisplayAndButton(bool force_refresh) {
     force_refresh = true;
   }
 
-  const uint32_t refresh_interval_ms = ack_window_active ? 250 : DISPLAY_REFRESH_MS;
+  const uint32_t refresh_interval_ms =
+    (ack_window_active || gps_live_metrics_active) ? 250 : DISPLAY_REFRESH_MS;
   if (force_refresh ||
       (uint32_t)(now - display_last_refresh_ms) >= refresh_interval_ms) {
     renderStatusPage();
@@ -3027,13 +3380,28 @@ bool listenForGpsFix(uint32_t listen_duration_ms,
                      bool& movement_accepted,
                      bool& position_accepted) {
   const uint32_t listen_start_ms = millis();
+  uint32_t valid_sentences_at_start = gps.passedChecksum();
+  uint32_t bytes_at_start = gps_uart_bytes_received;
 
   while ((uint32_t)(millis() - listen_start_ms) < listen_duration_ms) {
     bool processed_gps_bytes = false;
 
     while (Serial2.available() > 0) {
-      gps.encode(Serial2.read());
+      if (gps.encode(Serial2.read())) gps_live_nmea_seen = true;
+      gps_uart_bytes_received++;
       processed_gps_bytes = true;
+    }
+
+    const uint32_t listen_elapsed_ms = millis() - listen_start_ms;
+    if (!gps_recovery_attempted_this_cycle &&
+        listen_elapsed_ms >= GNSS_NMEA_STALL_MS &&
+        gps.passedChecksum() == valid_sentences_at_start) {
+      logPrintf("GNSS stalled: %lu UART bytes, no valid NMEA in %lu ms.\n",
+                (unsigned long)(gps_uart_bytes_received - bytes_at_start),
+                (unsigned long)listen_elapsed_ms);
+      recoverGpsUartStream();
+      valid_sentences_at_start = gps.passedChecksum();
+      bytes_at_start = gps_uart_bytes_received;
     }
 
     if (gps.location.isUpdated() && gps.location.isValid() &&
@@ -3214,6 +3582,9 @@ bool listenForGpsFix(uint32_t listen_duration_ms,
     if (!processed_gps_bytes) delay(10);
   }
 
+  logPrintf("GNSS listen ended: %lu UART bytes, %lu valid NMEA sentences.\n",
+            (unsigned long)(gps_uart_bytes_received - bytes_at_start),
+            (unsigned long)(gps.passedChecksum() - valid_sentences_at_start));
   return false;
 }
 
@@ -3327,7 +3698,7 @@ void setup() {
   }
 
   prefs.begin("tracker", false);
-  initializeAdminCredential();
+  initializeProvisioningCredentials();
   if (!loadTrackerConfig()) {
     // The factory configuration is validated in code, so reaching this branch
     // indicates an NVS write failure. Continue with the in-memory defaults.
@@ -3480,7 +3851,9 @@ void setup() {
   }
 
   if (hard_boot) {
-    wifi_setup_requested = tracker_onboarding_required || postBootButtonRequestsWifiSetup();
+    wifi_setup_requested = tracker_onboarding_required ||
+      force_wifi_setup_on_boot || postBootButtonRequestsWifiSetup();
+    force_wifi_setup_on_boot = false;
   }
 
   // A button-only wake opens the status UI and, when enabled, a bounded BLE
@@ -3596,6 +3969,10 @@ void performTrackingCycle() {
   const bool manual_radio_action = manual_radio_request;
   manual_gps_listen_request_ms = 0;
   manual_radio_request = false;
+  gps_live_metrics_active = manual_gps_action;
+  gps_live_metrics_deadline_ms = 0;
+  gps_live_nmea_seen = false;
+  gps_recovery_attempted_this_cycle = false;
   // The tracking cycle owns GNSS and LoRa. Reject additional page actions
   // until it has released those peripherals to avoid nested radio sessions.
   manual_action_in_progress = true;
@@ -3624,80 +4001,98 @@ void performTrackingCycle() {
     // =====================================================
     acquisition_start_ms = millis();
 
-  if (has_initial_fix && fix_age_at_cycle_start > MAX_FIX_AGE_S) {
-    logPrintf("WARNING: Last fix is %u seconds old. Discarding it!\n",
-              fix_age_at_cycle_start);
-    has_initial_fix = false;
-  }
+    if (has_initial_fix && fix_age_at_cycle_start > MAX_FIX_AGE_S) {
+      logPrintf("WARNING: Last fix is %u seconds old. Discarding it!\n",
+                fix_age_at_cycle_start);
+      has_initial_fix = false;
+    }
 
-  const uint32_t gps_timeout_ms = requested_gps_listen_ms > 0 ?
-    requested_gps_listen_ms : chooseGpsAcquisitionTimeoutMs();
-  logPrintf("GNSS acquisition policy -> no_fix=%u, full_retry_age=%u s, deadline=%u ms.\n",
-            consecutive_no_fix_cycles,
-            seconds_since_last_full_gnss_attempt,
-            gps_timeout_ms);
-  uint32_t first_window_ms = GPS_INITIAL_LISTEN_MS;
-  if (first_window_ms > gps_timeout_ms) first_window_ms = gps_timeout_ms;
-  cycle_fix_found = listenForGpsFix(
-    first_window_ms,
-    fix_age_at_cycle_start,
-    cycle_start_ms,
-    cycle_movement_accepted,
-    cycle_position_accepted
-  );
+    const uint32_t gps_timeout_ms = manual_gps_action ?
+      requested_gps_listen_ms : chooseGpsAcquisitionTimeoutMs();
+    logPrintf("GNSS acquisition policy -> no_fix=%u, full_retry_age=%u s, deadline=%u ms.\n",
+              consecutive_no_fix_cycles,
+              seconds_since_last_full_gnss_attempt,
+              gps_timeout_ms);
 
-  while (!cycle_fix_found) {
-    const uint32_t elapsed_ms = millis() - acquisition_start_ms;
-    if (elapsed_ms >= gps_timeout_ms) break;
-
-    uint32_t remaining_ms = gps_timeout_ms - elapsed_ms;
-    uint32_t sleep_chunk_ms = GPS_LIGHT_SLEEP_CHUNK_MS;
-    if (sleep_chunk_ms > remaining_ms) sleep_chunk_ms = remaining_ms;
-
-    if (isDebugModeActive()) {
-      setTrackerPhase("GPS wait (debug)");
-      responsiveDelay(sleep_chunk_ms);
+    if (manual_gps_action) {
+      // A user-requested acquisition is an interactive diagnostic session.
+      // Keep consuming NMEA continuously so satellites and HDOP stay live;
+      // scheduled low-power cycles retain their light-sleep/listen policy.
+      gps_live_metrics_deadline_ms = acquisition_start_ms + gps_timeout_ms;
+      serviceDisplayAndButton(true);
+      cycle_fix_found = listenForGpsFix(
+        gps_timeout_ms,
+        fix_age_at_cycle_start,
+        cycle_start_ms,
+        cycle_movement_accepted,
+        cycle_position_accepted
+      );
     } else {
-      setTrackerPhase("GPS light sleep");
-      Serial.flush();
-      esp_sleep_enable_ext0_wakeup((gpio_num_t)USER_BTN_PIN, 0);
-      esp_sleep_enable_timer_wakeup((uint64_t)sleep_chunk_ms * 1000ULL);
-      esp_light_sleep_start();
+      uint32_t first_window_ms = GPS_INITIAL_LISTEN_MS;
+      if (first_window_ms > gps_timeout_ms) first_window_ms = gps_timeout_ms;
+      cycle_fix_found = listenForGpsFix(
+        first_window_ms,
+        fix_age_at_cycle_start,
+        cycle_start_ms,
+        cycle_movement_accepted,
+        cycle_position_accepted
+      );
 
-      if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
-        previous_button_pressed = digitalRead(USER_BTN_PIN) == LOW;
-        last_button_event_ms = millis();
-        logPrintln("Button pressed during GNSS light sleep.");
-        requestDisplayWake(DISPLAY_BUTTON_TIMEOUT_MS, false);
+      while (!cycle_fix_found) {
+        const uint32_t elapsed_ms = millis() - acquisition_start_ms;
+        if (elapsed_ms >= gps_timeout_ms) break;
+
+        uint32_t remaining_ms = gps_timeout_ms - elapsed_ms;
+        uint32_t sleep_chunk_ms = GPS_LIGHT_SLEEP_CHUNK_MS;
+        if (sleep_chunk_ms > remaining_ms) sleep_chunk_ms = remaining_ms;
+
+        if (isDebugModeActive()) {
+          setTrackerPhase("GPS wait (debug)");
+          responsiveDelay(sleep_chunk_ms);
+        } else {
+          setTrackerPhase("GPS light sleep");
+          Serial.flush();
+          esp_sleep_enable_ext0_wakeup((gpio_num_t)USER_BTN_PIN, 0);
+          esp_sleep_enable_timer_wakeup((uint64_t)sleep_chunk_ms * 1000ULL);
+          esp_light_sleep_start();
+
+          if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
+            previous_button_pressed = digitalRead(USER_BTN_PIN) == LOW;
+            last_button_event_ms = millis();
+            logPrintln("Button pressed during GNSS light sleep.");
+            requestDisplayWake(DISPLAY_BUTTON_TIMEOUT_MS, false);
+          }
+        }
+
+        const uint32_t elapsed_after_sleep_ms = millis() - acquisition_start_ms;
+        if (elapsed_after_sleep_ms >= gps_timeout_ms) break;
+
+        remaining_ms = gps_timeout_ms - elapsed_after_sleep_ms;
+        uint32_t listen_ms = GPS_LISTEN_WINDOW_MS;
+        if (listen_ms > remaining_ms) listen_ms = remaining_ms;
+
+        setTrackerPhase("GPS listen");
+        const uint32_t elapsed_s =
+          fix_age_at_cycle_start + elapsed_after_sleep_ms / 1000U;
+        cycle_fix_found = listenForGpsFix(
+          listen_ms,
+          elapsed_s,
+          cycle_start_ms,
+          cycle_movement_accepted,
+          cycle_position_accepted
+        );
       }
     }
 
-    const uint32_t elapsed_after_sleep_ms = millis() - acquisition_start_ms;
-    if (elapsed_after_sleep_ms >= gps_timeout_ms) break;
-
-    remaining_ms = gps_timeout_ms - elapsed_after_sleep_ms;
-    uint32_t listen_ms = GPS_LISTEN_WINDOW_MS;
-    if (listen_ms > remaining_ms) listen_ms = remaining_ms;
-
-    setTrackerPhase("GPS listen");
-    const uint32_t current_elapsed_s =
-      fix_age_at_cycle_start + elapsed_after_sleep_ms / 1000U;
-    cycle_fix_found = listenForGpsFix(
-      listen_ms,
-      current_elapsed_s,
-      cycle_start_ms,
-      cycle_movement_accepted,
-      cycle_position_accepted
-    );
-  }
-
-  const uint32_t acquisition_elapsed_ms = millis() - acquisition_start_ms;
-  if (!cycle_fix_found) {
-    current_elapsed_s =
-      fix_age_at_cycle_start + acquisition_elapsed_ms / 1000U;
-    logPrintf("No confident GNSS fix before the %u ms deadline.\n",
-              gps_timeout_ms);
-  }
+    const uint32_t acquisition_elapsed_ms = millis() - acquisition_start_ms;
+    if (!cycle_fix_found) {
+      current_elapsed_s =
+        fix_age_at_cycle_start + acquisition_elapsed_ms / 1000U;
+      logPrintf("No confident GNSS fix before the %u ms deadline.\n",
+                gps_timeout_ms);
+    }
+    gps_live_metrics_active = false;
+    gps_live_metrics_deadline_ms = 0;
   } else {
     setTrackerPhase("Manual LoRa");
     serviceDisplayAndButton(true);

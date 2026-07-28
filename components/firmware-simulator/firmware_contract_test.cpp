@@ -242,6 +242,13 @@ void testConfiguration() {
   gateway.trackers[1].enabled = 1;
   memcpy(gateway.trackers[1].lora_aead_key, key, sizeof(key));
   finalize(gateway, DeviceRole::GATEWAY, 1);
+  GatewayConfigV1 legacy_crc_copy = gateway;
+  const uint32_t expected_crc = legacy_crc_copy.header.crc32;
+  legacy_crc_copy.header.crc32 = 0;
+  assert(expected_crc == crc32(
+    reinterpret_cast<const uint8_t*>(&legacy_crc_copy),
+    sizeof(legacy_crc_copy)));
+  assert(expected_crc == configCrc32(gateway));
   assert(validateEnvelope(gateway, DeviceRole::GATEWAY));
   assert(isValidCanonicalId(gateway.gateway_id, sizeof(gateway.gateway_id)));
   assert(isValidDisplayName(gateway.gateway_name, sizeof(gateway.gateway_name)));

@@ -184,6 +184,32 @@ inline uint32_t crc32(const uint8_t* data, size_t length) {
   return ~crc;
 }
 
+inline uint32_t crc32Update(uint32_t crc, const uint8_t* data, size_t length) {
+  for (size_t i = 0; i < length; i++) {
+    crc ^= data[i];
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      const uint32_t mask = -(crc & 1UL);
+      crc = (crc >> 1) ^ (0xEDB88320UL & mask);
+    }
+  }
+  return crc;
+}
+
+template <typename T>
+inline uint32_t configCrc32(const T& config) {
+  const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&config);
+  constexpr size_t crc_offset =
+    offsetof(T, header) + offsetof(ConfigHeaderV1, crc32);
+  constexpr uint8_t zero_crc[sizeof(config.header.crc32)]{};
+  uint32_t crc = crc32Update(0xFFFFFFFFUL, bytes, crc_offset);
+  crc = crc32Update(crc, zero_crc, sizeof(zero_crc));
+  crc = crc32Update(
+    crc,
+    bytes + crc_offset + sizeof(config.header.crc32),
+    sizeof(T) - crc_offset - sizeof(config.header.crc32));
+  return ~crc;
+}
+
 inline bool isNullTerminated(const char* value, size_t capacity) {
   return value && memchr(value, '\0', capacity) != nullptr;
 }
@@ -261,8 +287,7 @@ inline void finalize(T& config, DeviceRole role, uint32_t revision) {
   config.header.role = static_cast<uint8_t>(role);
   memset(config.header.reserved, 0, sizeof(config.header.reserved));
   config.header.crc32 = 0;
-  config.header.crc32 = crc32(
-    reinterpret_cast<const uint8_t*>(&config), sizeof(config));
+  config.header.crc32 = configCrc32(config);
 }
 
 template <typename T>
@@ -275,12 +300,7 @@ inline bool validateEnvelope(const T& config, DeviceRole expected_role) {
     return false;
   }
 
-  T copy;
-  memcpy(&copy, &config, sizeof(copy));
-  const uint32_t expected_crc = copy.header.crc32;
-  copy.header.crc32 = 0;
-  return expected_crc == crc32(
-    reinterpret_cast<const uint8_t*>(&copy), sizeof(copy));
+  return config.header.crc32 == configCrc32(config);
 }
 
 inline bool validateTrackerConfig(const TrackerConfigV1& config) {
