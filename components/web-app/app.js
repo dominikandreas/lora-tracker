@@ -1,3 +1,5 @@
+import "./styles.css";
+import "leaflet/dist/leaflet.css";
 import { MqttWebSocketClient } from "./mqtt.js";
 import {
   putPoint,
@@ -8,39 +10,88 @@ import {
 import { normalizePoint } from "./points.js";
 import { MapManager } from "./map.js";
 import { AlertsManager } from "./alerts.js";
-import { OnboardingManager } from "./onboarding.js";
+import {
+  evaluateBrokerTransport,
+  normalizeBrokerWebSocketUrl,
+} from "./broker-policy.js";
+import { generateOwnerKey, ownerKeyAction } from "./credential-policy.js";
+import {
+  OnboardingManager,
+  createBleDeviceScanner,
+  createBleTransport,
+} from "./onboarding.js";
+import { WifiDeviceTransport } from "./device-api.js";
+import {
+  createDeviceTransfer,
+  renderDeviceTransferQr,
+  scanDeviceTransferImage,
+} from "./device-sharing.js";
+import {
+  collectDeviceConfig,
+  renderDeviceConfig,
+} from "./device-config.js";
+import { pairTrackerTransaction } from "./pairing-transaction.js";
+import {
+  PlatformNotificationService,
+  addAppStateListener,
+  isNativeApp,
+  loadDeviceOwnerKey,
+  loadSettings,
+  loadDevices,
+  loadStoredMqttPassword,
+  removeDeviceOwnerKey,
+  saveDevices,
+  savePlatformSettings,
+  storeDeviceOwnerKey,
+  storeDeviceSecret,
+  storeMqttPassword,
+} from "./platform.js";
 
 const els = Object.fromEntries(
   [...document.querySelectorAll("[id]")].map((el) => [el.id, el]),
 );
 const mapManager = new MapManager("map");
-const alertsManager = new AlertsManager();
-const onboardingManager = new OnboardingManager();
+const notificationService = new PlatformNotificationService();
+try {
+  await notificationService.initialize();
+} catch (error) {
+  console.warn("Notifications are unavailable", error);
+}
+const alertsManager = new AlertsManager(notificationService);
 const mqtt = new MqttWebSocketClient();
 const trackers = new Map();
 let selectedHash = null;
 let connected = false;
 let pendingHistoryRequest = null;
 
-onboardingManager.transport.onDisconnect = () => {
-  setBleStatus("Disconnected");
-  els.bleControls.hidden = true;
-  els.blePassword.value = "";
-  els.cfgRadioKey.value = "";
-  onboardingManager.lastConfig = null;
-};
+let devices = await loadDevices();
+let deviceSession = null;
+const unpairedBleDevices = new Map();
+const bleScanner = createBleDeviceScanner();
 
-let saved = {};
-try {
-  saved = JSON.parse(
-    localStorage.getItem("lora-tracker.web.settings") || "{}",
-  );
-} catch {
-  localStorage.removeItem("lora-tracker.web.settings");
-}
-els.brokerUrl.value = saved.brokerUrl || "";
+const saved = await loadSettings();
+let startupWarning = "";
+els.brokerUrl.value = normalizeBrokerWebSocketUrl(saved.brokerUrl || "");
 els.baseTopic.value = saved.baseTopic || "lora-tracker";
 els.username.value = saved.username || "";
+if (isNativeApp) {
+  document.documentElement.classList.add("native-app");
+  els.credentialStorageHint.textContent =
+    "The password is saved automatically in Android Keystore-backed encrypted storage.";
+} else {
+  els.credentialStorageHint.textContent =
+    "The password is saved in this site's local browser storage. Use only a trusted browser profile.";
+}
+try {
+  const storedPassword = await loadStoredMqttPassword();
+  if (storedPassword) {
+    els.password.value = storedPassword;
+  }
+} catch (error) {
+  console.warn("Credential storage is unavailable", error);
+  startupWarning =
+    "Credential storage is unavailable; the password will remain in memory only.";
+}
 
 let mapLayerType = ["none", "osm", "pmtiles"].includes(saved.mapLayerType)
   ? saved.mapLayerType
@@ -57,8 +108,8 @@ async function loadPmtiles() {
   } catch {
     if (mapLayerType === "pmtiles") mapLayerType = "none";
     els.mapLayer.value = mapLayerType;
-    mapManager.setLayer(mapLayerType);
-    saveSettings();
+    await mapManager.setLayer(mapLayerType);
+    await saveSettings();
   }
 }
 
@@ -87,7 +138,7 @@ els.mapLayer.addEventListener("change", async (e) => {
     } else {
       await mapManager.setLayer(mapLayerType);
     }
-    saveSettings();
+    await saveSettings();
   } catch (error) {
     mapLayerType = previous;
     els.mapLayer.value = previous;
@@ -95,10 +146,14 @@ els.mapLayer.addEventListener("change", async (e) => {
   }
 });
 
+els.brokerUrl.addEventListener("change", () => {
+  els.brokerUrl.value = normalizeBrokerWebSocketUrl(els.brokerUrl.value);
+});
+
 // --- Onboarding Logic ---
 function setBleStatus(msg) {
   els.bleStatus.textContent = msg;
-  const connected = msg === "Connected";
+  const connected = msg.startsWith("Connected");
   const state =
     connected
       ? "online"
@@ -114,174 +169,633 @@ function appendBleOutput(msg) {
   els.bleOutput.scrollTop = els.bleOutput.scrollHeight;
 }
 
-els.onboardingButton.addEventListener("click", async () => {
-  els.onboardingPanel.hidden = !els.onboardingPanel.hidden;
-  if (!els.onboardingPanel.hidden) {
-    try {
-      setBleStatus("Connecting...");
-      await onboardingManager.connectTracker();
-      setBleStatus("Connected");
-      els.bleControls.hidden = false;
-    } catch (e) {
-      setBleStatus(`Error: ${e.message}`);
-    }
-  } else {
-    onboardingManager.disconnect();
-    setBleStatus("Disconnected");
-    els.bleControls.hidden = true;
-  }
-});
-
-function requireCredential() {
-  const credential = els.blePassword.value;
-  if (
-    credential.length < 12 ||
-    credential.length > 24 ||
-    /\s/.test(credential)
-  ) {
-    throw new Error("Credential must be 12–24 characters without spaces");
-  }
-  return credential;
+function deviceIdFromConfig(config) {
+  return config?.device_id || config?.gateway_id || config?.repeater_id;
 }
 
-els.bleClaim.addEventListener("click", async () => {
-  try {
-    appendBleOutput("Claiming...");
-    const result = await onboardingManager.claim(requireCredential());
-    appendBleOutput(result);
-    els.bleGetConfig.click();
-  } catch (e) {
-    appendBleOutput(`Error: ${e.message}`);
-  }
-});
+function deviceNameFromConfig(config) {
+  return config?.device_name || config?.gateway_name || config?.repeater_name || deviceIdFromConfig(config);
+}
 
-els.bleAuth.addEventListener("click", async () => {
-  try {
-    appendBleOutput("Authenticating...");
-    const result = await onboardingManager.auth(requireCredential());
-    appendBleOutput(result);
-    // Auto-fetch config after auth
-    els.bleGetConfig.click();
-  } catch (e) {
-    appendBleOutput(`Error: ${e.message}`);
-  }
-});
+function currentBleId(manager) {
+  return manager?.transport?.deviceId || manager?.transport?.device?.id || null;
+}
 
-els.bleReplaceCredential.addEventListener("click", async () => {
+function uniqueValues(...values) {
+  return [...new Set(values.flat().filter(Boolean).map(String))];
+}
+
+async function persistCurrentDevice() {
+  const config = deviceSession?.config;
+  if (!config) return;
+  const id = deviceIdFromConfig(config);
+  const previousId = deviceSession.record?.id;
+  const previous = devices.find((device) => device.id === id) ||
+    devices.find((device) => device.id === previousId) ||
+    deviceSession.record || {};
+  const record = {
+    ...previous,
+    id,
+    name: deviceNameFromConfig(config),
+    role: config.role,
+    bleId: currentBleId(deviceSession.manager) || previous.bleId || null,
+    address: config.network_ip && config.network_ip !== "off"
+      ? config.network_ip
+      : deviceSession.address || previous.address || null,
+    credentialAliases: uniqueValues(
+      previous.credentialAliases || [],
+      previousId,
+      previous.bleId,
+      currentBleId(deviceSession.manager),
+    ),
+    lastSeen: new Date().toISOString(),
+  };
+  devices = [
+    ...devices.filter((device) => device.id !== id && device.id !== previousId),
+    record,
+  ];
+  await saveDevices(devices);
+  if (deviceSession.ownerKey) {
+    await storeDeviceOwnerKey(
+      id,
+      deviceSession.ownerKey,
+      record.bleId,
+      previousId,
+      record.credentialAliases,
+    );
+  }
+  if (config.role === "tracker" && config.lora_aead_key) {
+    await storeDeviceSecret(id, config.lora_aead_key, "lora-key");
+  }
+  deviceSession.record = record;
+  unpairedBleDevices.delete(record.bleId);
+  renderDeviceInventory();
+  renderUnpairedDevices();
+}
+
+function renderDeviceInventory() {
+  els.deviceInventory.replaceChildren();
+  if (!devices.length) {
+    els.deviceInventory.textContent = "No saved devices yet.";
+    return;
+  }
+  for (const device of devices) {
+    const button = document.createElement("button");
+    button.className = "device-card";
+    const title = document.createElement("strong");
+    title.textContent = device.name || device.id;
+    const detail = document.createElement("span");
+    detail.textContent = `${device.role} · ${device.address || "Bluetooth"}`;
+    button.append(title, detail);
+    button.addEventListener("click", () => openSavedDevice(device));
+    els.deviceInventory.append(button);
+  }
+}
+
+function renderUnpairedDevices() {
+  els.unpairedDeviceInventory.replaceChildren();
+  const available = [...unpairedBleDevices.values()].filter(
+    (candidate) => !devices.some((device) => device.bleId === candidate.deviceId),
+  );
+  if (!available.length) {
+    els.unpairedDeviceInventory.textContent = "Scanning for unclaimed devices…";
+    return;
+  }
+  for (const candidate of available) {
+    const button = document.createElement("button");
+    button.className = "device-card";
+    const title = document.createElement("strong");
+    title.textContent = candidate.name || "LoRa tracker";
+    const detail = document.createElement("span");
+    detail.textContent = "Nearby device · Bluetooth";
+    button.append(title, detail);
+    button.addEventListener("click", async () => {
+      try {
+        await connectBle(candidate.deviceId);
+      } catch (error) {
+        setBleStatus(`Error: ${error.message}`);
+      }
+    });
+    els.unpairedDeviceInventory.append(button);
+  }
+}
+
+async function startUnpairedDeviceScan() {
   try {
-    if (!onboardingManager.lastConfig) {
-      throw new Error("Authenticate and fetch configuration first");
+    await bleScanner.start((candidate) => {
+      if (!candidate?.deviceId) return;
+      unpairedBleDevices.set(candidate.deviceId, candidate);
+      renderUnpairedDevices();
+    });
+    renderUnpairedDevices();
+  } catch (error) {
+    console.warn("Bluetooth discovery is unavailable", error);
+    if (!unpairedBleDevices.size) {
+      els.unpairedDeviceInventory.textContent = "Bluetooth discovery is unavailable.";
     }
-    if (!confirm("Replace the administrator credential and reboot the tracker?")) {
+  }
+}
+
+async function resetDeviceSession() {
+  const previousSession = deviceSession;
+  deviceSession = null;
+  try {
+    await previousSession?.manager?.disconnect();
+  } catch (error) {
+    console.warn("Could not close the previous Bluetooth session", error);
+  }
+  els.deviceSession.hidden = false;
+  els.deviceAddressRow.hidden = false;
+  els.deviceConfigPanel.hidden = true;
+  els.bleOutput.textContent = "";
+  setBleStatus("Disconnected");
+}
+
+function summarizeDevice(config, transport) {
+  const state = config.role === "tracker"
+    ? `${config.config_complete ? "Configured" : "Needs configuration"} · ${config.gateway_paired ? `Added to ${(config.paired_gateway_ids || [config.paired_gateway_id]).filter(Boolean).join(", ")}` : "Not added to a gateway"}`
+    : config.role === "gateway"
+      ? `${config.onboarding_required ? "Onboarding incomplete" : "Operational"} · ${config.trackers?.length || 0} tracker(s)`
+      : `${config.onboarding_required ? "Onboarding incomplete" : "Operational"} · Wi-Fi configuration portal`;
+  els.deviceStateSummary.textContent = `${deviceNameFromConfig(config)} · ${config.role} · ${transport} · revision ${config.revision} · ${state}`;
+}
+
+async function showDeviceConfig(config) {
+  deviceSession.config = config;
+  renderDeviceConfig(els.deviceConfigFields, config);
+  summarizeDevice(config, deviceSession.mode === "wifi" ? "Wi-Fi" : "Bluetooth");
+  els.deviceConfigPanel.hidden = false;
+  els.trackerPairingPanel.hidden = config.role !== "tracker";
+  els.rollbackDevice.hidden = config.role === "repeater";
+  if (config.role === "tracker") {
+    els.pairingGateway.replaceChildren();
+    for (const gateway of devices.filter((device) => device.role === "gateway")) {
+      const option = document.createElement("option");
+      option.value = gateway.id;
+      option.textContent = gateway.name || gateway.id;
+      els.pairingGateway.append(option);
+    }
+    const selectedGateway = devices.find(
+      (device) => device.id === els.pairingGateway.value,
+    );
+    els.pairingGatewayAddress.value = selectedGateway?.address || "";
+    els.pairTrackerGateway.disabled =
+      !els.pairingGateway.options.length || !config.config_complete;
+    els.pairTrackerGateway.title = config.config_complete
+      ? ""
+      : "Save a complete tracker configuration before gateway pairing";
+  }
+  await persistCurrentDevice();
+}
+
+async function fetchBleConfig() {
+  const config = await deviceSession.manager.getConfig();
+  appendBleOutput(`Loaded ${config.role} configuration revision ${config.revision}.`);
+  await showDeviceConfig(config);
+}
+
+async function connectBle(bleId = null, knownRecord = null) {
+  await bleScanner.stop();
+  await resetDeviceSession();
+  const manager = new OnboardingManager(createBleTransport());
+  deviceSession = { mode: "ble", manager, ownerKey: null, config: null };
+  manager.transport.onDisconnect = () => {
+    if (deviceSession?.manager === manager) setBleStatus("Disconnected");
+  };
+  try {
+    setBleStatus("Connecting…");
+    const info = await manager.connect(bleId);
+    deviceSession.info = info;
+    deviceSession.record = knownRecord;
+    setBleStatus(`Connected · ${info.role}`);
+    const identity = info.device_id || knownRecord?.id;
+    if (!identity) throw new Error("Device did not provide its identity");
+    const bleIdentity = currentBleId(manager);
+    let ownerKey = await loadDeviceOwnerKey(
+      identity,
+      knownRecord?.id,
+      knownRecord?.bleId,
+      knownRecord?.credentialAliases,
+      bleIdentity,
+    );
+    const keyAction = ownerKeyAction(info, ownerKey);
+    if (keyAction === "claim") {
+      ownerKey ||= generateOwnerKey();
+      els.deviceStep.textContent = "Claiming this factory-reset device…";
+      // Persist before the one-way claim. If the app is killed or the response
+      // is lost, reconnecting reuses this key and retries CLAIM.
+      await storeDeviceOwnerKey(
+        identity,
+        ownerKey,
+        knownRecord?.id,
+        knownRecord?.bleId,
+        knownRecord?.credentialAliases,
+        bleIdentity,
+      );
+      await manager.claim(ownerKey);
+    } else if (keyAction === "auth") {
+      els.deviceStep.textContent = "Authenticating with the saved owner key…";
+      await manager.auth(ownerKey);
+    } else {
+      throw new Error("This device is already claimed by another app. Connect using the app that set it up, or factory reset the device.");
+    }
+    deviceSession.ownerKey = ownerKey;
+    await fetchBleConfig();
+    return info;
+  } catch (error) {
+    if (deviceSession?.manager === manager) deviceSession = null;
+    await manager.disconnect();
+    if (!els.onboardingPanel.hidden) await startUnpairedDeviceScan();
+    throw error;
+  }
+}
+
+async function connectWifi(address, ownerKey, record = null) {
+  const transport = new WifiDeviceTransport(address, ownerKey);
+  const info = await transport.getInfo();
+  const config = await transport.getConfig();
+  deviceSession = {
+    mode: "wifi",
+    wifi: transport,
+    address,
+    ownerKey,
+    record,
+    info,
+    config,
+  };
+  setBleStatus(`Connected · ${info.role} · Wi-Fi`);
+  await showDeviceConfig(config);
+}
+
+async function openSavedDevice(record) {
+  await resetDeviceSession();
+  els.deviceStep.textContent = `Connecting to ${record.name || record.id}…`;
+  const ownerKey = await loadDeviceOwnerKey(
+    record.id,
+    record.bleId,
+    record.credentialAliases,
+  );
+  try {
+    if (record.address && ownerKey) {
+      await connectWifi(record.address, ownerKey, record);
       return;
     }
-    const result = await onboardingManager.replaceCredential(
-      requireCredential(),
-    );
-    appendBleOutput(result);
-  } catch (e) {
-    appendBleOutput(`Error: ${e.message}`);
+  } catch (error) {
+    appendBleOutput(`Wi-Fi unavailable: ${error.message}. Trying Bluetooth.`);
   }
-});
-
-function loadConfigIntoForm(config) {
-  els.bleConfigForm.hidden = false;
-  els.cfgDeviceId.value = config.device_id || "";
-  els.cfgDeviceName.value = config.device_name || "";
-  els.cfgWifiSsid.value = config.wifi_ssid || "";
-  els.cfgWifiPassword.value = "";
-  els.cfgFrequency.value = config.lora?.frequency_hz ?? "";
-  els.cfgTxPower.value = config.lora?.tx_power_dbm ?? "";
-  els.cfgSf.value = config.lora?.sf ?? "";
-  els.cfgHopLimit.value = config.lora?.relay_hop_limit ?? "";
-  els.cfgTxInterval.value = config.communication?.tx_interval_s ?? "";
-  els.cfgAckTimeout.value = config.communication?.ack_timeout_ms ?? "";
-  els.cfgMovingSleep.value = config.sleep?.moving_s ?? "";
-  els.cfgStationarySleep.value = config.sleep?.stationary_s ?? "";
-  els.cfgRadioKey.value = config.lora_aead_key || "";
+  try {
+    await connectBle(record.bleId, record);
+  } catch (error) {
+    setBleStatus(`Error: ${error.message}`);
+    els.deviceAddressRow.hidden = false;
+    els.deviceAddress.value = record.address || "";
+  }
 }
 
-els.bleRevealKey.addEventListener("click", () => {
-  const showing = els.cfgRadioKey.type === "text";
-  els.cfgRadioKey.type = showing ? "password" : "text";
-  els.bleRevealKey.textContent = showing ? "Show key" : "Hide key";
-});
-
-els.bleGetConfig.addEventListener("click", async () => {
-  try {
-    appendBleOutput("Fetching config...");
-    const result = await onboardingManager.getConfig();
-    appendBleOutput(`Configuration revision ${result.revision} loaded.`);
-    loadConfigIntoForm(result);
-  } catch (e) {
-    appendBleOutput(`Error: ${e.message}`);
+els.onboardingButton.addEventListener("click", () => {
+  els.onboardingPanel.hidden = !els.onboardingPanel.hidden;
+  if (!els.onboardingPanel.hidden) {
+    renderDeviceInventory();
+    startUnpairedDeviceScan();
   }
 });
 
-els.bleSaveConfig.addEventListener("click", async () => {
+els.addBleDevice.addEventListener("click", async () => {
   try {
-    const fields = {};
-    if (els.cfgDeviceId.value) fields.device_id = els.cfgDeviceId.value;
-    if (els.cfgDeviceName.value) fields.device_name = els.cfgDeviceName.value;
-    if (els.cfgWifiSsid.value) fields.wifi_ssid = els.cfgWifiSsid.value;
-    if (els.cfgWifiPassword.value)
-      fields.wifi_password = els.cfgWifiPassword.value;
-    const numericFields = [
-      ["lora_frequency_hz", els.cfgFrequency],
-      ["lora_tx_power_dbm", els.cfgTxPower],
-      ["lora_sf", els.cfgSf],
-      ["lora_relay_hop_limit", els.cfgHopLimit],
-      ["lora_tx_interval_s", els.cfgTxInterval],
-      ["lora_ack_timeout_ms", els.cfgAckTimeout],
-      ["moving_sleep_s", els.cfgMovingSleep],
-      ["stationary_sleep_s", els.cfgStationarySleep],
-    ];
-    for (const [name, input] of numericFields) {
-      if (input.value !== "") fields[name] = input.value;
-    }
+    await connectBle();
+  } catch (error) {
+    setBleStatus(`Error: ${error.message}`);
+  }
+});
 
-    if (!onboardingManager.lastConfig)
-      throw new Error("Must fetch config first");
-
-    appendBleOutput("Saving config...");
-    const result = await onboardingManager.patchConfig(
-      onboardingManager.lastConfig.revision,
-      fields,
+els.connectIpDevice.addEventListener("click", async () => {
+  try {
+    // Identify the endpoint before selecting a local key. Reusing the active
+    // session's key for an arbitrary typed IP can suppress a legitimate first
+    // claim or authenticate against the wrong device.
+    const probe = new WifiDeviceTransport(els.deviceAddress.value);
+    const info = await probe.getInfo();
+    const matchingRecord = devices.find((device) => device.id === info.device_id);
+    let ownerKey = await loadDeviceOwnerKey(
+      info.device_id,
+      matchingRecord?.bleId,
+      matchingRecord?.credentialAliases,
     );
+    const keyAction = ownerKeyAction(info, ownerKey);
+    if (keyAction === "claim") {
+      ownerKey ||= generateOwnerKey();
+      await storeDeviceOwnerKey(info.device_id, ownerKey);
+      await probe.claim(ownerKey);
+    }
+    if (keyAction === "unavailable") throw new Error("This device is already claimed and its owner key is not in this app");
+    await connectWifi(els.deviceAddress.value, ownerKey, matchingRecord);
+  } catch (error) {
+    appendBleOutput(`Connection failed: ${error.message}`);
+  }
+});
+
+async function patchCurrentDevice(fields) {
+  const revision = deviceSession.config.revision;
+  if (deviceSession.mode === "wifi") {
+    return deviceSession.wifi.patchConfig(revision, fields);
+  }
+  return deviceSession.manager.patchConfig(revision, fields);
+}
+
+els.saveDeviceConfig.addEventListener("click", async () => {
+  try {
+    const fields = collectDeviceConfig(els.deviceConfigFields);
+    appendBleOutput("Validating and saving the complete configuration…");
+    const result = await patchCurrentDevice(fields);
     appendBleOutput(result);
-    // Refresh to get updated revision
-    els.bleGetConfig.click();
-  } catch (e) {
-    appendBleOutput(`Error: ${e.message}`);
+    if (result.reboot_required) {
+      if (deviceSession.config.role === "tracker") {
+        if (fields.device_id) deviceSession.config.device_id = fields.device_id;
+        if (fields.device_name) deviceSession.config.device_name = fields.device_name;
+      } else {
+        if (fields.gateway_id) deviceSession.config.gateway_id = fields.gateway_id;
+        if (fields.gateway_name) deviceSession.config.gateway_name = fields.gateway_name;
+        if (fields.wifi_ssid) {
+          deviceSession.address = `http://lora-gateway-${deviceSession.config.gateway_id}.local`;
+          deviceSession.config.network_ip = "off";
+        }
+      }
+      await persistCurrentDevice();
+      appendBleOutput("Saved. The device is rebooting; reconnect from the saved device list when it is ready.");
+      return;
+    }
+    const config = deviceSession.mode === "wifi"
+      ? await deviceSession.wifi.getConfig()
+      : await deviceSession.manager.getConfig();
+    await showDeviceConfig(config);
+  } catch (error) {
+    appendBleOutput(`Save failed: ${error.message}`);
   }
 });
 
-els.bleRollback.addEventListener("click", async () => {
+els.refreshDeviceConfig.addEventListener("click", async () => {
   try {
-    const result = await onboardingManager.rollback();
-    if (result) appendBleOutput(result);
-  } catch (e) {
-    appendBleOutput(`Error: ${e.message}`);
+    const config = deviceSession.mode === "wifi"
+      ? await deviceSession.wifi.getConfig()
+      : await deviceSession.manager.getConfig();
+    await showDeviceConfig(config);
+  } catch (error) {
+    appendBleOutput(`Refresh failed: ${error.message}`);
   }
 });
 
-els.bleReboot.addEventListener("click", async () => {
+els.enableDeviceConfigMode.addEventListener("click", async () => {
   try {
-    const result = await onboardingManager.reboot();
-    if (result) appendBleOutput(result);
-  } catch (e) {
-    appendBleOutput(`Error: ${e.message}`);
+    const result = deviceSession.mode === "wifi"
+      ? await deviceSession.wifi.enterConfigMode()
+      : await deviceSession.manager.enterConfigMode();
+    appendBleOutput(result);
+    appendBleOutput(result.reboot_required
+      ? "The tracker is rebooting into configuration mode. Wait for Wi-Fi, then upload with PlatformIO within the setup window."
+      : "Configuration and authenticated PlatformIO OTA are enabled for 10 minutes.");
+  } catch (error) {
+    appendBleOutput(`Could not enable configuration mode: ${error.message}`);
   }
 });
 
-els.bleFactoryReset.addEventListener("click", async () => {
+els.exportDeviceQr.addEventListener("click", async () => {
   try {
-    const result = await onboardingManager.factoryReset();
-    if (result) appendBleOutput(result);
-  } catch (e) {
-    appendBleOutput(`Error: ${e.message}`);
+    const record = deviceSession?.record;
+    const ownerKey = deviceSession?.ownerKey || await loadDeviceOwnerKey(
+      record?.id,
+      record?.bleId,
+      record?.credentialAliases,
+    );
+    const payload = createDeviceTransfer(record, ownerKey);
+    els.deviceQrImage.src = await renderDeviceTransferQr(payload);
+    els.deviceQrPanel.hidden = false;
+  } catch (error) {
+    appendBleOutput(`QR export failed: ${error.message}`);
   }
 });
+
+els.closeDeviceQr.addEventListener("click", () => {
+  els.deviceQrPanel.hidden = true;
+  els.deviceQrImage.removeAttribute("src");
+});
+
+els.copyDeviceOwnerKey.addEventListener("click", async () => {
+  try {
+    const record = deviceSession?.record;
+    const ownerKey = deviceSession?.ownerKey || await loadDeviceOwnerKey(
+      record?.id,
+      record?.bleId,
+      record?.credentialAliases,
+    );
+    if (!ownerKey) throw new Error("No owner key is stored for this device");
+    await navigator.clipboard.writeText(ownerKey);
+    appendBleOutput("Owner key copied. Treat the clipboard as full device authority and clear it after the PlatformIO upload.");
+  } catch (error) {
+    appendBleOutput(`Could not copy owner key: ${error.message}`);
+  }
+});
+
+els.importDeviceQrButton.addEventListener("click", () => {
+  els.importDeviceQrInput.click();
+});
+
+els.importDeviceQrInput.addEventListener("change", async () => {
+  const file = els.importDeviceQrInput.files?.[0];
+  els.importDeviceQrInput.value = "";
+  if (!file) return;
+  try {
+    const transfer = await scanDeviceTransferImage(file);
+    const previous = devices.find((device) => device.id === transfer.device.id) || {};
+    const record = {
+      ...previous,
+      ...transfer.device,
+      bleId: previous.bleId || null,
+      credentialAliases: uniqueValues(previous.credentialAliases || []),
+      lastSeen: new Date().toISOString(),
+    };
+    devices = [...devices.filter((device) => device.id !== record.id), record];
+    await saveDevices(devices);
+    await storeDeviceOwnerKey(record.id, transfer.owner_key);
+    renderDeviceInventory();
+    appendBleOutput(`Imported owner access for ${record.name || record.id}.`);
+  } catch (error) {
+    appendBleOutput(`QR import failed: ${error.message}`);
+  }
+});
+
+async function connectGatewayForPairing(gateway) {
+  const ownerKey = await loadDeviceOwnerKey(
+    gateway.id,
+    gateway.bleId,
+    gateway.credentialAliases,
+  );
+  if (!ownerKey) {
+    throw new Error(
+      "The saved gateway authorization is missing. Open the gateway once over Bluetooth to recover it, or factory reset and claim it again",
+    );
+  }
+  let wifiError;
+  if (gateway.address) {
+    try {
+      const wifi = new WifiDeviceTransport(gateway.address, ownerKey);
+      const config = await wifi.getConfig();
+      if (config.role !== "gateway" || config.gateway_id !== gateway.id) {
+        throw new Error("the address belongs to a different device");
+      }
+      return {
+        registerTracker: (tracker) => wifi.registerTracker(tracker),
+        close: async () => {},
+      };
+    } catch (error) {
+      wifiError = error;
+      appendBleOutput(`Gateway Wi-Fi unavailable: ${error.message}. Trying Bluetooth…`);
+    }
+  }
+  if (!gateway.bleId) {
+    throw new Error(
+      wifiError
+        ? `Could not reach the gateway at ${gateway.address}: ${wifiError.message}`
+        : "The gateway has neither a saved network address nor Bluetooth identity",
+    );
+  }
+  const manager = new OnboardingManager(createBleTransport());
+  try {
+    const info = await manager.connect(gateway.bleId);
+    if (info.role !== "gateway" || info.device_id !== gateway.id) {
+      throw new Error("Bluetooth identity does not match the selected gateway");
+    }
+    await manager.auth(ownerKey);
+    return {
+      registerTracker: (tracker) => manager.registerTracker(tracker),
+      close: () => manager.disconnect(),
+    };
+  } catch (error) {
+    await manager.disconnect();
+    throw error;
+  }
+}
+
+els.pairingGateway.addEventListener("change", () => {
+  const gateway = devices.find((device) => device.id === els.pairingGateway.value);
+  els.pairingGatewayAddress.value = gateway?.address || "";
+});
+
+els.pairTrackerGateway.addEventListener("click", async () => {
+  const trackerConfig = deviceSession?.config;
+  let gateway = devices.find((device) => device.id === els.pairingGateway.value);
+  if (!trackerConfig || trackerConfig.role !== "tracker" || !gateway) return;
+  if (!trackerConfig.config_complete) {
+    appendBleOutput("Save and verify the tracker configuration before pairing.");
+    return;
+  }
+  const trackerTransport = deviceSession.mode === "wifi"
+    ? deviceSession.wifi
+    : deviceSession.manager;
+  try {
+    els.pairTrackerGateway.disabled = true;
+    const enteredAddress = els.pairingGatewayAddress.value.trim();
+    if (enteredAddress && enteredAddress !== gateway.address) {
+      gateway = { ...gateway, address: enteredAddress };
+      devices = devices.map((device) =>
+        device.id === gateway.id ? gateway : device,
+      );
+      await saveDevices(devices);
+      renderDeviceInventory();
+    }
+    const result = await pairTrackerTransaction({
+      trackerConfig,
+      gatewayRecord: gateway,
+      openGateway: connectGatewayForPairing,
+      confirmTracker: (gatewayId) => trackerTransport.pairGateway(gatewayId),
+      onStep: (_step, message) => appendBleOutput(`${message}…`),
+    });
+    deviceSession.config = {
+      ...trackerConfig,
+      gateway_paired: true,
+      paired_gateway_id: result.confirmation.gateway_id,
+      paired_gateway_ids: [
+        ...new Set([
+          ...(trackerConfig.paired_gateway_ids || []),
+          result.confirmation.gateway_id,
+        ]),
+      ],
+      onboarding_required: Boolean(result.confirmation.onboarding_required),
+    };
+    await persistCurrentDevice();
+    summarizeDevice(
+      deviceSession.config,
+      deviceSession.mode === "wifi" ? "Wi-Fi" : "Bluetooth",
+    );
+    appendBleOutput("Pairing complete. The tracker may now leave setup mode and begin tracking.");
+  } catch (error) {
+    appendBleOutput(`Pairing incomplete: ${error.message}.`);
+  } finally {
+    els.pairTrackerGateway.disabled = false;
+  }
+});
+
+els.rollbackDevice.addEventListener("click", async () => {
+  if (!confirm("Restore the previous configuration and reboot?")) return;
+  try {
+    const result = deviceSession.mode === "wifi"
+      ? await deviceSession.wifi.rollback(deviceSession.config.revision)
+      : await deviceSession.manager.transport.sendCommand(`ROLLBACK ${deviceSession.config.revision}`);
+    appendBleOutput(result);
+  } catch (error) { appendBleOutput(`Rollback failed: ${error.message}`); }
+});
+
+els.rebootDevice.addEventListener("click", async () => {
+  if (!confirm("Reboot this device?")) return;
+  try {
+    const result = deviceSession.mode === "wifi"
+      ? await deviceSession.wifi.reboot()
+      : await deviceSession.manager.transport.sendCommand("REBOOT");
+    appendBleOutput(result);
+  } catch (error) { appendBleOutput(`Reboot failed: ${error.message}`); }
+});
+
+els.factoryResetDevice.addEventListener("click", async () => {
+  if (!confirm("Factory reset this device and erase its configuration?")) return;
+  try {
+    const result = deviceSession.mode === "wifi"
+      ? await deviceSession.wifi.factoryReset()
+      : await deviceSession.manager.transport.sendCommand("FACTORY_RESET FACTORY_RESET");
+    appendBleOutput(result);
+    const id = deviceSession?.record?.id || deviceIdFromConfig(deviceSession?.config);
+    const aliases = [
+      id,
+      deviceSession?.record?.bleId,
+      deviceSession?.record?.credentialAliases,
+      currentBleId(deviceSession?.manager),
+    ];
+    devices = devices.filter((device) => device.id !== id);
+    await saveDevices(devices);
+    await removeDeviceOwnerKey(...aliases);
+    if (id) await storeDeviceSecret(id, null, "lora-key");
+    await resetDeviceSession();
+    renderDeviceInventory();
+    renderUnpairedDevices();
+  } catch (error) { appendBleOutput(`Factory reset failed: ${error.message}`); }
+});
+
+els.forgetDevice.addEventListener("click", async () => {
+  const id = deviceSession?.record?.id || deviceIdFromConfig(deviceSession?.config);
+  if (!id || !confirm(`Forget ${id} from this app? This does not reset the hardware.`)) return;
+  devices = devices.filter((device) => device.id !== id);
+  await saveDevices(devices);
+  await removeDeviceOwnerKey(
+    id,
+    deviceSession?.record?.bleId,
+    deviceSession?.record?.credentialAliases,
+  );
+  await storeDeviceSecret(id, null, "lora-key");
+  await resetDeviceSession();
+  renderDeviceInventory();
+});
+
+renderDeviceInventory();
+renderUnpairedDevices();
+startUnpairedDeviceScan();
 
 async function importPmtiles(file) {
   // Validate and display before replacing the persisted archive.
@@ -301,7 +815,7 @@ async function importPmtiles(file) {
   els.mapLayer.querySelector('option[value="pmtiles"]').disabled = false;
   els.mapLayer.value = "pmtiles";
   mapLayerType = "pmtiles";
-  saveSettings();
+  await saveSettings();
 }
 
 els.importPmtilesButton.addEventListener("click", async () => {
@@ -343,8 +857,13 @@ function updateAlertsButtonState() {
 }
 
 els.enableAlertsButton.addEventListener("click", async () => {
-  if (await alertsManager.requestPermission()) {
-    updateAlertsButtonState();
+  try {
+    if (await alertsManager.requestPermission()) {
+      updateAlertsButtonState();
+    }
+  } catch (error) {
+    console.warn("Could not enable alerts", error);
+    els.connectionMessage.textContent = `Could not enable alerts: ${error.message}`;
   }
 });
 updateAlertsButtonState();
@@ -361,16 +880,13 @@ els.pmtilesInput?.addEventListener("change", async (e) => {
   }
 });
 
-function saveSettings() {
-  localStorage.setItem(
-    "lora-tracker.web.settings",
-    JSON.stringify({
-      brokerUrl: els.brokerUrl.value.trim(),
-      baseTopic: els.baseTopic.value.trim() || "lora-tracker",
-      username: els.username.value.trim(),
-      mapLayerType,
-    }),
-  );
+async function saveSettings() {
+  await savePlatformSettings({
+    brokerUrl: els.brokerUrl.value.trim(),
+    baseTopic: els.baseTopic.value.trim() || "lora-tracker",
+    username: els.username.value.trim(),
+    mapLayerType,
+  });
 }
 
 function setConnectionState(state, message = "") {
@@ -555,16 +1071,26 @@ function parseTopic(topic) {
 
 mqtt.addEventListener("status", (event) => {
   const state = event.detail.state;
+  const insecureTransport = els.brokerUrl.value
+    .trim()
+    .toLowerCase()
+    .startsWith("ws://");
   connected = state === "online";
   setConnectionState(
     state,
     state === "reconnecting"
-      ? `Reconnecting in ${Math.round(event.detail.delay / 1000)} seconds…`
+      ? `${event.detail.error || "Connection failed."} Retrying in ${Math.round(event.detail.delay / 1000)} seconds…`
       : state === "online"
-        ? "Subscribed to tracker telemetry and history responses."
+        ? insecureTransport
+          ? "Connected over unencrypted MQTT WebSocket. Traffic and credentials are visible on the network."
+          : "Subscribed to tracker telemetry and history responses."
         : state === "connecting"
-          ? "Opening secure MQTT WebSocket…"
-          : "Not connected.",
+          ? event.detail.previousError
+            ? `${event.detail.previousError} Retrying now…`
+            : insecureTransport
+              ? "Opening unencrypted MQTT WebSocket…"
+              : "Opening secure MQTT WebSocket…"
+          : event.detail.message || "Not connected.",
   );
   if (state === "online") {
     const base = els.baseTopic.value.trim() || "lora-tracker";
@@ -632,22 +1158,29 @@ mqtt.addEventListener("message", async (event) => {
   }
 });
 
-els.connectButton.addEventListener("click", () => {
+els.connectButton.addEventListener("click", async () => {
   if (connected || els.connectButton.textContent === "Disconnect") {
     mqtt.disconnect();
     connected = false;
     setConnectionState("offline", "Disconnected by user.");
     return;
   }
-  const url = els.brokerUrl.value.trim();
-  if (!/^wss?:\/\//i.test(url)) {
-    els.connectionMessage.textContent =
-      "Enter an MQTT WebSocket URL beginning with ws:// or wss://.";
+  const url = normalizeBrokerWebSocketUrl(els.brokerUrl.value);
+  els.brokerUrl.value = url;
+  const transportPolicy = evaluateBrokerTransport(url, {
+    native: isNativeApp,
+    pageProtocol: location.protocol,
+  });
+  if (!transportPolicy.allowed) {
+    els.connectionMessage.textContent = transportPolicy.message;
     return;
   }
-  if (location.protocol === "https:" && !url.toLowerCase().startsWith("wss://")) {
-    els.connectionMessage.textContent =
-      "This HTTPS page requires a secure wss:// MQTT WebSocket endpoint.";
+  if (
+    isNativeApp && transportPolicy.insecure &&
+    !confirm(
+      "This MQTT connection is not encrypted. Your broker password, locations, history and commands may be read or changed by devices on the network. Continue?",
+    )
+  ) {
     return;
   }
   const baseTopic = els.baseTopic.value.trim();
@@ -661,7 +1194,15 @@ els.connectButton.addEventListener("click", () => {
       "Base topic must be a concrete MQTT topic without wildcards.";
     return;
   }
-  saveSettings();
+  try {
+    await saveSettings();
+    await storeMqttPassword(els.password.value);
+  } catch (error) {
+    console.warn("Could not persist application settings", error);
+    els.connectionMessage.textContent =
+      "Could not save settings securely. Connection was not started.";
+    return;
+  }
   mqtt.connect({
     url,
     username: els.username.value.trim(),
@@ -728,6 +1269,18 @@ async function restoreCachedTrackers() {
   }
 }
 restoreCachedTrackers();
-if ("serviceWorker" in navigator)
+try {
+  await addAppStateListener((isActive) => {
+    if (isActive) {
+      mapManager.invalidateSize();
+      startUnpairedDeviceScan();
+    } else {
+      bleScanner.stop().catch((error) => console.warn("Could not pause Bluetooth discovery", error));
+    }
+  });
+} catch (error) {
+  console.warn("Application lifecycle integration is unavailable", error);
+}
+if (!isNativeApp && "serviceWorker" in navigator)
   navigator.serviceWorker.register("./sw.js").catch(console.warn);
-setConnectionState("offline", "Not connected.");
+setConnectionState("offline", startupWarning || "Not connected.");

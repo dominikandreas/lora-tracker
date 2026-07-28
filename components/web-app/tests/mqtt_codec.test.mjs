@@ -7,6 +7,7 @@ import {
   encodePublish,
   parsePackets,
   decodePublish,
+  mqttConnectRejectionMessage,
 } from "../mqtt.js";
 
 test("remaining length round trip", () => {
@@ -36,4 +37,9 @@ test("publish packet round trip", () => {
   const publish = decodePublish(parsed.packets[0]);
   assert.equal(publish.topic, "lora-tracker/v1/test");
   assert.equal(publish.payload, '{"ok":true}');
+});
+
+test("MQTT connection rejection codes are actionable", () => {
+  assert.match(mqttConnectRejectionMessage(4), /bad username or password/);
+  assert.match(mqttConnectRejectionMessage(5), /not authorized/);
 });

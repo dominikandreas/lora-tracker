@@ -1,3 +1,6 @@
+import L from "leaflet";
+import { PMTiles, TileType, leafletRasterLayer } from "pmtiles";
+
 export class MapManager {
   constructor(containerId) {
     this.map = L.map(containerId).setView([51.1657, 10.4515], 6);
@@ -39,14 +42,14 @@ export class MapManager {
           return { data: await slice.arrayBuffer() };
         },
       };
-      const archive = new pmtiles.PMTiles(source);
+      const archive = new PMTiles(source);
       const header = await archive.getHeader();
-      if (header.tileType === pmtiles.TileType.Mvt) {
+      if (header.tileType === TileType.Mvt) {
         throw new Error(
           "Vector PMTiles are not supported; import a raster archive",
         );
       }
-      nextLayer = pmtiles.leafletRasterLayer(archive, {
+      nextLayer = leafletRasterLayer(archive, {
         attribution: "Offline PMTiles archive",
       });
     } else if (type === "osm") {
@@ -100,6 +103,10 @@ export class MapManager {
     if (bounds && bounds.isValid()) {
       this.map.fitBounds(bounds, { padding: [50, 50] });
     }
+  }
+
+  invalidateSize() {
+    this.map.invalidateSize({ pan: false });
   }
 
   clearLocal() {

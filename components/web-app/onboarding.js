@@ -1,3 +1,9 @@
+import { Capacitor } from "@capacitor/core";
+import { BleClient } from "@capacitor-community/bluetooth-le";
+
+const SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+const TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
 export class BleTransport {
   constructor(adapter = navigator.bluetooth) {
     this.adapter = adapter;
@@ -11,6 +17,7 @@ export class BleTransport {
     this.disconnectHandler = this.onDisconnected.bind(this);
     this.notificationHandler = this.onNotification.bind(this);
     this.onDisconnect = null;
+    this.disconnected = true;
   }
 
   get isSupported() {
@@ -27,6 +34,7 @@ export class BleTransport {
       filters: [{ services: ["6e400001-b5a3-f393-e0a9-e50e24dcca9e"] }],
       optionalServices: ["6e400001-b5a3-f393-e0a9-e50e24dcca9e"],
     });
+    this.disconnected = false;
 
     this.device.addEventListener(
       "gattserverdisconnected",
@@ -65,6 +73,8 @@ export class BleTransport {
   }
 
   onDisconnected() {
+    if (this.disconnected) return;
+    this.disconnected = true;
     if (this.tx) {
       this.tx.removeEventListener(
         "characteristicvaluechanged",
@@ -98,7 +108,7 @@ export class BleTransport {
     const value = this.decoder.decode(event.target.value, { stream: true });
     this.buffer += value;
 
-    if (this.buffer.length > 4096) {
+    if (this.buffer.length > 32768) {
       this.buffer = ""; // Prevent infinite growth on malformed data
       return;
     }
@@ -139,7 +149,7 @@ export class BleTransport {
 
   async sendCommand(cmd, timeoutMs = 5000) {
     if (!this.rx) throw new Error("Not connected");
-    if (new TextEncoder().encode(cmd).length > 1534)
+    if (new TextEncoder().encode(cmd).length > 16382)
       throw new Error("Command too long");
 
     return new Promise((resolve, reject) => {
@@ -176,10 +186,189 @@ export class BleTransport {
         clearTimeout(cmd.timer);
         this.activeCommand = null;
         cmd.reject(e);
-        this.processQueue();
       }
+      this.disconnect();
     }
   }
+}
+
+export class NativeBleTransport extends BleTransport {
+  constructor(client = BleClient) {
+    super(null);
+    this.client = client;
+    this.deviceId = null;
+  }
+
+  get isSupported() {
+    return Capacitor.isNativePlatform();
+  }
+
+  async connect(deviceId = null) {
+    await this.client.initialize({ androidNeverForLocation: true });
+    if (deviceId) {
+      this.deviceId = deviceId;
+    } else {
+      const device = await this.client.requestDevice({ services: [SERVICE_UUID] });
+      this.deviceId = device.deviceId;
+    }
+    this.disconnected = false;
+    try {
+      await this.client.connect(
+        this.deviceId,
+        () => this.onDisconnected(),
+        { timeout: 10000 },
+      );
+      await this.client.startNotifications(
+        this.deviceId,
+        SERVICE_UUID,
+        TX_UUID,
+        (value) => this.onNotification({ target: { value } }),
+        { timeout: 5000 },
+      );
+      // The base transport uses rx as its connected/write-ready marker.
+      this.rx = true;
+    } catch (error) {
+      await this.disconnect();
+      throw error instanceof Error ? error : new Error(String(error));
+    }
+  }
+
+  async disconnect() {
+    const deviceId = this.deviceId;
+    this.deviceId = null;
+    if (deviceId) {
+      try {
+        await this.client.stopNotifications(deviceId, SERVICE_UUID, TX_UUID);
+      } catch {}
+      try {
+        await this.client.disconnect(deviceId);
+      } catch {}
+    }
+    this.finishDisconnect();
+  }
+
+  onDisconnected() {
+    this.deviceId = null;
+    this.finishDisconnect();
+  }
+
+  finishDisconnect() {
+    if (this.disconnected) return;
+    this.disconnected = true;
+    this.rx = null;
+    this.buffer = "";
+    this.decoder = new TextDecoder();
+    const error = new Error("BLE Disconnected");
+    if (this.activeCommand) {
+      clearTimeout(this.activeCommand.timer);
+      this.activeCommand.reject(error);
+      this.activeCommand = null;
+    }
+    for (const cmd of this.queue) cmd.reject(error);
+    this.queue = [];
+    this.onDisconnect?.();
+  }
+
+  async processQueue() {
+    if (this.activeCommand || this.queue.length === 0) return;
+    if (!this.deviceId) {
+      this.finishDisconnect();
+      return;
+    }
+
+    const cmd = this.queue.shift();
+    this.activeCommand = cmd;
+    cmd.timer = setTimeout(() => {
+      if (this.activeCommand === cmd) {
+        this.activeCommand = null;
+        cmd.reject(new Error("Command timeout"));
+        this.disconnect();
+      }
+    }, cmd.timeoutMs);
+
+    try {
+      const payload = new TextEncoder().encode(`${cmd.cmd}\n`);
+      for (let offset = 0; offset < payload.length; offset += 18) {
+        const chunk = payload.slice(offset, offset + 18);
+        await this.client.write(
+          this.deviceId,
+          SERVICE_UUID,
+          RX_UUID,
+          new DataView(chunk.buffer, chunk.byteOffset, chunk.byteLength),
+          { timeout: 5000 },
+        );
+      }
+    } catch (error) {
+      if (this.activeCommand === cmd) {
+        clearTimeout(cmd.timer);
+        this.activeCommand = null;
+        cmd.reject(error);
+      }
+      await this.disconnect();
+    }
+  }
+}
+
+export function createBleTransport() {
+  return Capacitor.isNativePlatform() ? new NativeBleTransport() : new BleTransport();
+}
+
+// Discovery is deliberately separate from connecting.  A scan must never try
+// to connect to every advertisement: that would wake trackers and repeatedly
+// trigger device connections. The app keeps the scan running at the platform-selected
+// low-power rate and lets the operator choose an unpaired tracker.
+export class BleDeviceScanner {
+  constructor(client = BleClient) {
+    this.client = client;
+    this.running = false;
+  }
+
+  get isSupported() {
+    return Capacitor.isNativePlatform() || Boolean(navigator.bluetooth?.requestLEScan);
+  }
+
+  async start(onDevice) {
+    if (this.running || !this.isSupported) return;
+    if (Capacitor.isNativePlatform()) {
+      await this.client.initialize({ androidNeverForLocation: true });
+      await this.client.requestLEScan(
+        { services: [SERVICE_UUID], allowDuplicates: false },
+        (result) => onDevice?.(result.device || result),
+      );
+      this.running = true;
+      return;
+    }
+
+    const scan = await navigator.bluetooth.requestLEScan({
+      filters: [{ services: [SERVICE_UUID] }],
+      keepRepeatedDevices: false,
+    });
+    const listener = (event) => onDevice?.({
+      deviceId: event.device.id,
+      name: event.device.name,
+    });
+    navigator.bluetooth.addEventListener("advertisementreceived", listener);
+    this.stopWebScan = () => {
+      navigator.bluetooth.removeEventListener("advertisementreceived", listener);
+      scan.stop();
+    };
+    this.running = true;
+  }
+
+  async stop() {
+    if (!this.running) return;
+    this.running = false;
+    if (Capacitor.isNativePlatform()) {
+      await this.client.stopLEScan();
+    } else {
+      this.stopWebScan?.();
+      this.stopWebScan = null;
+    }
+  }
+}
+
+export function createBleDeviceScanner() {
+  return new BleDeviceScanner();
 }
 
 export class OnboardingManager {
@@ -187,31 +376,40 @@ export class OnboardingManager {
     this.transport = transport;
   }
 
-  async connectTracker() {
-    await this.transport.connect();
+  async connect(deviceId = null) {
+    await this.transport.connect(deviceId);
+    this.info = await this.transport.sendCommand("INFO");
+    if (!this.info || !["tracker", "gateway"].includes(this.info.role)) {
+      throw new Error("Unsupported device configuration service");
+    }
+    return this.info;
   }
 
   disconnect() {
-    this.transport.disconnect();
+    return this.transport.disconnect();
   }
 
-  async claim(password) {
-    return this.transport.sendCommand(`CLAIM ${password}`);
+  async claim(ownerKey) {
+    return this.transport.sendCommand(`CLAIM ${ownerKey}`);
   }
 
-  async auth(password) {
-    return this.transport.sendCommand(`AUTH ${password}`);
+  async auth(ownerKey) {
+    return this.transport.sendCommand(`AUTH ${ownerKey}`);
+  }
+
+  async enterConfigMode() {
+    return this.transport.sendCommand("ENTER_CONFIG_MODE", 15000);
   }
 
   async getConfig() {
-    this.lastConfig = await this.transport.sendCommand("GET CONFIG");
+    this.lastConfig = await this.transport.sendCommand("GET CONFIG", 15000);
     if (
       !this.lastConfig ||
-      this.lastConfig.role !== "tracker" ||
+      !["tracker", "gateway"].includes(this.lastConfig.role) ||
       !Number.isSafeInteger(this.lastConfig.revision)
     ) {
       this.lastConfig = null;
-      throw new Error("Tracker returned an invalid configuration response");
+      throw new Error("Device returned an invalid configuration response");
     }
     return this.lastConfig;
   }
@@ -221,11 +419,24 @@ export class OnboardingManager {
       expected_revision: expectedRevision,
       ...fields,
     }).toString();
-    return this.transport.sendCommand(`PATCH ${params}`);
+    return this.transport.sendCommand(`PATCH ${params}`, 30000);
   }
 
-  async replaceCredential(password) {
-    return this.transport.sendCommand(`SET_CREDENTIAL ${password}`);
+  async pairGateway(gatewayId) {
+    return this.transport.sendCommand(`PAIR_GATEWAY ${gatewayId}`);
+  }
+
+  async registerTracker(tracker) {
+    const params = new URLSearchParams({
+      device_id: tracker.device_id,
+      device_name: tracker.device_name,
+      lora_aead_key: tracker.lora_aead_key,
+    }).toString();
+    return this.transport.sendCommand(`REGISTER_TRACKER ${params}`, 30000);
+  }
+
+  async unpairGateway() {
+    return this.transport.sendCommand("UNPAIR_GATEWAY");
   }
 
   async rollback() {

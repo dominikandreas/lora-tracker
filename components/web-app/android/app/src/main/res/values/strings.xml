@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">LoRa Tracker</string>
+    <string name="title_activity_main">LoRa Tracker</string>
+    <string name="package_name">de.dominikandreas.loratracker</string>
+    <string name="custom_url_scheme">de.dominikandreas.loratracker</string>
+</resources>

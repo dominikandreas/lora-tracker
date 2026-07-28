@@ -130,6 +130,17 @@ export function decodePublish(packetData) {
   };
 }
 
+export function mqttConnectRejectionMessage(code) {
+  const reasons = {
+    1: "unsupported MQTT protocol version",
+    2: "client identifier rejected",
+    3: "broker unavailable",
+    4: "bad username or password",
+    5: "not authorized",
+  };
+  return `MQTT connection rejected (${code}: ${reasons[code] || "unknown reason"})`;
+}
+
 export class MqttWebSocketClient extends EventTarget {
   constructor() {
     super();
@@ -142,11 +153,15 @@ export class MqttWebSocketClient extends EventTarget {
     this.buffer = new Uint8Array();
     this.options = null;
     this.subscriptions = new Set();
+    this.lastErrorMessage = "";
+    this.mqttConnected = false;
   }
 
   connect(options) {
     this.options = { keepAlive: 30, ...options };
     this.manualClose = false;
+    this.lastErrorMessage = "";
+    this.mqttConnected = false;
     clearTimeout(this.reconnectTimer);
     this.#open();
   }
@@ -155,16 +170,26 @@ export class MqttWebSocketClient extends EventTarget {
     this.dispatchEvent(new CustomEvent(name, { detail }));
   }
 
+  #reportError(message) {
+    this.lastErrorMessage = message;
+    this.#emit("error", { message });
+  }
+
   #open() {
     if (!this.options) return;
     this.buffer = new Uint8Array();
-    this.#emit("status", { state: "connecting" });
+    this.mqttConnected = false;
+    this.#emit("status", {
+      state: "connecting",
+      previousError: this.lastErrorMessage,
+    });
     let socket;
     try {
       socket = new WebSocket(this.options.url, ["mqtt"]);
     } catch (error) {
-      this.#emit("error", { message: `Invalid WebSocket URL: ${error.message}` });
-      this.#emit("status", { state: "offline" });
+      const message = `Invalid WebSocket URL: ${error.message}`;
+      this.#reportError(message);
+      this.#emit("status", { state: "offline", message });
       return;
     }
     socket.binaryType = "arraybuffer";
@@ -180,20 +205,38 @@ export class MqttWebSocketClient extends EventTarget {
       );
     };
     socket.onmessage = (event) => this.#onBytes(new Uint8Array(event.data));
-    socket.onerror = () =>
-      this.#emit("error", { message: "WebSocket transport error" });
-    socket.onclose = () => {
+    socket.onerror = () => {
+      const secure = this.options.url.toLowerCase().startsWith("wss://");
+      this.#reportError(
+        secure
+          ? "Secure WebSocket connection failed. Check the broker WebSocket port/path and certificate trust."
+          : "WebSocket connection failed. Check the broker WebSocket listener, port/path, and local-network reachability.",
+      );
+    };
+    socket.onclose = (event) => {
       this.buffer = new Uint8Array();
       clearInterval(this.keepAliveTimer);
       this.keepAliveTimer = null;
-      this.#emit("status", { state: "offline" });
+      if (!this.manualClose && !this.lastErrorMessage) {
+        const suffix = event?.code ? ` (close code ${event.code})` : "";
+        this.lastErrorMessage = this.mqttConnected
+          ? `MQTT WebSocket connection closed${suffix}.`
+          : `WebSocket closed before MQTT connected${suffix}. Check that this is a WebSocket endpoint, not a raw MQTT port.`;
+      }
+      this.mqttConnected = false;
+      this.#emit("status", {
+        state: "offline",
+        message:
+          this.lastErrorMessage ||
+          (this.manualClose ? "Disconnected by user." : "Not connected."),
+      });
       if (!this.manualClose) this.#scheduleReconnect();
     };
   }
 
   #onBytes(bytes) {
     if (this.buffer.length + bytes.length > MAX_BUFFER_BYTES) {
-      this.#emit("error", { message: "MQTT packet exceeds the browser limit" });
+      this.#reportError("MQTT packet exceeds the browser limit");
       this.socket?.close();
       return;
     }
@@ -204,14 +247,14 @@ export class MqttWebSocketClient extends EventTarget {
       if (packetData.type === 2) {
         if (packetData.body.length < 2 || packetData.body[1] !== 0) {
           const code = packetData.body[1] ?? -1;
-          this.#emit("error", {
-            message: `MQTT connection rejected (${code})`,
-          });
+          this.#reportError(mqttConnectRejectionMessage(code));
           this.manualClose = true;
           this.socket?.close();
           continue;
         }
         this.reconnectAttempt = 0;
+        this.lastErrorMessage = "";
+        this.mqttConnected = true;
         this.#emit("status", { state: "online" });
         this.#startKeepAlive();
         if (this.subscriptions.size)
@@ -220,7 +263,7 @@ export class MqttWebSocketClient extends EventTarget {
         try {
           this.#emit("message", decodePublish(packetData));
         } catch (error) {
-          this.#emit("error", { message: error.message });
+          this.#reportError(error.message);
         }
       } else if (packetData.type === 9) {
         this.#emit("subscribed", {});
@@ -244,7 +287,11 @@ export class MqttWebSocketClient extends EventTarget {
       30000,
       1000 * 2 ** Math.min(this.reconnectAttempt++, 5),
     );
-    this.#emit("status", { state: "reconnecting", delay });
+    this.#emit("status", {
+      state: "reconnecting",
+      delay,
+      error: this.lastErrorMessage,
+    });
     this.reconnectTimer = setTimeout(() => this.#open(), delay);
   }
 
@@ -275,6 +322,8 @@ export class MqttWebSocketClient extends EventTarget {
 
   disconnect() {
     this.manualClose = true;
+    this.lastErrorMessage = "";
+    this.mqttConnected = false;
     this.buffer = new Uint8Array();
     clearTimeout(this.reconnectTimer);
     clearInterval(this.keepAliveTimer);

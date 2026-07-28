@@ -13,10 +13,6 @@
     />
     <title>LoRa Tracker</title>
     <link rel="manifest" href="manifest.webmanifest" />
-    <link rel="stylesheet" href="styles.css" />
-    <link rel="stylesheet" href="vendor/leaflet/leaflet.css" />
-    <script src="vendor/leaflet/leaflet.js"></script>
-    <script src="vendor/pmtiles/pmtiles.js"></script>
   </head>
   <body>
     <header>
@@ -26,9 +22,8 @@
       </div>
       <div class="mode-toggle">
         <a
-          href="https://dominikandreas.github.io/lora-tracker-docs/simulator/"
-          target="_blank"
-          >Open Network Lab ↗</a
+          href="./lab/"
+          >Open Network Lab</a
         >
         <a
           class="header-link"
@@ -52,7 +47,7 @@
           <label
             >WebSocket URL<input
               id="brokerUrl"
-              placeholder="wss://broker.example.com:8084/mqtt"
+              placeholder="ws://192.168.1.10 (defaults to port 1884)"
           /></label>
           <label>Base topic<input id="baseTopic" value="lora-tracker" /></label>
           <label>Username<input id="username" autocomplete="username" /></label>
@@ -64,8 +59,8 @@
           /></label>
         </div>
         <p class="hint">
-          The password remains in memory only. Broker URL, topic and username
-          are saved locally.
+          <span id="credentialStorageHint">The password is saved locally on this device.</span>
+          Broker URL, topic and username are saved locally.
         </p>
         <p id="connectionMessage" class="status-line">Not connected.</p>
       </section>
@@ -124,7 +119,7 @@
                 />
                 <button id="importPmtilesButton">Import Map</button>
                 <button id="enableAlertsButton">Enable Alerts</button>
-                <button id="onboardingButton">Connect Tracker</button>
+                <button id="onboardingButton">Manage devices</button>
                 <select id="historyRange" aria-label="History range">
                   <option value="6">6 hours</option>
                   <option value="24" selected>24 hours</option>
@@ -136,59 +131,73 @@
             <div id="onboardingPanel" hidden class="onboarding-panel">
               <div class="section-title">
                 <div>
-                  <p class="eyebrow">LOCAL BLUETOOTH</p>
-                  <h3>Tracker configuration</h3>
+                  <p class="eyebrow">DEVICE MANAGER</p>
+                  <h3>Onboard and configure devices</h3>
                 </div>
                 <span id="bleStatus" class="badge offline">Disconnected</span>
               </div>
               <p class="hint">
-                Open the tracker’s setup window first. Pair using the PIN shown
-                on its display. Use Claim only on a factory-new tracker to set a
-                new 12–24 character administrator credential; otherwise use
-                Authenticate with its existing credential.
+                Do not pair devices in Android Settings. Select a factory-reset device
+                here and the app installs a random owner key through the custom BLE
+                protocol—there is no Bluetooth bond, PIN, or device password. The same
+                key authorizes BLE and local-IP management and is kept in Android secure
+                storage. A transfer QR grants full device access to whoever scans it.
               </p>
-              <div id="bleControls" hidden>
-                <div class="credential-row">
-                  <label>Administrator credential
-                    <input type="password" id="blePassword" minlength="12" maxlength="24" autocomplete="off" />
-                  </label>
-                  <button id="bleClaim">Claim new tracker</button>
-                  <button id="bleAuth">Authenticate</button>
-                  <button id="bleReplaceCredential">Replace credential</button>
-                </div>
-                <div id="bleConfigForm" hidden>
-                  <div class="config-grid">
-                    <label>Device ID<input id="cfgDeviceId" maxlength="24" /></label>
-                    <label>Device name<input id="cfgDeviceName" maxlength="32" /></label>
-                    <label>Wi-Fi SSID<input id="cfgWifiSsid" maxlength="32" /></label>
-                    <label>Wi-Fi password<input type="password" id="cfgWifiPassword" placeholder="Leave blank to keep" /></label>
-                    <label>Frequency (Hz)<input type="number" id="cfgFrequency" /></label>
-                    <label>Transmit power (dBm)<input type="number" id="cfgTxPower" min="-9" max="14" /></label>
-                    <label>Spreading factor<input type="number" id="cfgSf" min="7" max="12" /></label>
-                    <label>Relay hop limit<input type="number" id="cfgHopLimit" min="0" max="4" /></label>
-                    <label>Transmit interval (s)<input type="number" id="cfgTxInterval" min="1" /></label>
-                    <label>ACK timeout (ms)<input type="number" id="cfgAckTimeout" min="1" /></label>
-                    <label>Moving sleep (s)<input type="number" id="cfgMovingSleep" min="1" /></label>
-                    <label>Stationary sleep (s)<input type="number" id="cfgStationarySleep" min="1" /></label>
-                    <label class="radio-key">Tracker radio key
-                      <input type="password" id="cfgRadioKey" readonly autocomplete="off" />
-                    </label>
-                    <button id="bleRevealKey" type="button">Show key</button>
+              <div class="device-manager-grid">
+                <aside>
+                  <div class="actions">
+                    <button id="addBleDevice" class="primary">Claim nearby device</button>
+                    <button id="importDeviceQrButton">Import access QR</button>
+                    <input id="importDeviceQrInput" type="file" accept="image/*" capture="environment" hidden />
                   </div>
-                  <p class="hint">
-                    The radio key is secret. Transfer it to an authorized
-                    gateway over an attended channel. Changing the device ID or
-                    key also requires updating every gateway registry entry.
-                  </p>
-                  <button id="bleSaveConfig" class="primary">Save configuration</button>
+                  <h4>Unclaimed nearby devices</h4>
+                  <div id="unpairedDeviceInventory" class="device-inventory"></div>
+                  <h4>Added devices</h4>
+                  <div id="deviceInventory" class="device-inventory"></div>
+                </aside>
+                <div id="deviceSession" hidden>
+                  <p id="deviceStep" class="device-step"></p>
+                  <div id="deviceAddressRow" class="credential-row">
+                    <label>Device IP or hostname
+                      <input id="deviceAddress" inputmode="url" placeholder="192.168.1.42" />
+                    </label>
+                    <button id="connectIpDevice">Connect</button>
+                  </div>
+                  <div id="deviceConfigPanel" hidden>
+                    <div id="deviceStateSummary" class="device-state-summary"></div>
+                    <details open>
+                      <summary>Complete configuration</summary>
+                      <div id="deviceConfigFields" class="config-grid"></div>
+                    </details>
+                    <div class="actions onboarding-actions">
+                      <button id="saveDeviceConfig" class="primary">Save and verify</button>
+                      <button id="refreshDeviceConfig">Refresh</button>
+                      <button id="enableDeviceConfigMode">Enable config + OTA (10 min)</button>
+                      <button id="exportDeviceQr">Show access QR</button>
+                    </div>
+                    <div id="deviceQrPanel" hidden class="qr-panel">
+                      <p><strong>Full device authority.</strong> Anyone who scans this QR can configure and update the device.</p>
+                      <img id="deviceQrImage" alt="Device owner-key transfer QR code" />
+                      <button id="copyDeviceOwnerKey">Copy owner key for PlatformIO</button>
+                      <button id="closeDeviceQr">Close QR</button>
+                    </div>
+                    <div id="trackerPairingPanel" hidden class="pairing-panel">
+                      <h4>Gateway pairing</h4>
+                      <p>Add this tracker to any gateway. Repeat for every gateway that should receive its data.</p>
+                      <label>Gateway<select id="pairingGateway"></select></label>
+                      <label>Gateway IP or hostname<input id="pairingGatewayAddress" inputmode="url" placeholder="192.168.1.103" /></label>
+                      <small>The saved address is filled automatically. You can enter the gateway's current LAN IP if its <code>.local</code> name is unavailable.</small>
+                      <button id="pairTrackerGateway" class="primary">Register and finish pairing</button>
+                    </div>
+                    <div class="actions onboarding-actions">
+                      <button id="rollbackDevice">Rollback</button>
+                      <button id="rebootDevice">Reboot</button>
+                      <button id="forgetDevice">Forget from app</button>
+                      <button id="factoryResetDevice" class="danger">Factory reset</button>
+                    </div>
+                  </div>
+                  <pre id="bleOutput" class="ble-output" role="log" aria-live="polite"></pre>
                 </div>
-                <div class="actions onboarding-actions">
-                  <button id="bleGetConfig">Refresh configuration</button>
-                  <button id="bleRollback">Rollback</button>
-                  <button id="bleReboot">Reboot</button>
-                  <button id="bleFactoryReset" class="danger">Factory reset</button>
-                </div>
-                <pre id="bleOutput" class="ble-output" role="log" aria-live="polite"></pre>
               </div>
             </div>
             <div
@@ -240,6 +249,6 @@
       </button>
     </template>
 
-    <script type="module" src="app.js"></script>
+    <script type="module" src="/app.js"></script>
   </body>
 </html>

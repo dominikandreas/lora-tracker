@@ -1,13 +1,18 @@
 export class AlertsManager {
-  constructor() {
+  constructor(notificationService = null) {
+    this.notificationService = notificationService;
     this.states = new Map(); // trackerHash -> { batteryState, lastSeen, alertLevel, etc }
     this.staleThresholdMs = 2 * 60 * 60 * 1000; // 2 hours
-    this.enabled =
-      "Notification" in window && Notification.permission === "granted";
+    this.enabled = notificationService?.enabled ??
+      ("Notification" in window && Notification.permission === "granted");
     this.intervalId = null;
   }
 
   async requestPermission() {
+    if (this.notificationService) {
+      this.enabled = await this.notificationService.requestPermission();
+      return this.enabled;
+    }
     if (!("Notification" in window)) {
       alert("Web Notifications are not supported in this browser.");
       return false;
@@ -128,6 +133,11 @@ export class AlertsManager {
 
   notify(message) {
     console.warn(`[ALERT] ${message}`);
+    if (this.notificationService) {
+      this.notificationService.notify(message).catch((error) =>
+        console.warn("Could not display notification", error));
+      return;
+    }
     if (this.enabled) {
       try {
         new Notification("LoRa Tracker Alert", {

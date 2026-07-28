@@ -1,0 +1,26 @@
+{
+  "appId": "de.dominikandreas.loratracker",
+  "appName": "LoRa Tracker",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https"
+  },
+  "android": {
+    "allowMixedContent": true,
+    "webContentsDebuggingEnabled": false
+  },
+  "plugins": {
+    "BluetoothLe": {
+      "displayStrings": {
+        "scanning": "Scanning for LoRa Trackers…",
+        "cancel": "Cancel",
+        "availableDevices": "Available trackers",
+        "noDeviceFound": "No tracker found"
+      }
+    },
+    "LocalNotifications": {
+      "smallIcon": "ic_stat_tracker",
+      "iconColor": "#9bdb7d"
+    }
+  }
+}

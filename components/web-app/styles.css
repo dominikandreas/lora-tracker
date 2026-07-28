@@ -131,6 +131,21 @@ select,
 button {
   font: inherit;
 }
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  min-height: 42px;
+  gap: 9px;
+  color: #edf4ec;
+}
+.checkbox-row input {
+  width: auto;
+  accent-color: var(--accent);
+}
+.native-app body {
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+}
 input,
 select {
   width: 100%;
@@ -255,6 +270,39 @@ button.danger {
   border-radius: 14px;
   background: #101611;
 }
+.device-manager-grid {
+  display: grid;
+  grid-template-columns: minmax(210px, 0.28fr) minmax(0, 1fr);
+  gap: 18px;
+}
+.device-inventory {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  color: var(--muted);
+}
+.device-card {
+  display: grid;
+  gap: 3px;
+  text-align: left;
+}
+.device-card span,
+.device-step,
+.device-state-summary {
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+.device-state-summary,
+.pairing-panel {
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.config-grid textarea {
+  min-height: 120px;
+  resize: vertical;
+}
 .credential-row {
   display: grid;
   grid-template-columns: minmax(240px, 1fr) auto auto auto;
@@ -284,12 +332,39 @@ button.danger {
   color: var(--muted);
   white-space: pre-wrap;
 }
+
+.qr-panel {
+  margin: 1rem 0;
+  padding: 1rem;
+  border: 1px solid color-mix(in srgb, var(--warning, #f2b84b) 55%, transparent);
+  border-radius: 0.8rem;
+  background: rgba(242, 184, 75, 0.08);
+}
+
+.qr-panel img {
+  display: block;
+  width: min(100%, 420px);
+  height: auto;
+  margin: 1rem auto;
+  background: white;
+  border-radius: 0.5rem;
+}
 .actions {
   display: flex;
   gap: 8px;
 }
 .actions select {
   width: auto;
+}
+@media (max-width: 760px) {
+  .device-manager-grid,
+  .config-grid,
+  .credential-row {
+    grid-template-columns: 1fr;
+  }
+  .actions {
+    flex-wrap: wrap;
+  }
 }
 #routeMap {
   width: 100%;

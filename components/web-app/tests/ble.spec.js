@@ -4,6 +4,7 @@ test.describe("BLE Mock Transport Integration", () => {
   test.beforeEach(async ({ page }) => {
     // Go to local server
     await page.goto("http://localhost:8080");
+    await page.evaluate(() => import("/test-api.js"));
   });
 
   test("BleTransport gracefully handles lack of Web Bluetooth", async ({
@@ -11,7 +12,7 @@ test.describe("BLE Mock Transport Integration", () => {
   }) => {
     // Evaluate in page context
     const isSupported = await page.evaluate(async () => {
-      const module = await import("./onboarding.js");
+      const module = window.__loraTrackerTest;
       const transport = new module.BleTransport(null); // mock unsupported adapter
       return transport.isSupported;
     });
@@ -20,7 +21,7 @@ test.describe("BLE Mock Transport Integration", () => {
 
     const errorMsg = await page.evaluate(async () => {
       try {
-        const module = await import("./onboarding.js");
+        const module = window.__loraTrackerTest;
         const transport = new module.BleTransport(null);
         await transport.connect();
         return null;
@@ -32,12 +33,84 @@ test.describe("BLE Mock Transport Integration", () => {
     expect(errorMsg).toContain("Web Bluetooth is not supported");
   });
 
+  test("NativeBleTransport uses acknowledged 18-byte writes and notifications", async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      const { NativeBleTransport } = window.__loraTrackerTest;
+      const chunks = [];
+      const writeTimeouts = [];
+      const connectionEvents = [];
+      let notify;
+      const client = {
+        initialize: async () => {},
+        requestDevice: async () => ({ deviceId: "tracker-1" }),
+        connect: async () => connectionEvents.push("connect"),
+        startNotifications: async (_id, _service, _characteristic, callback) => {
+          notify = callback;
+        },
+        write: async (_id, _service, _characteristic, value, options) => {
+          chunks.push([...new Uint8Array(value.buffer, value.byteOffset, value.byteLength)]);
+          writeTimeouts.push(options?.timeout);
+        },
+        stopNotifications: async () => {},
+        disconnect: async () => {},
+      };
+      const transport = new NativeBleTransport(client);
+      await transport.connect();
+      const responsePromise = transport.sendCommand("PATCH " + "x".repeat(30));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const response = new TextEncoder().encode('{"ok":true}\n');
+      notify(new DataView(response.buffer));
+      await responsePromise;
+      await transport.disconnect();
+      return {
+        lengths: chunks.map((chunk) => chunk.length),
+        connectionEvents,
+        writeTimeouts,
+        disconnected: !transport.deviceId,
+      };
+    });
+    expect(result.lengths).toEqual([18, 18, 1]);
+    expect(result.connectionEvents).toEqual(["connect"]);
+    expect(result.writeTimeouts).toEqual([5000, 5000, 5000]);
+    expect(result.disconnected).toBe(true);
+  });
+
+  test("NativeBleTransport surfaces a configuration-write failure", async ({
+    page,
+  }) => {
+    const message = await page.evaluate(async () => {
+      const { NativeBleTransport } = window.__loraTrackerTest;
+      const client = {
+        initialize: async () => {},
+        requestDevice: async () => ({ deviceId: "tracker-1" }),
+        connect: async () => {},
+        startNotifications: async () => {},
+        write: async () => {
+          throw new Error("insufficient authentication");
+        },
+        stopNotifications: async () => {},
+        disconnect: async () => {},
+      };
+      try {
+        const transport = new NativeBleTransport(client);
+        await transport.connect();
+        await transport.sendCommand("INFO");
+      } catch (error) {
+        return error.message;
+      }
+      return "no error";
+    });
+    expect(message).toContain("insufficient authentication");
+  });
+
   test("BleTransport chunking and sequencing logic (mocked adapter)", async ({
     page,
   }) => {
     // Evaluate an isolated mock adapter
     const result = await page.evaluate(async () => {
-      const module = await import("./onboarding.js");
+      const module = window.__loraTrackerTest;
 
       let writtenChunks = [];
       const mockTx = {
@@ -105,7 +178,7 @@ test.describe("BLE Mock Transport Integration", () => {
     page,
   }) => {
     const result = await page.evaluate(async () => {
-      const { OnboardingManager } = await import("./onboarding.js");
+      const { OnboardingManager } = window.__loraTrackerTest;
       const config = {
         role: "tracker",
         revision: 7,
@@ -125,11 +198,87 @@ test.describe("BLE Mock Transport Integration", () => {
     expect(result.communication.tx_interval_s).toBe(60);
   });
 
-  test("OnboardingManager sends authenticated credential replacement command", async ({
-    page,
-  }) => {
+  test("OnboardingManager discovers either device role before authentication", async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { OnboardingManager } = window.__loraTrackerTest;
+      const commands = [];
+      const manager = new OnboardingManager({
+        connect: async () => {},
+        sendCommand: async (command) => {
+          commands.push(command);
+          return { ok: true, role: "gateway", onboarding_required: true, revision: 1 };
+        },
+      });
+      return { info: await manager.connect(), commands };
+    });
+    expect(result.info.role).toBe("gateway");
+    expect(result.commands).toEqual(["INFO"]);
+  });
+
+  test("OnboardingManager accepts gateway configuration", async ({ page }) => {
+    const role = await page.evaluate(async () => {
+      const { OnboardingManager } = window.__loraTrackerTest;
+      const manager = new OnboardingManager({
+        sendCommand: async () => ({ role: "gateway", revision: 3, trackers: [] }),
+      });
+      return (await manager.getConfig()).role;
+    });
+    expect(role).toBe("gateway");
+  });
+
+  test("OnboardingManager waits for the native disconnect to finish", async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { OnboardingManager } = window.__loraTrackerTest;
+      let released = false;
+      const manager = new OnboardingManager({
+        disconnect: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          released = true;
+        },
+      });
+      const pending = manager.disconnect();
+      const beforeAwait = released;
+      await pending;
+      return { beforeAwait, afterAwait: released };
+    });
+    expect(result).toEqual({ beforeAwait: false, afterAwait: true });
+  });
+
+  test("the first app claims with an owner key used for later Bluetooth sessions", async ({ page }) => {
+    const methods = await page.evaluate(async () => {
+      const { OnboardingManager } = window.__loraTrackerTest;
+      const manager = new OnboardingManager({ sendCommand: async () => ({ ok: true }) });
+      return { claim: typeof manager.claim, auth: typeof manager.auth, enterConfigMode: typeof manager.enterConfigMode };
+    });
+    expect(methods).toEqual({ claim: "function", auth: "function", enterConfigMode: "function" });
+  });
+
+  test("owner keys fan out to renamed and stable device aliases", async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const api = window.__loraTrackerTest;
+      const ownerKey = "ab".repeat(32);
+      await api.storeDeviceOwnerKey("old-gateway", ownerKey, "ble-stable-id");
+      const loaded = await api.loadDeviceOwnerKey(
+        "new-gateway",
+        "old-gateway",
+        "ble-stable-id",
+      );
+      return {
+        loaded,
+        canonical: localStorage.getItem("device-new-gateway-owner-key"),
+        ble: localStorage.getItem("device-ble-stable-id-owner-key"),
+      };
+    });
+    expect(result).toEqual({
+      loaded: "ab".repeat(32),
+      canonical: "ab".repeat(32),
+      ble: "ab".repeat(32),
+    });
+  });
+
+  test("OnboardingManager sends dedicated tracker registration command", async ({ page }) => {
     const command = await page.evaluate(async () => {
-      const { OnboardingManager } = await import("./onboarding.js");
+      const { OnboardingManager } = window.__loraTrackerTest;
       let sent;
       const manager = new OnboardingManager({
         sendCommand: async (value) => {
@@ -137,17 +286,23 @@ test.describe("BLE Mock Transport Integration", () => {
           return { ok: true };
         },
       });
-      await manager.replaceCredential("new-secret-123");
+      await manager.registerTracker({
+        device_id: "tracker-one",
+        device_name: "Pasture tracker",
+        lora_aead_key: "ab".repeat(32),
+      });
       return sent;
     });
-    expect(command).toBe("SET_CREDENTIAL new-secret-123");
+    expect(command).toContain("REGISTER_TRACKER ");
+    expect(command).toContain("device_id=tracker-one");
+    expect(command).toContain("device_name=Pasture+tracker");
   });
 
   test("a timeout rejects both the active and queued BLE commands", async ({
     page,
   }) => {
     const messages = await page.evaluate(async () => {
-      const { BleTransport } = await import("./onboarding.js");
+      const { BleTransport } = window.__loraTrackerTest;
       const mockTx = {
         addEventListener: () => {},
         removeEventListener: () => {},
@@ -188,7 +343,7 @@ test.describe("BLE Mock Transport Integration", () => {
     page,
   }) => {
     const errorMsg = await page.evaluate(async () => {
-      const module = await import("./onboarding.js");
+      const module = window.__loraTrackerTest;
 
       const mockTx = {
         addEventListener: () => {},
@@ -239,7 +394,7 @@ test.describe("BLE Mock Transport Integration", () => {
 
     // Disconnect rejection
     const disconnectErrorMsg = await page.evaluate(async () => {
-      const module = await import("./onboarding.js");
+      const module = window.__loraTrackerTest;
 
       const mockRx = { writeValueWithResponse: async () => {} };
       const mockTx = {

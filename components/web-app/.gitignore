@@ -10,3 +10,7 @@ playwright-report
 test-results
 dist
 debug.log
+android/.gradle
+android/local.properties
+android/app/build
+android/build

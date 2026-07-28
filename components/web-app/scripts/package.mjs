@@ -1,21 +1,8 @@
-import { cp, mkdir, rm } from "node:fs/promises";
+import { access } from "node:fs/promises";
+import { resolve } from "node:path";
 
-const files = [
-  "index.html",
-  "styles.css",
-  "app.js",
-  "mqtt.js",
-  "points.js",
-  "storage.js",
-  "map.js",
-  "alerts.js",
-  "onboarding.js",
-  "sw.js",
-  "manifest.webmanifest",
-  "icon.svg",
-];
-
-await rm("dist", { recursive: true, force: true });
-await mkdir("dist", { recursive: true });
-for (const file of files) await cp(file, `dist/${file}`);
-await cp("vendor", "dist/vendor", { recursive: true });
+const dist = resolve(import.meta.dirname, "../dist");
+for (const file of ["index.html", "sw.js", "manifest.webmanifest", "lab/index.html"]) {
+  await access(resolve(dist, file));
+}
+console.log("Web/native bundle is complete.");

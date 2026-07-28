@@ -6,14 +6,29 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "package": "node scripts/package.mjs",
-    "test": "node --test tests/*.test.mjs && playwright test",
-    "serve": "python -m http.server 8080"
+    "test": "node scripts/build.mjs --test && node --test tests/*.test.mjs && node scripts/test-browser.mjs && node scripts/build.mjs",
+    "serve": "node scripts/serve.mjs",
+    "native:sync": "npm run build && cap sync android && node patch.mjs",
+    "native:build": "node scripts/build-android.mjs",
+    "native:open": "cap open android"
   },
   "dependencies": {
+    "@aparajita/capacitor-secure-storage": "^8.0.0",
+    "@capacitor-community/bluetooth-le": "^8.0.0",
+    "@capacitor-community/sqlite": "^8.0.0",
+    "@capacitor/android": "^8.0.0",
+    "@capacitor/app": "^8.0.0",
+    "@capacitor/core": "^8.0.0",
+    "@capacitor/local-notifications": "^8.0.0",
+    "@capacitor/preferences": "^8.0.0",
     "leaflet": "^1.9.4",
-    "pmtiles": "^4.4.1"
+    "pmtiles": "^4.4.1",
+    "qr-scanner": "^1.4.2",
+    "qrcode": "^1.5.4"
   },
   "devDependencies": {
-    "@playwright/test": "^1.61.1"
+    "@capacitor/cli": "^8.4.2",
+    "@playwright/test": "^1.61.1",
+    "vite": "^8.1.5"
   }
 }
