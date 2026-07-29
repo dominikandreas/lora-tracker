@@ -63,6 +63,10 @@
 - Added MQTT WebSocket URL normalization with project defaults of port 1884 for
   `ws://` and 8884 for `wss://`, while preserving explicit custom ports and URL
   paths.
+- Unified app and device connection setup around reusable Wi-Fi/MQTT profiles:
+  trackers select Wi-Fi, gateways select Wi-Fi and MQTT, and the dashboard uses
+  the same MQTT credentials plus its WebSocket endpoint. Incomplete tracker
+  onboarding now keeps BLE configuration available without a timeout.
 - Replaced tracker-only raw onboarding controls with a native device manager:
   authenticated BLE-first claiming for trackers and gateways, Keystore-backed
   per-device credentials, full role configuration, local-IP reconnect with BLE

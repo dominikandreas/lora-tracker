@@ -673,6 +673,16 @@ void clearGatewayConfigStorage() {
   clearMqttCaCertificateStorage();
 }
 
+void markGatewayOnboardingComplete() {
+  gateway_onboarding_required = false;
+  // Factory onboarding has no deadline. Once a valid configuration has been
+  // committed, retain setup/OTA briefly instead of leaving it enabled forever.
+  // Authenticated BLE management remains available independently.
+  if (gateway_config_mode && gateway_config_mode_deadline_ms == 0) {
+    gateway_config_mode_deadline_ms = millis() + 600000UL;
+  }
+}
+
 
 bool commitGatewayConfigCandidate(
     EquineConfig::GatewayConfigV1& candidate,
@@ -730,7 +740,7 @@ bool commitGatewayConfigCandidate(
       gateway_onboarding_required = true;
       return false;
     }
-    gateway_onboarding_required = false;
+    markGatewayOnboardingComplete();
   }
   gateway_config = candidate;
   return true;
@@ -1204,7 +1214,7 @@ void processGatewayBleCommand(char* command) {
         sendGatewayBleError("commit_failed", "failed to persist onboarding completion");
         return;
       }
-      gateway_onboarding_required = false;
+      markGatewayOnboardingComplete();
     }
     const bool needs_reboot = status.reboot_required || reboot;
     String out = "{\"ok\":true,\"revision\":" +
@@ -1365,7 +1375,7 @@ bool applyGatewayWebPatch(EquineConfigApi::PatchStatus& status,
                  "failed to persist onboarding completion");
         return false;
       }
-      gateway_onboarding_required = false;
+      markGatewayOnboardingComplete();
     }
     return true;
   }

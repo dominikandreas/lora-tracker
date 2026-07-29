@@ -89,10 +89,12 @@ query before restarting MQTT ingestion.
 
 ## BLE behavior
 
-BLE debugging is intentionally bounded. Lifecycle changes are deferred outside
-the button handler, and enabling BLE uses a clean restart path. After disabling
-BLE, verify that wake count and fix age continue to change after the next normal
-tracking cycle.
+BLE debugging is intentionally bounded after onboarding. A tracker with
+incomplete configuration or no confirmed gateway keeps configuration BLE
+available without a deadline so setup cannot expire halfway through. Lifecycle
+changes are deferred outside the button handler, and enabling BLE uses a clean
+restart path. After disabling BLE on a configured tracker, verify that wake
+count and fix age continue to change after the next normal tracking cycle.
 
 ## No GNSS fixes
 

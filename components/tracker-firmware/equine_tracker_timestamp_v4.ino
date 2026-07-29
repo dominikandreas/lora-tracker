@@ -555,7 +555,9 @@ class MyServerCallbacks: public BLEServerCallbacks {
         ble_session_authenticated = false;
         debug_mode = false;
         ble_connection_window_active = true;
-        ble_connection_window_deadline_ms = millis() + BLE_RECONNECT_WINDOW_MS;
+        ble_connection_window_deadline_ms = tracker_onboarding_required
+          ? 0
+          : millis() + BLE_RECONNECT_WINDOW_MS;
         ble_advertising = true;
         server->startAdvertising();
     }
@@ -570,7 +572,8 @@ bool isDebugModeActive() {
 
 bool isBleConnectionWindowActive() {
   return ble_connection_window_active &&
-         (int32_t)(ble_connection_window_deadline_ms - millis()) > 0;
+         (ble_connection_window_deadline_ms == 0 ||
+          (int32_t)(ble_connection_window_deadline_ms - millis()) > 0);
 }
 
 void setTrackerPhase(const char* phase) {
@@ -862,8 +865,19 @@ constexpr const char* TRACKER_GATEWAY_ID_KEY = "gateway_id";
 constexpr const char* TRACKER_GATEWAY_COUNT_KEY = "gw_count";
 
 void refreshTrackerOnboardingState() {
+  const bool was_onboarding_required = tracker_onboarding_required;
   tracker_onboarding_required =
     !tracker_config_complete || !tracker_gateway_paired;
+  if (!ble_connection_window_active) return;
+  if (tracker_onboarding_required) {
+    // A factory-reset or otherwise incomplete tracker must remain reachable.
+    // Zero is the explicit unbounded deadline used by setup mode.
+    ble_connection_window_deadline_ms = 0;
+  } else if (was_onboarding_required &&
+             ble_connection_window_deadline_ms == 0) {
+    // Once onboarding completes, return to the normal low-power BLE policy.
+    ble_connection_window_deadline_ms = millis() + BLE_RECONNECT_WINDOW_MS;
+  }
 }
 
 bool readTrackerGatewayPairing() {
@@ -1537,7 +1551,9 @@ void processBleConfigCommand(const char* command) {
 void stopBleDebug() {
   if (!ble_initialized) {
     ble_connection_window_active = false;
+    ble_connection_window_deadline_ms = 0;
     ble_advertising = false;
+    ble_provisioning_mode = false;
     return;
   }
 
@@ -1556,6 +1572,7 @@ void stopBleDebug() {
   ble_initialized = false;
   ble_advertising = false;
   ble_connection_window_active = false;
+  ble_connection_window_deadline_ms = 0;
   ble_provisioning_mode = false;
   ble_config_command_length = 0;
   ble_config_command_pending = false;
@@ -1566,7 +1583,9 @@ void startBleDebugWindow(uint32_t duration_ms, bool force_provisioning) {
   ble_provisioning_mode = force_provisioning;
 
   if (!ble_initialized) {
-    logPrintln("Starting bounded BLE/configuration window...");
+    logPrintln(duration_ms == 0
+      ? "Starting BLE/configuration until onboarding completes..."
+      : "Starting bounded BLE/configuration window...");
     String ble_name = "LT-" + String(TRACKER_ID);
     BLEDevice::init(ble_name.c_str());
     logPrintln("BLE configuration uses application-layer owner-key authentication; OS pairing is disabled.");
@@ -1599,7 +1618,9 @@ void startBleDebugWindow(uint32_t duration_ms, bool force_provisioning) {
   BLEDevice::startAdvertising();
   ble_advertising = true;
   ble_connection_window_active = true;
-  ble_connection_window_deadline_ms = millis() + duration_ms;
+  ble_connection_window_deadline_ms = duration_ms == 0
+    ? 0
+    : millis() + duration_ms;
 }
 
 void serviceBleDebug() {
@@ -2165,7 +2186,7 @@ void runWifiSetupMode() {
   // Configuration BLE is available during an explicit setup/onboarding session
   // even when ordinary BLE debug logging is disabled.
   // CRITICAL: Initialize BLE before WiFi on ESP32-S3 to prevent coex_enable panic.
-  startBleDebugWindow(600000UL, true);
+  startBleDebugWindow(tracker_onboarding_required ? 0 : 600000UL, true);
   tracker_config_mode_deadline_ms = tracker_onboarding_required
     ? 0
     : millis() + 600000UL;
@@ -2513,7 +2534,7 @@ void runWifiSetupMode() {
   webServer.on("/api/v1/config-mode", HTTP_POST, [requireWebAuthentication]() {
     if (!requireWebAuthentication()) return;
     tracker_config_mode_deadline_ms = millis() + 600000UL;
-    startBleDebugWindow(600000UL, true);
+    startBleDebugWindow(tracker_onboarding_required ? 0 : 600000UL, true);
     webServer.send(200, "application/json", "{\"ok\":true,\"config_mode\":true,\"ota_enabled\":true}");
   });
 

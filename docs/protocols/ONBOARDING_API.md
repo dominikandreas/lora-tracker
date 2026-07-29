@@ -53,9 +53,11 @@ Send `Authorization: Bearer <owner-key>`:
 - tracker `POST`/`DELETE /api/v1/gateway-pairing`
 - gateway `GET`/`POST /api/v1/trackers`
 
-`POST /api/v1/config-mode` enables configuration OTA for ten minutes. Tracker
-configuration mode is already bounded by its setup lifecycle; gateway and
-repeater responses include `duration_s=600`.
+`POST /api/v1/config-mode` enables configuration OTA for ten minutes on an
+already configured device. A tracker whose configuration or gateway pairing is
+incomplete has no setup deadline, so it cannot become unreachable halfway
+through onboarding. Gateway and repeater responses include `duration_s=600`
+after onboarding.
 
 Factory reset requires `confirm=FACTORY_RESET`. Rollback and configuration
 patches require `expected_revision=<current revision>`.
@@ -96,6 +98,11 @@ REBOOT
 `INFO` is public. `CLAIM` is allowed only for an unclaimed device during the
 attended setup window. Every other command except `AUTH` requires the current
 BLE session to be authenticated. Disconnect clears session authentication.
+
+An incomplete tracker advertises this service without a deadline. Completing
+both tracker configuration and gateway pairing returns it to the bounded BLE
+window and normal low-power policy. Gateway owner-key BLE management remains
+discoverable; its setup AP and OTA service are independently time-bounded.
 
 The key is a bearer secret on local HTTP and the custom BLE protocol. Operate
 configuration networks in physical proximity/on a trusted LAN. QR exports and
