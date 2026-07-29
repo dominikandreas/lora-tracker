@@ -620,7 +620,7 @@ void logPrint(const T& message) {
   rememberLogLine(s.c_str());
   if (deviceConnected && ble_session_authenticated && !ble_provisioning_mode && pTxCharacteristic) {
     pTxCharacteristic->setValue(s.c_str());
-    pTxCharacteristic->notify();
+    pTxCharacteristic->indicate();
     delay(5);
   }
 }
@@ -635,7 +635,7 @@ void logPrintln(const T& message) {
     cleanS.replace("\r\n", "\n");
     cleanS.replace("\n", "\r\n");
     pTxCharacteristic->setValue(cleanS.c_str());
-    pTxCharacteristic->notify();
+    pTxCharacteristic->indicate();
     delay(5);
   }
 }
@@ -658,7 +658,7 @@ void logPrintf(const char* format, ...) {
     cleanS.replace("\r\n", "\n");
     cleanS.replace("\n", "\r\n");
     pTxCharacteristic->setValue(cleanS.c_str());
-    pTxCharacteristic->notify();
+    pTxCharacteristic->indicate();
     delay(5);
   }
 }
@@ -1193,20 +1193,22 @@ String trackerConfigJson() {
 
 void sendBleConfigText(const String& response) {
   if (!deviceConnected || !pTxCharacteristic) return;
-  // 18-byte pieces remain valid with the default 23-byte BLE MTU. The newline
-  // terminates one response; app clients concatenate notifications until then.
+  // 18-byte pieces remain valid with the default 23-byte BLE MTU. Acknowledged
+  // indications prevent Android from silently dropping pieces of larger JSON
+  // responses. The newline terminates one complete response frame.
   String framed = response;
   if (framed.length() == 0 || framed.c_str()[framed.length() - 1] != '\n') {
     framed += '\n';
   }
   constexpr size_t payload_size = 18;
   for (size_t offset = 0; offset < framed.length(); offset += payload_size) {
+    if (!deviceConnected) break;
     const size_t length = min(payload_size, framed.length() - offset);
     pTxCharacteristic->setValue(
       reinterpret_cast<uint8_t*>(const_cast<char*>(framed.c_str() + offset)),
       length);
-    pTxCharacteristic->notify();
-    delay(8);
+    pTxCharacteristic->indicate();
+    delay(1);
   }
 }
 
@@ -1574,7 +1576,7 @@ void startBleDebugWindow(uint32_t duration_ms, bool force_provisioning) {
     BLEService *pService = pServer->createService(SERVICE_UUID);
     pTxCharacteristic = pService->createCharacteristic(
       CHARACTERISTIC_UUID_TX,
-      BLECharacteristic::PROPERTY_NOTIFY
+      BLECharacteristic::PROPERTY_INDICATE
     );
     pTxCharacteristic->addDescriptor(new BLE2902());
 

@@ -896,16 +896,20 @@ String gatewayConfigJson() {
 
 void sendGatewayBleText(const String& response) {
   if (!gateway_ble_connected || !gateway_ble_tx) return;
+  // Use acknowledged ATT indications. Back-to-back notifications can be
+  // silently dropped by Android, corrupting larger JSON responses while still
+  // leaving a newline that makes the app attempt to parse the damaged frame.
   String framed = response;
   if (framed.isEmpty() || framed[framed.length() - 1] != '\n') framed += '\n';
   constexpr size_t payload_size = 18;
   for (size_t offset = 0; offset < framed.length(); offset += payload_size) {
+    if (!gateway_ble_connected) break;
     const size_t length = min(payload_size, framed.length() - offset);
     gateway_ble_tx->setValue(
       reinterpret_cast<uint8_t*>(const_cast<char*>(framed.c_str() + offset)),
       length);
-    gateway_ble_tx->notify();
-    delay(8);
+    gateway_ble_tx->indicate();
+    delay(1);
   }
 }
 
@@ -1255,7 +1259,7 @@ void startGatewayBleConfiguration() {
   gateway_ble_server->setCallbacks(new GatewayBleServerCallbacks());
   BLEService* service = gateway_ble_server->createService(CONFIG_SERVICE_UUID);
   gateway_ble_tx = service->createCharacteristic(
-    CONFIG_TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+    CONFIG_TX_UUID, BLECharacteristic::PROPERTY_INDICATE);
   gateway_ble_tx->addDescriptor(new BLE2902());
   gateway_ble_rx = service->createCharacteristic(
     CONFIG_RX_UUID, BLECharacteristic::PROPERTY_WRITE);

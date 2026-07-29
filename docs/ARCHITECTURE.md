@@ -129,7 +129,7 @@ The gateway registration API is a narrow idempotent upsert, and the app keeps
 the tracker transport alive between gateway registration and tracker-side
 confirmation. Firmware GATT callbacks only frame incoming bytes. Complete commands are copied
 and processed by the Arduino application task; JSON construction, NVS writes and
-notification bursts must never run on the small ESP-IDF `BTC_TASK` stack.
+indication transmission must never run on the small ESP-IDF `BTC_TASK` stack.
 
 The Android WebView permits cleartext `ws://` solely to support private brokers
 without a trusted certificate and displays an explicit warning before each such

@@ -33,7 +33,7 @@ test.describe("BLE Mock Transport Integration", () => {
     expect(errorMsg).toContain("Web Bluetooth is not supported");
   });
 
-  test("NativeBleTransport uses acknowledged 18-byte writes and notifications", async ({
+  test("NativeBleTransport uses acknowledged writes and subscribes to responses", async ({
     page,
   }) => {
     const result = await page.evaluate(async () => {
@@ -46,6 +46,7 @@ test.describe("BLE Mock Transport Integration", () => {
         initialize: async () => {},
         requestDevice: async () => ({ deviceId: "tracker-1" }),
         connect: async () => connectionEvents.push("connect"),
+        discoverServices: async () => connectionEvents.push("discover"),
         startNotifications: async (_id, _service, _characteristic, callback) => {
           notify = callback;
         },
@@ -72,7 +73,7 @@ test.describe("BLE Mock Transport Integration", () => {
       };
     });
     expect(result.lengths).toEqual([18, 18, 1]);
-    expect(result.connectionEvents).toEqual(["connect"]);
+    expect(result.connectionEvents).toEqual(["connect", "discover"]);
     expect(result.writeTimeouts).toEqual([5000, 5000, 5000]);
     expect(result.disconnected).toBe(true);
   });

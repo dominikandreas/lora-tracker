@@ -229,6 +229,13 @@ export class NativeBleTransport extends BleTransport {
           },
           { timeout: 10000 },
         );
+        // Android caches characteristic properties by device address. Refresh
+        // after firmware upgrades so a TX characteristic changed from notify
+        // to indicate is rediscovered instead of configured with stale CCCD
+        // flags. The native plugin's discoverServices() performs that refresh.
+        if (typeof this.client.discoverServices === "function") {
+          await this.client.discoverServices(this.deviceId);
+        }
         await this.client.startNotifications(
           this.deviceId,
           SERVICE_UUID,

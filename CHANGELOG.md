@@ -103,6 +103,9 @@
 - Added reusable app-level Wi-Fi and MQTT profiles. They can be created before
   connecting a device, then selected to fill compatible device configuration;
   Android stores complete profiles in Keystore-backed encrypted storage.
+- Replaced fire-and-forget BLE response notifications with acknowledged,
+  ordered indications on trackers and gateways, preventing Android from
+  silently dropping middle chunks of larger configuration JSON responses.
 - Persisted the MQTT password in the browser as requested, with explicit
   localStorage risk documentation; Android continues to use Keystore storage.
 
