@@ -31,6 +31,11 @@
 // VERSIONED PERSISTENT GATEWAY CONFIGURATION
 // ==========================================
 EquineConfig::GatewayConfigV1 gateway_config{};
+// Configuration transactions run from Arduino loop(), never concurrently. Keep
+// their large temporary objects in static storage so a BLE connection cannot
+// make an otherwise ordinary save fail due to fragmented/insufficient heap.
+EquineConfig::GatewayConfigV1 gateway_config_working{};
+EquineConfig::GatewayConfigV1 gateway_config_storage_scratch{};
 Preferences configPrefs;
 constexpr size_t OWNER_KEY_HEX_LENGTH = 64;
 char owner_key[OWNER_KEY_HEX_LENGTH + 1]{};
@@ -571,36 +576,42 @@ void makeGatewayFactoryConfig() {
     gateway_config, EquineConfig::DeviceRole::GATEWAY, 1);
 }
 
-bool saveGatewayConfig(bool increment_revision = true) {
-  EquineConfig::GatewayConfigV1 previous{};
-  if (readGatewayConfigBlob(EquineConfig::ACTIVE_CONFIG_KEY, previous)) {
-    if (!writeGatewayConfigBlob(EquineConfig::BACKUP_CONFIG_KEY, previous)) {
+bool saveGatewayConfigValue(EquineConfig::GatewayConfigV1& value,
+                            bool increment_revision = true) {
+  if (readGatewayConfigBlob(EquineConfig::ACTIVE_CONFIG_KEY,
+                            gateway_config_storage_scratch)) {
+    if (!writeGatewayConfigBlob(EquineConfig::BACKUP_CONFIG_KEY,
+                                gateway_config_storage_scratch)) {
       logPrintln("Warning: failed to update gateway configuration backup.");
     }
   }
 
-  uint32_t revision = gateway_config.header.revision;
+  uint32_t revision = value.header.revision;
   if (revision == 0) revision = 1;
   else if (increment_revision && revision < UINT32_MAX) revision++;
   EquineConfig::finalize(
-    gateway_config, EquineConfig::DeviceRole::GATEWAY, revision);
+    value, EquineConfig::DeviceRole::GATEWAY, revision);
 
-  if (!EquineConfig::validateGatewayConfig(gateway_config)) {
+  if (!EquineConfig::validateGatewayConfig(value)) {
     logPrintln("Refusing to save invalid gateway configuration.");
     return false;
   }
   if (!writeGatewayConfigBlob(
-        EquineConfig::ACTIVE_CONFIG_KEY, gateway_config)) {
+        EquineConfig::ACTIVE_CONFIG_KEY, value)) {
     logPrintln("Failed to save gateway configuration.");
     return false;
   }
 
   logPrintf("Saved gateway config schema=%u revision=%lu id=%s trackers=%u.\n",
-            gateway_config.header.schema_version,
-            (unsigned long)gateway_config.header.revision,
-            gateway_config.gateway_id,
-            gateway_config.tracker_count);
+            value.header.schema_version,
+            (unsigned long)value.header.revision,
+            value.gateway_id,
+            value.tracker_count);
   return true;
+}
+
+bool saveGatewayConfig(bool increment_revision = true) {
+  return saveGatewayConfigValue(gateway_config, increment_revision);
 }
 
 
@@ -683,7 +694,6 @@ bool commitGatewayConfigCandidate(
     snprintf(error, error_size, "Wi-Fi SSID is required to complete onboarding");
     return false;
   }
-  const String previous_ca = runtime_mqtt_ca_certificate;
   const String& next_ca = mqtt_ca_candidate
     ? *mqtt_ca_candidate : runtime_mqtt_ca_certificate;
   if (candidate.mqtt_tls_enabled && !isValidMqttCaCertificate(next_ca, false)) {
@@ -694,31 +704,35 @@ bool commitGatewayConfigCandidate(
     snprintf(error, error_size, "plaintext MQTT is disabled by this firmware");
     return false;
   }
-  std::unique_ptr<EquineConfig::GatewayConfigV1> previous(
-    new (std::nothrow) EquineConfig::GatewayConfigV1(gateway_config));
-  if (!previous) {
-    snprintf(error, error_size, "not enough memory to commit configuration safely");
-    return false;
-  }
-  if (!writeMqttCaCertificate(next_ca, true)) {
-    snprintf(error, error_size, "failed to write MQTT CA certificate");
-    return false;
-  }
-  gateway_config = candidate;
-  if (!saveGatewayConfig(false)) {
-    gateway_config = *previous;
-    writeMqttCaCertificate(previous_ca, false);
+  const bool ca_changed = mqtt_ca_candidate && next_ca != runtime_mqtt_ca_certificate;
+
+  // Keep the live configuration untouched until every persistent write has
+  // succeeded. The old active blob is copied to the backup slot by this call.
+  if (!saveGatewayConfigValue(candidate, false)) {
     snprintf(error, error_size, "failed to write active configuration");
+    return false;
+  }
+  if (ca_changed && !writeMqttCaCertificate(next_ca, true)) {
+    writeGatewayConfigBlob(EquineConfig::ACTIVE_CONFIG_KEY, gateway_config);
+    snprintf(error, error_size, "failed to write MQTT CA certificate");
     return false;
   }
   if (mark_provisioned) {
     if (!writeGatewayProvisionedFlag(true)) {
+      writeGatewayConfigBlob(EquineConfig::ACTIVE_CONFIG_KEY, gateway_config);
+      if (ca_changed) {
+        String previous_ca;
+        if (readMqttCaCertificateBackup(previous_ca)) {
+          writeMqttCaCertificate(previous_ca, false);
+        }
+      }
       snprintf(error, error_size, "failed to persist onboarding completion");
       gateway_onboarding_required = true;
       return false;
     }
     gateway_onboarding_required = false;
   }
+  gateway_config = candidate;
   return true;
 }
 
@@ -740,12 +754,8 @@ bool registerGatewayTracker(
     return false;
   }
 
-  std::unique_ptr<EquineConfig::GatewayConfigV1> candidate(
-    new (std::nothrow) EquineConfig::GatewayConfigV1(gateway_config));
-  if (!candidate) {
-    snprintf(error, error_size, "could not allocate registry candidate");
-    return false;
-  }
+  gateway_config_working = gateway_config;
+  EquineConfig::GatewayConfigV1* candidate = &gateway_config_working;
 
   bool found = false;
   for (uint8_t index = 0; index < candidate->tracker_count; index++) {
@@ -800,13 +810,8 @@ bool registerGatewayTracker(
 }
 
 bool rollbackGatewayConfig(char* error, size_t error_size) {
-  std::unique_ptr<EquineConfig::GatewayConfigV1> backup(
-    new (std::nothrow) EquineConfig::GatewayConfigV1());
-  if (!backup) {
-    snprintf(error, error_size, "not enough memory to load rollback configuration");
-    return false;
-  }
-  if (!readGatewayConfigBlob(EquineConfig::BACKUP_CONFIG_KEY, *backup)) {
+  if (!readGatewayConfigBlob(EquineConfig::BACKUP_CONFIG_KEY,
+                             gateway_config_working)) {
     snprintf(error, error_size, "no valid rollback configuration");
     return false;
   }
@@ -816,7 +821,7 @@ bool rollbackGatewayConfig(char* error, size_t error_size) {
     return false;
   }
   return commitGatewayConfigCandidate(
-    *backup, true, error, error_size, &backup_ca);
+    gateway_config_working, true, error, error_size, &backup_ca);
 }
 
 String gatewayConfigJson() {
@@ -1077,7 +1082,6 @@ void processGatewayBleCommand(char* command) {
       return;
     }
     gateway_ble_authenticated = true;
-    setupOTA();
     sendGatewayBleText("{\"ok\":true,\"claimed\":true,\"authenticated\":true}");
     return;
   }
@@ -1162,12 +1166,8 @@ void processGatewayBleCommand(char* command) {
       return;
     }
     char* encoded = command + 6;
-    std::unique_ptr<EquineConfig::GatewayConfigV1> candidate(
-      new (std::nothrow) EquineConfig::GatewayConfigV1(gateway_config));
-    if (!candidate) {
-      sendGatewayBleError("out_of_memory", "could not allocate configuration candidate");
-      return;
-    }
+    gateway_config_working = gateway_config;
+    EquineConfig::GatewayConfigV1* candidate = &gateway_config_working;
     String mqtt_ca_candidate = runtime_mqtt_ca_certificate;
     EquineConfigApi::PatchStatus status;
     uint32_t expected_revision = 0;
@@ -1286,12 +1286,8 @@ void stopGatewayBleConfiguration() {
 
 bool applyGatewayWebPatch(EquineConfigApi::PatchStatus& status,
                           bool& reboot_requested) {
-  std::unique_ptr<EquineConfig::GatewayConfigV1> candidate(
-    new (std::nothrow) EquineConfig::GatewayConfigV1(gateway_config));
-  if (!candidate) {
-    EquineConfigApi::setError(status, "configuration", "not enough memory");
-    return false;
-  }
+  gateway_config_working = gateway_config;
+  EquineConfig::GatewayConfigV1* candidate = &gateway_config_working;
   String mqtt_ca_candidate = runtime_mqtt_ca_certificate;
   uint32_t expected_revision = 0;
   bool has_revision = false;
@@ -1926,7 +1922,6 @@ void setupWebInterface() {
       webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_owner_key\"}");
       return;
     }
-    setupOTA();
     webServer.send(200, "application/json", "{\"ok\":true,\"claimed\":true}");
   });
   webServer.on("/", HTTP_GET, []() {
