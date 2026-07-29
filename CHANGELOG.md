@@ -64,7 +64,7 @@
   `ws://` and 8884 for `wss://`, while preserving explicit custom ports and URL
   paths.
 - Replaced tracker-only raw onboarding controls with a native device manager:
-  encrypted BLE-first claiming for trackers and gateways, Keystore-backed
+  authenticated BLE-first claiming for trackers and gateways, Keystore-backed
   per-device credentials, full role configuration, local-IP reconnect with BLE
   fallback, and coordinated gateway-registry/tracker pairing confirmation.
 - Made tracker activation fail closed until Wi-Fi configuration and gateway
@@ -93,6 +93,16 @@
 - Fixed gateway BLE configuration saves exhausting heap and aborting by making
   configuration CRC validation allocation-free, parsing PATCH data in place,
   and turning transactional allocation failures into protocol errors.
+- Removed the remaining gateway save-time configuration allocations. BLE, HTTP,
+  registry and rollback transactions now use fixed scratch storage, keep the
+  live config unchanged until persistence succeeds and restore NVS on later
+  CA/onboarding-marker failure.
+- Deferred OTA service startup until explicitly requested and added bounded
+  Android GATT retries with stale-disconnect rejection, improving first claim
+  reliability without OS pairing.
+- Added reusable app-level Wi-Fi and MQTT profiles. They can be created before
+  connecting a device, then selected to fill compatible device configuration;
+  Android stores complete profiles in Keystore-backed encrypted storage.
 - Persisted the MQTT password in the browser as requested, with explicit
   localStorage risk documentation; Android continues to use Keystore storage.
 

@@ -27,6 +27,10 @@ WebSocket and bundles Leaflet, PMTiles and the complete Network Lab locally.
 - Installable/offline application shell through a service worker
 - Automatic MQTT password storage: Android Keystore-backed storage in the
   native app and origin-scoped localStorage in the browser
+- Reusable Wi-Fi and gateway MQTT profiles stored independently from device
+  records. Selecting a profile fills the matching device fields before the
+  normal transactional **Save and verify** operation. Android keeps the entire
+  profile, including passwords, in Keystore-backed encrypted storage.
 
 ## Run
 
@@ -72,6 +76,13 @@ field if the network cannot resolve its `.local` hostname. The application ID is
 `de.dominikandreas.loratracker`; its version is
 derived from the repository-level `VERSION` file. Android CI performs the same
 sync and Gradle build and uploads a debug APK artifact.
+
+Create Wi-Fi and MQTT profiles in **Reusable connection profiles** after
+connecting to a device. Profiles belong to the app rather than to one device:
+save a profile once, select **Use for this device**, then press **Save and
+verify**. Trackers expose Wi-Fi profiles; gateways expose both Wi-Fi and MQTT
+profiles. Profile selection only fills the form and never changes a device
+until the explicit save succeeds.
 
 ## Deliberate limitations
 

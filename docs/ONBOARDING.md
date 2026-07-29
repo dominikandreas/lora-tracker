@@ -27,10 +27,24 @@ it physically attended until the app confirms the claim.
 5. The app generates a 64-hex-character owner key, stores it securely, and
    sends `CLAIM`. If that one-way operation is interrupted, reconnecting reuses
    the staged key and retries `CLAIM` while the device still reports itself as
-   unclaimed.
-6. Configure station Wi-Fi and all role-specific settings. With an empty SSID,
+   unclaimed. Android also retries transient GATT connection failures three
+   times. Claim itself does not start OTA or other memory-heavy services before
+   acknowledging the app.
+6. In **Reusable connection profiles**, create or select a Wi-Fi profile and,
+   for a gateway, an MQTT profile. Choose **Use for this device** for each one,
+   then configure the remaining role-specific settings and press **Save and
+   verify**. Profiles are app-owned and can be reused for every later device.
+   With an empty SSID,
    firmware skips station association entirely; it does not call
    `WiFi.begin()` or enter a reconnect loop.
+
+Android stores complete connection profiles, including Wi-Fi and MQTT secrets,
+in Keystore-backed encrypted storage. The browser build uses origin-scoped
+`localStorage`, so use it only from a trusted browser profile. Applying a
+profile only fills the editable device form; it does not transmit anything
+until **Save and verify** is pressed. Firmware writes the validated candidate
+and backup from fixed scratch storage, so a normal BLE save does not depend on
+allocating another large contiguous heap block.
 
 The setup AP has no password because factory-reset claim is already open by
 design. After claim, all management API mutations require the owner key even

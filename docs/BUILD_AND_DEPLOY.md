@@ -100,10 +100,12 @@ npm run build
 python3 -m http.server 8080
 ```
 
-The browser app persists broker URL, namespace, username, MQTT password and
-per-device owner keys in origin-scoped localStorage so reconnects require no
-manual entry. Use a trusted browser profile and a least-privilege broker account.
-Android stores them in Keystore-backed storage and can transfer them through an
+The browser app persists broker URL, namespace, username, MQTT password,
+reusable Wi-Fi/MQTT profiles and per-device owner keys in origin-scoped
+localStorage so reconnects and repeated device setup require no manual entry.
+Use a trusted browser profile and a least-privilege broker account. Android
+stores MQTT passwords, complete connection profiles and owner keys in
+Keystore-backed encrypted storage and can transfer device authority through an
 explicit full-authority QR export. Run `npm run package` to assemble the self-contained
 `dist/` artifact. The public
 documentation deploys that artifact at `/app/` and the Network Lab at
