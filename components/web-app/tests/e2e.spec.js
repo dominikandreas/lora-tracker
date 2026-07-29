@@ -75,6 +75,34 @@ test.describe("PWA Offline & Mode Tests", () => {
     await expect(page.locator("#importDeviceQrButton")).toBeVisible();
   });
 
+  test("connection profiles can be created before a device and survive reload", async ({
+    page,
+  }) => {
+    await page.locator("#onboardingButton").click();
+    await page.locator("#connectionProfiles").evaluate((element) => {
+      element.open = true;
+    });
+    await page.locator("#wifiProfileName").fill("Stable pasture Wi-Fi");
+    await page.locator("#profileWifiSsid").fill("pasture-network");
+    await page.locator("#profileWifiPassword").fill("test-secret");
+    await page.locator("#saveWifiProfile").click();
+    await expect(page.locator("#wifiProfileSelect")).toHaveValue(/.+/);
+
+    await page.reload();
+    await page.locator("#onboardingButton").click();
+    await page.locator("#connectionProfiles").evaluate((element) => {
+      element.open = true;
+    });
+    await page
+      .locator("#wifiProfileSelect")
+      .selectOption({ label: "Stable pasture Wi-Fi" });
+    await expect(page.locator("#profileWifiSsid")).toHaveValue("pasture-network");
+    await expect(page.locator("#profileWifiPassword")).toHaveValue("test-secret");
+    await page.evaluate(() =>
+      localStorage.removeItem("lora-tracker.configuration-profiles.v1"),
+    );
+  });
+
 
   test("Network Lab is bundled with the application", async ({
     page,

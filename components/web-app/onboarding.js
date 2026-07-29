@@ -197,6 +197,8 @@ export class NativeBleTransport extends BleTransport {
     super(null);
     this.client = client;
     this.deviceId = null;
+    this.connecting = false;
+    this.connectionGeneration = 0;
   }
 
   get isSupported() {
@@ -212,28 +214,66 @@ export class NativeBleTransport extends BleTransport {
       this.deviceId = device.deviceId;
     }
     this.disconnected = false;
-    try {
-      await this.client.connect(
-        this.deviceId,
-        () => this.onDisconnected(),
-        { timeout: 10000 },
-      );
-      await this.client.startNotifications(
-        this.deviceId,
-        SERVICE_UUID,
-        TX_UUID,
-        (value) => this.onNotification({ target: { value } }),
-        { timeout: 5000 },
-      );
-      // The base transport uses rx as its connected/write-ready marker.
-      this.rx = true;
-    } catch (error) {
-      await this.disconnect();
-      throw error instanceof Error ? error : new Error(String(error));
+    this.connecting = true;
+    let lastError;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      let attemptInterrupted = false;
+      const generation = ++this.connectionGeneration;
+      try {
+        await this.client.connect(
+          this.deviceId,
+          () => {
+            if (generation !== this.connectionGeneration) return;
+            if (this.connecting) attemptInterrupted = true;
+            else this.onDisconnected();
+          },
+          { timeout: 10000 },
+        );
+        await this.client.startNotifications(
+          this.deviceId,
+          SERVICE_UUID,
+          TX_UUID,
+          (value) => this.onNotification({ target: { value } }),
+          { timeout: 5000 },
+        );
+        if (attemptInterrupted) {
+          throw new Error("BLE disconnected while enabling notifications");
+        }
+        // The base transport uses rx as its connected/write-ready marker.
+        this.rx = true;
+        this.connecting = false;
+        return;
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        try {
+          await this.client.stopNotifications(
+            this.deviceId,
+            SERVICE_UUID,
+            TX_UUID,
+          );
+        } catch {}
+        try {
+          await this.client.disconnect(this.deviceId);
+        } catch {}
+        if (attempt < 2) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, attempt === 0 ? 250 : 600),
+          );
+        }
+      }
     }
+    this.connecting = false;
+    this.connectionGeneration += 1;
+    this.deviceId = null;
+    this.finishDisconnect();
+    throw new Error(
+      `BLE connection failed after 3 attempts: ${lastError?.message || "unknown error"}`,
+    );
   }
 
   async disconnect() {
+    this.connecting = false;
+    this.connectionGeneration += 1;
     const deviceId = this.deviceId;
     this.deviceId = null;
     if (deviceId) {

@@ -105,6 +105,43 @@ test.describe("BLE Mock Transport Integration", () => {
     expect(message).toContain("insufficient authentication");
   });
 
+  test("NativeBleTransport retries transient Android GATT connection failures", async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      const { NativeBleTransport } = window.__loraTrackerTest;
+      let attempts = 0;
+      const disconnectCallbacks = [];
+      const client = {
+        initialize: async () => {},
+        requestDevice: async () => ({ deviceId: "gateway-1" }),
+        connect: async (_id, onDisconnect) => {
+          attempts += 1;
+          disconnectCallbacks.push(onDisconnect);
+          if (attempts < 3) throw new Error("GATT 133");
+        },
+        startNotifications: async () => {},
+        stopNotifications: async () => {},
+        disconnect: async () => {},
+      };
+      const transport = new NativeBleTransport(client);
+      await transport.connect();
+      disconnectCallbacks[0]();
+      const staleCallbackIgnored = Boolean(transport.deviceId && transport.rx);
+      disconnectCallbacks[2]();
+      return {
+        attempts,
+        staleCallbackIgnored,
+        activeDisconnectHandled: !transport.deviceId,
+      };
+    });
+    expect(result).toEqual({
+      attempts: 3,
+      staleCallbackIgnored: true,
+      activeDisconnectHandled: true,
+    });
+  });
+
   test("BleTransport chunking and sequencing logic (mocked adapter)", async ({
     page,
   }) => {

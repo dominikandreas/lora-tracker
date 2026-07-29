@@ -316,6 +316,28 @@ button.danger {
   gap: 10px;
   margin-bottom: 12px;
 }
+.profile-editor {
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.profile-editor h4 {
+  margin: 0 0 10px;
+}
+.profile-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(150px, 1fr));
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.profile-grid textarea {
+  min-height: 100px;
+  resize: vertical;
+}
+.profile-ca {
+  grid-column: 1 / -1;
+}
 .radio-key {
   grid-column: span 3;
 }
@@ -442,6 +464,9 @@ td code {
   .config-grid {
     grid-template-columns: 1fr 1fr;
   }
+  .profile-grid {
+    grid-template-columns: 1fr 1fr;
+  }
   .radio-key {
     grid-column: span 1;
   }
@@ -455,6 +480,7 @@ td code {
   .form-grid,
   .stats-grid,
   .config-grid,
+  .profile-grid,
   .credential-row {
     grid-template-columns: 1fr;
   }

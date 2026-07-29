@@ -143,6 +143,45 @@
                 key authorizes BLE and local-IP management and is kept in Android secure
                 storage. A transfer QR grants full device access to whoever scans it.
               </p>
+              <details id="connectionProfiles">
+                <summary>Reusable connection profiles</summary>
+                <p class="hint">Create these once, independently of a device. After connecting a compatible device, select a profile and choose Use for this device to fill its form.</p>
+                <div id="wifiProfileSection" class="profile-editor">
+                  <h4>Wi-Fi profile</h4>
+                  <div class="profile-grid">
+                    <label>Saved profile<select id="wifiProfileSelect"></select></label>
+                    <label>Profile name<input id="wifiProfileName" maxlength="80" /></label>
+                    <label>SSID<input id="profileWifiSsid" maxlength="32" /></label>
+                    <label>Password<input id="profileWifiPassword" type="password" autocomplete="new-password" maxlength="64" /></label>
+                  </div>
+                  <div class="actions">
+                    <button id="applyWifiProfile" class="primary">Use for this device</button>
+                    <button id="saveWifiProfile">Save profile</button>
+                    <button id="newWifiProfile">New</button>
+                    <button id="deleteWifiProfile" class="danger">Delete</button>
+                  </div>
+                </div>
+                <div id="mqttProfileSection" class="profile-editor">
+                  <h4>MQTT profile</h4>
+                  <div class="profile-grid">
+                    <label>Saved profile<select id="mqttProfileSelect"></select></label>
+                    <label>Profile name<input id="mqttProfileName" maxlength="80" /></label>
+                    <label>Host<input id="profileMqttHost" maxlength="64" /></label>
+                    <label>Port<input id="profileMqttPort" type="number" min="1" max="65535" value="1883" /></label>
+                    <label class="checkbox-row"><input id="profileMqttTls" type="checkbox" /> TLS</label>
+                    <label>Username<input id="profileMqttUsername" maxlength="32" /></label>
+                    <label>Password<input id="profileMqttPassword" type="password" autocomplete="new-password" maxlength="64" /></label>
+                    <label>Base topic<input id="profileMqttBaseTopic" maxlength="32" value="lora-tracker" /></label>
+                    <label class="profile-ca">Root CA certificate<textarea id="profileMqttCa" maxlength="4096"></textarea></label>
+                  </div>
+                  <div class="actions">
+                    <button id="applyMqttProfile" class="primary">Use for this device</button>
+                    <button id="saveMqttProfile">Save profile</button>
+                    <button id="newMqttProfile">New</button>
+                    <button id="deleteMqttProfile" class="danger">Delete</button>
+                  </div>
+                </div>
+              </details>
               <div class="device-manager-grid">
                 <aside>
                   <div class="actions">

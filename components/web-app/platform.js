@@ -8,6 +8,8 @@ const SETTINGS_KEY = "lora-tracker.web.settings";
 const PASSWORD_KEY = "mqtt-password";
 const WEB_PASSWORD_KEY = "lora-tracker.mqtt-password";
 const DEVICES_KEY = "lora-tracker.devices.v1";
+const PROFILES_KEY = "configuration-profiles-v1";
+const WEB_PROFILES_KEY = "lora-tracker.configuration-profiles.v1";
 export const isNativeApp = Capacitor.isNativePlatform();
 
 export async function loadSettings() {
@@ -78,6 +80,32 @@ export async function saveDevices(devices) {
   const value = JSON.stringify(devices);
   if (isNativeApp) await Preferences.set({ key: DEVICES_KEY, value });
   else localStorage.setItem(DEVICES_KEY, value);
+}
+
+export async function loadConfigurationProfiles() {
+  let raw = null;
+  if (isNativeApp) {
+    await prepareSecureStorage();
+    raw = await SecureStorage.getItem(PROFILES_KEY);
+  } else {
+    raw = localStorage.getItem(WEB_PROFILES_KEY);
+  }
+  if (!raw) return { wifi: [], mqtt: [] };
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return { wifi: [], mqtt: [] };
+  }
+}
+
+export async function saveConfigurationProfiles(profiles) {
+  const value = JSON.stringify(profiles);
+  if (isNativeApp) {
+    await prepareSecureStorage();
+    await SecureStorage.setItem(PROFILES_KEY, value);
+  } else {
+    localStorage.setItem(WEB_PROFILES_KEY, value);
+  }
 }
 
 function deviceSecretKey(deviceId, kind) {
