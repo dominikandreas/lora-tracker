@@ -19,7 +19,7 @@ function normalizeMqtt(profile) {
   return {
     id: text(profile.id, 80),
     name: text(profile.name, 80),
-    host: text(profile.host, 64),
+    host: text(profile.host, 64).trim(),
     port:
       proposedPort >= 1 && proposedPort <= 65535
         ? proposedPort
@@ -29,8 +29,9 @@ function normalizeMqtt(profile) {
     tls_enabled: tlsEnabled,
     username: text(profile.username, 32),
     password: text(profile.password, 64),
-    base_topic: text(profile.base_topic || "lora-tracker", 32),
+    base_topic: text(profile.base_topic || "lora-tracker", 32).trim(),
     ca_certificate: text(profile.ca_certificate, 4096),
+    websocket_url: text(profile.websocket_url, 512).trim(),
   };
 }
 
@@ -54,6 +55,17 @@ export function upsertConfigurationProfile(profiles, kind, profile) {
   if (!item.id || !item.name) throw new Error("Profile name is required");
   if (kind === "wifi" && !item.ssid) throw new Error("Wi-Fi SSID is required");
   if (kind === "mqtt" && !item.host) throw new Error("MQTT host is required");
+  if (kind === "mqtt" && item.websocket_url) {
+    let parsed;
+    try {
+      parsed = new URL(item.websocket_url);
+    } catch {
+      throw new Error("App WebSocket URL is invalid");
+    }
+    if (!["ws:", "wss:"].includes(parsed.protocol)) {
+      throw new Error("App WebSocket URL must use ws:// or wss://");
+    }
+  }
   const index = normalized[kind].findIndex(({ id }) => id === item.id);
   if (index >= 0) normalized[kind][index] = item;
   else normalized[kind].push(item);
@@ -85,4 +97,29 @@ export function configurationFieldsForProfile(kind, profile) {
     };
   }
   throw new Error("Unknown profile type");
+}
+
+export function mqttWebSocketUrlForProfile(profile) {
+  const value = normalizeMqtt(profile || {});
+  if (value.websocket_url) return value.websocket_url;
+  const scheme = value.tls_enabled ? "wss" : "ws";
+  const port = value.tls_enabled ? 8884 : 1884;
+  return value.host ? `${scheme}://${value.host}:${port}` : "";
+}
+
+export function applicationFieldsForMqttProfile(profile) {
+  const value = normalizeMqtt(profile || {});
+  return {
+    brokerUrl: mqttWebSocketUrlForProfile(value),
+    baseTopic: value.base_topic,
+    username: value.username,
+    password: value.password,
+  };
+}
+
+export function profileKindsForRole(role) {
+  return {
+    wifi: role === "tracker" || role === "gateway",
+    mqtt: role === "gateway",
+  };
 }

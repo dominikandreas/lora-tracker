@@ -338,6 +338,14 @@ button.danger {
 .profile-ca {
   grid-column: 1 / -1;
 }
+.connection-profile-actions {
+  margin-top: 10px;
+}
+input[readonly] {
+  background: color-mix(in srgb, var(--surface) 78%, var(--line));
+  color: var(--muted);
+  cursor: default;
+}
 .radio-key {
   grid-column: span 3;
 }

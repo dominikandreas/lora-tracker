@@ -31,8 +31,10 @@ import {
   renderDeviceConfig,
 } from "./device-config.js";
 import {
+  applicationFieldsForMqttProfile,
   configurationFieldsForProfile,
   normalizeConfigurationProfiles,
+  profileKindsForRole,
   removeConfigurationProfile,
   upsertConfigurationProfile,
 } from "./configuration-profiles.js";
@@ -82,20 +84,37 @@ const bleScanner = createBleDeviceScanner();
 
 const saved = await loadSettings();
 let startupWarning = "";
-els.brokerUrl.value = normalizeBrokerWebSocketUrl(saved.brokerUrl || "");
-els.baseTopic.value = saved.baseTopic || "lora-tracker";
-els.username.value = saved.username || "";
+let appMqttProfileId = configurationProfiles.mqtt.some(
+  ({ id }) => id === saved.mqttProfileId,
+)
+  ? saved.mqttProfileId
+  : "";
+const startupMqttProfile = configurationProfiles.mqtt.find(
+  ({ id }) => id === appMqttProfileId,
+);
+const startupMqtt = startupMqttProfile
+  ? applicationFieldsForMqttProfile(startupMqttProfile)
+  : {
+      brokerUrl: saved.brokerUrl || "",
+      baseTopic: saved.baseTopic || "lora-tracker",
+      username: saved.username || "",
+      password: "",
+    };
+els.brokerUrl.value = normalizeBrokerWebSocketUrl(startupMqtt.brokerUrl);
+els.baseTopic.value = startupMqtt.baseTopic;
+els.username.value = startupMqtt.username;
+els.password.value = startupMqtt.password;
 if (isNativeApp) {
   document.documentElement.classList.add("native-app");
   els.credentialStorageHint.textContent =
-    "The password is saved automatically in Android Keystore-backed encrypted storage.";
+    "Connection profiles and manual MQTT passwords are saved in Android Keystore-backed encrypted storage.";
 } else {
   els.credentialStorageHint.textContent =
-    "The password is saved in this site's local browser storage. Use only a trusted browser profile.";
+    "Connection profiles and manual MQTT passwords are saved in this site's local browser storage. Use only a trusted browser profile.";
 }
 try {
-  const storedPassword = await loadStoredMqttPassword();
-  if (storedPassword) {
+  const storedPassword = appMqttProfileId ? null : await loadStoredMqttPassword();
+  if (storedPassword && !els.password.value) {
     els.password.value = storedPassword;
   }
 } catch (error) {
@@ -219,6 +238,14 @@ async function persistCurrentDevice() {
       previous.bleId,
       currentBleId(deviceSession.manager),
     ),
+    wifiProfileId:
+      deviceSession.selectedWifiProfileId !== undefined
+        ? deviceSession.selectedWifiProfileId || null
+        : previous.wifiProfileId || null,
+    mqttProfileId:
+      deviceSession.selectedMqttProfileId !== undefined
+        ? deviceSession.selectedMqttProfileId || null
+        : previous.mqttProfileId || null,
     lastSeen: new Date().toISOString(),
   };
   devices = [
@@ -276,7 +303,7 @@ function renderUnpairedDevices() {
     const button = document.createElement("button");
     button.className = "device-card";
     const title = document.createElement("strong");
-    title.textContent = candidate.name || "LoRa tracker";
+    title.textContent = candidate.name || "LoRa device";
     const detail = document.createElement("span");
     detail.textContent = "Nearby device · Bluetooth";
     button.append(title, detail);
@@ -320,7 +347,6 @@ async function resetDeviceSession() {
   els.deviceConfigPanel.hidden = true;
   els.bleOutput.textContent = "";
   setBleStatus("Disconnected");
-  setProfileApplyAvailability(null);
 }
 
 function summarizeDevice(config, transport) {
@@ -328,14 +354,14 @@ function summarizeDevice(config, transport) {
     ? `${config.config_complete ? "Configured" : "Needs configuration"} · ${config.gateway_paired ? `Added to ${(config.paired_gateway_ids || [config.paired_gateway_id]).filter(Boolean).join(", ")}` : "Not added to a gateway"}`
     : config.role === "gateway"
       ? `${config.onboarding_required ? "Onboarding incomplete" : "Operational"} · ${config.trackers?.length || 0} tracker(s)`
-      : `${config.onboarding_required ? "Onboarding incomplete" : "Operational"} · Wi-Fi configuration portal`;
+      : `${config.onboarding_required ? "Onboarding incomplete" : "Operational"} · LoRa-only repeater`;
   els.deviceStateSummary.textContent = `${deviceNameFromConfig(config)} · ${config.role} · ${transport} · revision ${config.revision} · ${state}`;
 }
 
 async function showDeviceConfig(config) {
   deviceSession.config = config;
   renderDeviceConfig(els.deviceConfigFields, config);
-  renderConfigurationProfiles(config.role);
+  renderDeviceProfileAssignments(config);
   summarizeDevice(config, deviceSession.mode === "wifi" ? "Wi-Fi" : "Bluetooth");
   els.deviceConfigPanel.hidden = false;
   els.trackerPairingPanel.hidden = config.role !== "tracker";
@@ -383,6 +409,7 @@ const profileUi = {
       password: els.profileMqttPassword,
       base_topic: els.profileMqttBaseTopic,
       ca_certificate: els.profileMqttCa,
+      websocket_url: els.profileMqttWebSocketUrl,
     },
   },
 };
@@ -432,15 +459,9 @@ function renderProfileSelect(kind, preferredId = profileUi[kind].select.value) {
   }
 }
 
-function renderConfigurationProfiles(role) {
+function renderConfigurationProfiles() {
   renderProfileSelect("wifi");
   renderProfileSelect("mqtt");
-  setProfileApplyAvailability(role);
-}
-
-function setProfileApplyAvailability(role) {
-  els.applyWifiProfile.disabled = !["tracker", "gateway"].includes(role);
-  els.applyMqttProfile.disabled = role !== "gateway";
 }
 
 function profileFromEditor(kind) {
@@ -464,6 +485,205 @@ function fillDeviceConfiguration(fields) {
   }
 }
 
+function populateDeviceProfileSelect(select, profiles, selectedId) {
+  select.replaceChildren(new Option("Select a saved profile", ""));
+  for (const profile of profiles) {
+    select.append(new Option(profile.name, profile.id));
+  }
+  select.value = profiles.some(({ id }) => id === selectedId)
+    ? selectedId
+    : "";
+}
+
+function matchingWifiProfile(config) {
+  return configurationProfiles.wifi.find(
+    ({ ssid }) => ssid && ssid === config.wifi_ssid,
+  )?.id;
+}
+
+function matchingMqttProfile(config) {
+  return configurationProfiles.mqtt.find(
+    (profile) =>
+      profile.host === config.mqtt?.host &&
+      profile.port === config.mqtt?.port &&
+      profile.tls_enabled === Boolean(config.mqtt?.tls_enabled) &&
+      profile.username === (config.mqtt?.username || "") &&
+      profile.base_topic === (config.mqtt?.base_topic || "lora-tracker"),
+  )?.id;
+}
+
+function availableProfileId(kind, id) {
+  return configurationProfiles[kind].some((profile) => profile.id === id)
+    ? id
+    : "";
+}
+
+function renderDeviceProfileAssignments(config) {
+  const { wifi: supportsWifi, mqtt: supportsMqtt } = profileKindsForRole(
+    config.role,
+  );
+  els.deviceWifiProfileRow.hidden = !supportsWifi;
+  els.deviceMqttProfileRow.hidden = !supportsMqtt;
+
+  if (!supportsWifi && !supportsMqtt) {
+    els.deviceConnectionProfiles.hidden = false;
+    els.deviceProfileHint.textContent =
+      "This repeater is LoRa-only in normal operation. It has no station Wi-Fi or MQTT client, so connection profiles do not apply; use its temporary setup access point for configuration.";
+    return;
+  }
+
+  els.deviceConnectionProfiles.hidden = false;
+
+  const record = deviceSession.record || {};
+  const hasWifiSelection = Object.hasOwn(deviceSession, "selectedWifiProfileId");
+  const hasMqttSelection = Object.hasOwn(deviceSession, "selectedMqttProfileId");
+  deviceSession.selectedWifiProfileId = supportsWifi
+    ? hasWifiSelection
+      ? deviceSession.selectedWifiProfileId
+      : availableProfileId("wifi", record.wifiProfileId) ||
+        matchingWifiProfile(config) ||
+        (!config.wifi_ssid && configurationProfiles.wifi.length === 1
+          ? configurationProfiles.wifi[0].id
+          : "")
+    : "";
+  deviceSession.selectedMqttProfileId = supportsMqtt
+    ? hasMqttSelection
+      ? deviceSession.selectedMqttProfileId
+      : availableProfileId("mqtt", record.mqttProfileId) ||
+        matchingMqttProfile(config) ||
+        (!config.mqtt?.host && configurationProfiles.mqtt.length === 1
+          ? configurationProfiles.mqtt[0].id
+          : "") ||
+        ""
+    : "";
+  populateDeviceProfileSelect(
+    els.deviceWifiProfileSelect,
+    configurationProfiles.wifi,
+    deviceSession.selectedWifiProfileId,
+  );
+  populateDeviceProfileSelect(
+    els.deviceMqttProfileSelect,
+    configurationProfiles.mqtt,
+    deviceSession.selectedMqttProfileId,
+  );
+  if (supportsWifi && !config.wifi_ssid && deviceSession.selectedWifiProfileId) {
+    const profile = configurationProfiles.wifi.find(
+      ({ id }) => id === deviceSession.selectedWifiProfileId,
+    );
+    if (profile) fillDeviceConfiguration(configurationFieldsForProfile("wifi", profile));
+  }
+  if (supportsMqtt && !config.mqtt?.host && deviceSession.selectedMqttProfileId) {
+    const profile = configurationProfiles.mqtt.find(
+      ({ id }) => id === deviceSession.selectedMqttProfileId,
+    );
+    if (profile) fillDeviceConfiguration(configurationFieldsForProfile("mqtt", profile));
+  }
+  els.deviceProfileHint.textContent = supportsMqtt
+    ? "Select the Wi-Fi and MQTT profiles for this gateway. Selection fills the configuration below; Save and verify performs the device write."
+    : "Select the Wi-Fi profile for this tracker. Selection fills the configuration below; Save and verify performs the device write.";
+}
+
+async function selectDeviceProfile(kind, id) {
+  if (!deviceSession?.config) return;
+  if (!id) {
+    if (kind === "wifi") deviceSession.selectedWifiProfileId = "";
+    else deviceSession.selectedMqttProfileId = "";
+    await persistCurrentDevice();
+    appendBleOutput(
+      `${kind === "wifi" ? "Wi-Fi" : "MQTT"} profile assignment cleared. Existing form values were left unchanged.`,
+    );
+    return;
+  }
+  const profile = configurationProfiles[kind].find((item) => item.id === id);
+  if (!profile) return;
+  fillDeviceConfiguration(configurationFieldsForProfile(kind, profile));
+  if (kind === "wifi") deviceSession.selectedWifiProfileId = id;
+  else deviceSession.selectedMqttProfileId = id;
+  await persistCurrentDevice();
+  appendBleOutput(
+    `${kind === "wifi" ? "Wi-Fi" : "MQTT"} profile “${profile.name}” selected. Use Save and verify to write it to the device.`,
+  );
+}
+
+els.deviceWifiProfileSelect.addEventListener("change", () =>
+  selectDeviceProfile("wifi", els.deviceWifiProfileSelect.value),
+);
+els.deviceMqttProfileSelect.addEventListener("change", () =>
+  selectDeviceProfile("mqtt", els.deviceMqttProfileSelect.value),
+);
+
+function setApplicationMqttProfile(profileId) {
+  const profile = configurationProfiles.mqtt.find(({ id }) => id === profileId);
+  appMqttProfileId = profile?.id || "";
+  if (profile) {
+    const fields = applicationFieldsForMqttProfile(profile);
+    els.brokerUrl.value = normalizeBrokerWebSocketUrl(fields.brokerUrl);
+    els.baseTopic.value = fields.baseTopic;
+    els.username.value = fields.username;
+    els.password.value = fields.password;
+  }
+  for (const input of [
+    els.brokerUrl,
+    els.baseTopic,
+    els.username,
+    els.password,
+  ]) {
+    input.readOnly = Boolean(profile);
+  }
+}
+
+function renderApplicationMqttProfiles() {
+  els.appMqttProfileSelect.replaceChildren(
+    new Option("Manual settings", ""),
+  );
+  for (const profile of configurationProfiles.mqtt) {
+    els.appMqttProfileSelect.append(new Option(profile.name, profile.id));
+  }
+  els.appMqttProfileSelect.value = configurationProfiles.mqtt.some(
+    ({ id }) => id === appMqttProfileId,
+  )
+    ? appMqttProfileId
+    : "";
+  setApplicationMqttProfile(els.appMqttProfileSelect.value);
+}
+
+function prefillMqttProfileFromApplication() {
+  if (profileUi.mqtt.select.value || !els.brokerUrl.value.trim()) return;
+  let url;
+  try {
+    url = new URL(normalizeBrokerWebSocketUrl(els.brokerUrl.value));
+  } catch {
+    return;
+  }
+  if (!["ws:", "wss:"].includes(url.protocol)) return;
+  if (!profileUi.mqtt.name.value) profileUi.mqtt.name.value = "App MQTT";
+  profileUi.mqtt.fields.host.value = url.hostname;
+  profileUi.mqtt.fields.port.value = url.protocol === "wss:" ? "8883" : "1883";
+  profileUi.mqtt.fields.tls_enabled.checked = url.protocol === "wss:";
+  profileUi.mqtt.fields.username.value = els.username.value;
+  profileUi.mqtt.fields.password.value = els.password.value;
+  profileUi.mqtt.fields.base_topic.value = els.baseTopic.value || "lora-tracker";
+  profileUi.mqtt.fields.websocket_url.value = url.toString();
+}
+
+els.appMqttProfileSelect.addEventListener("change", async () => {
+  setApplicationMqttProfile(els.appMqttProfileSelect.value);
+  await storeMqttPassword(appMqttProfileId ? "" : els.password.value);
+  await saveSettings();
+});
+
+els.manageConnectionProfiles.addEventListener("click", () => {
+  els.onboardingPanel.hidden = false;
+  els.connectionProfiles.open = true;
+  prefillMqttProfileFromApplication();
+  renderDeviceInventory();
+  els.connectionProfiles.scrollIntoView({ behavior: "smooth", block: "start" });
+});
+
+els.connectionProfiles.addEventListener("toggle", () => {
+  if (els.connectionProfiles.open) prefillMqttProfileFromApplication();
+});
+
 for (const kind of ["wifi", "mqtt"]) {
   const title = kind === "wifi" ? "Wi-Fi" : "MQTT";
   const idPrefix = kind === "wifi" ? "Wifi" : "Mqtt";
@@ -483,6 +703,23 @@ for (const kind of ["wifi", "mqtt"]) {
       );
       await saveConfigurationProfiles(configurationProfiles);
       renderProfileSelect(kind, profile.id);
+      if (kind === "mqtt") {
+        if (!appMqttProfileId) appMqttProfileId = profile.id;
+        renderApplicationMqttProfiles();
+        await storeMqttPassword("");
+        await saveSettings();
+      }
+      if (deviceSession?.config) {
+        const selectedId = kind === "wifi"
+          ? deviceSession.selectedWifiProfileId
+          : deviceSession.selectedMqttProfileId;
+        if (selectedId === profile.id) {
+          fillDeviceConfiguration(
+            configurationFieldsForProfile(kind, profile),
+          );
+        }
+        renderDeviceProfileAssignments(deviceSession.config);
+      }
       appendBleOutput(`${title} profile “${profile.name}” saved in the app.`);
     } catch (error) {
       appendBleOutput(`Could not save ${title} profile: ${error.message}`);
@@ -497,25 +734,40 @@ for (const kind of ["wifi", "mqtt"]) {
       id,
     );
     await saveConfigurationProfiles(configurationProfiles);
+    devices = devices.map((device) => ({
+      ...device,
+      ...(kind === "wifi" && device.wifiProfileId === id
+        ? { wifiProfileId: null }
+        : {}),
+      ...(kind === "mqtt" && device.mqttProfileId === id
+        ? { mqttProfileId: null }
+        : {}),
+    }));
+    await saveDevices(devices);
+    if (kind === "wifi" && deviceSession?.selectedWifiProfileId === id) {
+      deviceSession.selectedWifiProfileId = "";
+    }
+    if (kind === "mqtt") {
+      if (deviceSession?.selectedMqttProfileId === id) {
+        deviceSession.selectedMqttProfileId = "";
+      }
+      if (appMqttProfileId === id) {
+        appMqttProfileId = "";
+        await storeMqttPassword(els.password.value);
+      }
+      renderApplicationMqttProfiles();
+      await saveSettings();
+    }
     renderProfileSelect(kind);
+    if (deviceSession?.config) {
+      renderDeviceProfileAssignments(deviceSession.config);
+      await persistCurrentDevice();
+    }
     appendBleOutput(`${title} profile removed from the app.`);
   });
-  els[`apply${idPrefix}Profile`].addEventListener("click", () => {
-    if (els[`apply${idPrefix}Profile`].disabled || !deviceSession?.config) {
-      appendBleOutput(`Connect a compatible device before applying a ${title} profile.`);
-      return;
-    }
-    const id = profileUi[kind].select.value;
-    const profile = configurationProfiles[kind].find((item) => item.id === id);
-    if (!profile) {
-      appendBleOutput(`Select a saved ${title} profile first.`);
-      return;
-    }
-    fillDeviceConfiguration(configurationFieldsForProfile(kind, profile));
-    appendBleOutput(`${title} profile applied. Use Save and verify to write it to the device.`);
-  });
 }
-renderConfigurationProfiles(null);
+renderConfigurationProfiles();
+renderApplicationMqttProfiles();
 els.profileMqttTls.addEventListener("change", () => {
   const current = Number.parseInt(els.profileMqttPort.value, 10);
   if (current === 1883 || current === 8883 || !current) {
@@ -537,7 +789,6 @@ async function connectBle(bleId = null, knownRecord = null) {
   manager.transport.onDisconnect = () => {
     if (deviceSession?.manager === manager) {
       setBleStatus("Disconnected");
-      setProfileApplyAvailability(null);
     }
   };
   try {
@@ -630,11 +881,13 @@ async function openSavedDevice(record) {
   }
 }
 
-els.onboardingButton.addEventListener("click", () => {
+els.onboardingButton.addEventListener("click", async () => {
   els.onboardingPanel.hidden = !els.onboardingPanel.hidden;
   if (!els.onboardingPanel.hidden) {
     renderDeviceInventory();
-    startUnpairedDeviceScan();
+    await startUnpairedDeviceScan();
+  } else {
+    await bleScanner.stop();
   }
 });
 
@@ -690,7 +943,11 @@ els.saveDeviceConfig.addEventListener("click", async () => {
       if (deviceSession.config.role === "tracker") {
         if (fields.device_id) deviceSession.config.device_id = fields.device_id;
         if (fields.device_name) deviceSession.config.device_name = fields.device_name;
-      } else {
+        if (fields.wifi_ssid) {
+          deviceSession.address = `http://lora-tracker-${deviceSession.config.device_id}.local`;
+          deviceSession.config.network_ip = "off";
+        }
+      } else if (deviceSession.config.role === "gateway") {
         if (fields.gateway_id) deviceSession.config.gateway_id = fields.gateway_id;
         if (fields.gateway_name) deviceSession.config.gateway_name = fields.gateway_name;
         if (fields.wifi_ssid) {
@@ -953,6 +1210,7 @@ els.factoryResetDevice.addEventListener("click", async () => {
     await resetDeviceSession();
     renderDeviceInventory();
     renderUnpairedDevices();
+    if (!els.onboardingPanel.hidden) await startUnpairedDeviceScan();
   } catch (error) { appendBleOutput(`Factory reset failed: ${error.message}`); }
 });
 
@@ -969,11 +1227,11 @@ els.forgetDevice.addEventListener("click", async () => {
   await storeDeviceSecret(id, null, "lora-key");
   await resetDeviceSession();
   renderDeviceInventory();
+  if (!els.onboardingPanel.hidden) await startUnpairedDeviceScan();
 });
 
 renderDeviceInventory();
 renderUnpairedDevices();
-startUnpairedDeviceScan();
 
 async function importPmtiles(file) {
   // Validate and display before replacing the persisted archive.
@@ -1060,6 +1318,7 @@ els.pmtilesInput?.addEventListener("change", async (e) => {
 
 async function saveSettings() {
   await savePlatformSettings({
+    mqttProfileId: appMqttProfileId,
     brokerUrl: els.brokerUrl.value.trim(),
     baseTopic: els.baseTopic.value.trim() || "lora-tracker",
     username: els.username.value.trim(),
@@ -1374,7 +1633,7 @@ els.connectButton.addEventListener("click", async () => {
   }
   try {
     await saveSettings();
-    await storeMqttPassword(els.password.value);
+    await storeMqttPassword(appMqttProfileId ? "" : els.password.value);
   } catch (error) {
     console.warn("Could not persist application settings", error);
     els.connectionMessage.textContent =
@@ -1451,7 +1710,7 @@ try {
   await addAppStateListener((isActive) => {
     if (isActive) {
       mapManager.invalidateSize();
-      startUnpairedDeviceScan();
+      if (!els.onboardingPanel.hidden) startUnpairedDeviceScan();
     } else {
       bleScanner.stop().catch((error) => console.warn("Could not pause Bluetooth discovery", error));
     }

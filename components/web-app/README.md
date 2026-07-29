@@ -27,10 +27,12 @@ WebSocket and bundles Leaflet, PMTiles and the complete Network Lab locally.
 - Installable/offline application shell through a service worker
 - Automatic MQTT password storage: Android Keystore-backed storage in the
   native app and origin-scoped localStorage in the browser
-- Reusable Wi-Fi and gateway MQTT profiles stored independently from device
-  records. Selecting a profile fills the matching device fields before the
-  normal transactional **Save and verify** operation. Android keeps the entire
-  profile, including passwords, in Keystore-backed encrypted storage.
+- Reusable Wi-Fi and MQTT profiles stored independently from device records.
+  A connected tracker exposes its Wi-Fi selector and a gateway exposes both
+  selectors beside the device form. The same MQTT profile drives the app's
+  MQTT-over-WebSocket connection and the gateway's raw MQTT client. Android
+  keeps the complete profile, including passwords, in Keystore-backed encrypted
+  storage.
 
 ## Run
 
@@ -77,12 +79,15 @@ field if the network cannot resolve its `.local` hostname. The application ID is
 derived from the repository-level `VERSION` file. Android CI performs the same
 sync and Gradle build and uploads a debug APK artifact.
 
-Create Wi-Fi and MQTT profiles in **Reusable connection profiles** after
-connecting to a device. Profiles belong to the app rather than to one device:
-save a profile once, select **Use for this device**, then press **Save and
+Create Wi-Fi and MQTT profiles in **Reusable connection profiles** at any time.
+Profiles belong to the app rather than to one device: save them once, select
+them under a connected device's **Connection settings**, then press **Save and
 verify**. Trackers expose Wi-Fi profiles; gateways expose both Wi-Fi and MQTT
-profiles. Profile selection only fills the form and never changes a device
-until the explicit save succeeds.
+profiles. The dashboard also selects from the same MQTT profiles. A profile has
+a raw MQTT host/port for gateway firmware and an optional WebSocket URL for the
+app; if omitted, the app derives `ws://host:1884` or `wss://host:8884`.
+Repeaters are LoRa-only during normal operation and therefore have no station
+Wi-Fi or MQTT profile.
 
 ## Deliberate limitations
 

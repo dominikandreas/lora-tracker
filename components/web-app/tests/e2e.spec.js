@@ -75,7 +75,7 @@ test.describe("PWA Offline & Mode Tests", () => {
     await expect(page.locator("#importDeviceQrButton")).toBeVisible();
   });
 
-  test("connection profiles can be created before a device and survive reload", async ({
+  test("connection profiles are reusable by devices and the app after reload", async ({
     page,
   }) => {
     await page.locator("#onboardingButton").click();
@@ -87,8 +87,26 @@ test.describe("PWA Offline & Mode Tests", () => {
     await page.locator("#profileWifiPassword").fill("test-secret");
     await page.locator("#saveWifiProfile").click();
     await expect(page.locator("#wifiProfileSelect")).toHaveValue(/.+/);
+    await page.locator("#mqttProfileName").fill("Pasture broker");
+    await page.locator("#profileMqttHost").fill("192.168.1.217");
+    await page.locator("#profileMqttUsername").fill("tracker-user");
+    await page.locator("#profileMqttPassword").fill("mqtt-secret");
+    await page.locator("#profileMqttBaseTopic").fill("farm");
+    await page.locator("#saveMqttProfile").click();
+    await expect(page.locator("#appMqttProfileSelect")).toHaveValue(/.+/);
+    await expect(page.locator("#brokerUrl")).toHaveValue(
+      "ws://192.168.1.217:1884",
+    );
+    await expect(page.locator("#password")).toHaveValue("mqtt-secret");
+    await expect(page.locator("#brokerUrl")).toHaveAttribute("readonly", "");
 
     await page.reload();
+    await expect(page.locator("#appMqttProfileSelect")).toHaveValue(/.+/);
+    await expect(page.locator("#brokerUrl")).toHaveValue(
+      "ws://192.168.1.217:1884",
+    );
+    await expect(page.locator("#baseTopic")).toHaveValue("farm");
+    await expect(page.locator("#password")).toHaveValue("mqtt-secret");
     await page.locator("#onboardingButton").click();
     await page.locator("#connectionProfiles").evaluate((element) => {
       element.open = true;
@@ -102,7 +120,6 @@ test.describe("PWA Offline & Mode Tests", () => {
       localStorage.removeItem("lora-tracker.configuration-profiles.v1"),
     );
   });
-
 
   test("Network Lab is bundled with the application", async ({
     page,

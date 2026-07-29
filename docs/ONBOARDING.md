@@ -30,10 +30,13 @@ it physically attended until the app confirms the claim.
    unclaimed. Android also retries transient GATT connection failures three
    times. Claim itself does not start OTA or other memory-heavy services before
    acknowledging the app.
-6. In **Reusable connection profiles**, create or select a Wi-Fi profile and,
-   for a gateway, an MQTT profile. Choose **Use for this device** for each one,
-   then configure the remaining role-specific settings and press **Save and
-   verify**. Profiles are app-owned and can be reused for every later device.
+6. In **Reusable connection profiles**, create a Wi-Fi profile and an MQTT
+   profile once. When a tracker or gateway is connected, select the appropriate
+   profile directly under **Connection settings**; selection immediately fills
+   the complete form. Trackers use Wi-Fi profiles, while gateways use both.
+   Configure the remaining role-specific settings and press **Save and verify**.
+   The MQTT profile can also be selected in the app's MQTT connection panel, so
+   its topic and credentials are not entered a second time.
    With an empty SSID,
    firmware skips station association entirely; it does not call
    `WiFi.begin()` or enter a reconnect loop.
@@ -87,9 +90,16 @@ owner key can authenticate without an OS bond. Station Wi-Fi is preferred for
 normal management. Holding USER for five seconds opens configuration mode and
 the setup AP for ten minutes.
 
+An incomplete tracker keeps its custom BLE configuration service available
+without a timeout, including the interval after Wi-Fi has been saved but before
+gateway registration is confirmed. Once onboarding is complete, its normal
+bounded BLE/low-power policy resumes. Gateway BLE management remains available
+after onboarding and always requires the stored owner key.
+
 Repeaters do not need tracker LoRa keys and do not expose BLE. Claim and manage
-them through their open, attended setup AP. Repeating remains disabled until a
-valid radio/forwarding configuration has been saved.
+them through their open, attended setup AP. They do not run a station Wi-Fi or
+MQTT client in normal operation, so Wi-Fi/MQTT profiles do not apply. Repeating
+remains disabled until a valid radio/forwarding configuration has been saved.
 
 ## Transfer access by QR
 

@@ -45,6 +45,11 @@
         </div>
         <div class="form-grid">
           <label
+            >Saved MQTT profile<select id="appMqttProfileSelect">
+              <option value="">Manual settings</option>
+            </select></label
+          >
+          <label
             >WebSocket URL<input
               id="brokerUrl"
               placeholder="ws://192.168.1.10 (defaults to port 1884)"
@@ -58,9 +63,14 @@
               autocomplete="current-password"
           /></label>
         </div>
+        <div class="actions connection-profile-actions">
+          <button id="manageConnectionProfiles">Manage connection profiles</button>
+        </div>
         <p class="hint">
           <span id="credentialStorageHint">The password is saved locally on this device.</span>
-          Broker URL, topic and username are saved locally.
+          Select an MQTT profile to use the same broker settings and credentials
+          for the app and gateways. MQTT-over-WebSocket may use a different port
+          from the gateway's raw MQTT connection.
         </p>
         <p id="connectionMessage" class="status-line">Not connected.</p>
       </section>
@@ -145,7 +155,7 @@
               </p>
               <details id="connectionProfiles">
                 <summary>Reusable connection profiles</summary>
-                <p class="hint">Create these once, independently of a device. After connecting a compatible device, select a profile and choose Use for this device to fill its form.</p>
+                <p class="hint">Create these once, independently of a device. Select them beside a connected device to fill its form immediately. MQTT profiles also feed the app connection selector above.</p>
                 <div id="wifiProfileSection" class="profile-editor">
                   <h4>Wi-Fi profile</h4>
                   <div class="profile-grid">
@@ -155,7 +165,6 @@
                     <label>Password<input id="profileWifiPassword" type="password" autocomplete="new-password" maxlength="64" /></label>
                   </div>
                   <div class="actions">
-                    <button id="applyWifiProfile" class="primary">Use for this device</button>
                     <button id="saveWifiProfile">Save profile</button>
                     <button id="newWifiProfile">New</button>
                     <button id="deleteWifiProfile" class="danger">Delete</button>
@@ -172,10 +181,10 @@
                     <label>Username<input id="profileMqttUsername" maxlength="32" /></label>
                     <label>Password<input id="profileMqttPassword" type="password" autocomplete="new-password" maxlength="64" /></label>
                     <label>Base topic<input id="profileMqttBaseTopic" maxlength="32" value="lora-tracker" /></label>
+                    <label class="profile-ca">App WebSocket URL<input id="profileMqttWebSocketUrl" maxlength="512" placeholder="Derived as ws(s)://host:1884/8884 when empty" /></label>
                     <label class="profile-ca">Root CA certificate<textarea id="profileMqttCa" maxlength="4096"></textarea></label>
                   </div>
                   <div class="actions">
-                    <button id="applyMqttProfile" class="primary">Use for this device</button>
                     <button id="saveMqttProfile">Save profile</button>
                     <button id="newMqttProfile">New</button>
                     <button id="deleteMqttProfile" class="danger">Delete</button>
@@ -204,6 +213,14 @@
                   </div>
                   <div id="deviceConfigPanel" hidden>
                     <div id="deviceStateSummary" class="device-state-summary"></div>
+                    <div id="deviceConnectionProfiles" class="device-state-summary">
+                      <h4>Connection settings</h4>
+                      <div class="profile-grid">
+                        <label id="deviceWifiProfileRow">Wi-Fi profile<select id="deviceWifiProfileSelect"></select></label>
+                        <label id="deviceMqttProfileRow">MQTT profile<select id="deviceMqttProfileSelect"></select></label>
+                      </div>
+                      <p id="deviceProfileHint" class="hint"></p>
+                    </div>
                     <details open>
                       <summary>Complete configuration</summary>
                       <div id="deviceConfigFields" class="config-grid"></div>
