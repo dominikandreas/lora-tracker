@@ -6,7 +6,7 @@
   "scripts": {
     "build": "npm --prefix ../simulation-engine run build && node scripts/copy-engine.mjs",
     "copy-engine": "node scripts/copy-engine.mjs",
-    "test:browser": "npm run copy-engine && playwright test",
+    "test:browser": "npm run copy-engine && node scripts/test-browser.mjs",
     "serve": "node scripts/serve.mjs 8080 app"
   },
   "devDependencies": {
