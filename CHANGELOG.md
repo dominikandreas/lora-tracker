@@ -2,6 +2,12 @@
 
 ## Unreleased — production-hardening pass
 
+- Added resilient tracker-to-gateway pairing over owner-key-encrypted MQTT,
+  current LAN/mDNS addresses, or nearby BLE, with visible transaction progress,
+  retained station-address discovery, and automatic setup-AP address removal.
+- Fixed GNSS acquisition so normal tracking continuously services a larger UART
+  buffer, uses viable cold/retry budgets, preserves acquisition state during
+  invalid-stream recovery, and displays separate visible/used satellite counts.
 - Removed support for all superseded LoRa, point and history-request schemas.
 - Changed the product, package, workspace and default MQTT namespace to LoRa Tracker.
 - Added certificate-verified gateway MQTT TLS and explicit plaintext opt-in.

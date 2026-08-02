@@ -16,6 +16,8 @@ hardware support or multiple public interfaces.
       transactional configuration and recovery actions.
 - [x] Add QR owner-key transfer between app installations.
 - [ ] Add fleet recovery, auditable key rotation and revocation policy.
+- [ ] Add expiring, owner-authorized gateway invitation tokens for brokerless
+      LoRa-only tracker enrollment; never permit unauthenticated radio pairing.
 - [ ] Replace password-only ArduinoOTA with signed images, Secure Boot v2, flash/NVS encryption and documented eFuse/key custody.
 - [x] Require an application-level archiver receipt before gateway dedup advancement and tracker ACK; retries remain idempotent across QoS-0 loss.
 - [ ] Port the gateway to a current ESP32-S3/SX1262 board and share its RadioLib driver with the tracker.
