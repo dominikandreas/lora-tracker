@@ -299,6 +299,36 @@ button.danger {
   border: 1px solid var(--line);
   border-radius: 10px;
 }
+.pairing-progress {
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel) 75%, var(--accent) 25%);
+}
+.pairing-progress ol {
+  margin: 8px 0;
+  padding-left: 24px;
+}
+.pairing-progress li {
+  color: var(--muted);
+  padding: 3px 0;
+}
+.pairing-progress li.active {
+  color: var(--text);
+  font-weight: 700;
+}
+.pairing-progress li.done {
+  color: var(--accent);
+}
+.pairing-progress li.done::marker {
+  content: "✓  ";
+}
+.pairing-progress li.failed {
+  color: var(--danger, #ef6b6b);
+}
+.pairing-progress p {
+  margin: 8px 0 0;
+}
 .config-grid textarea {
   min-height: 120px;
   resize: vertical;

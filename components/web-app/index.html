@@ -239,11 +239,21 @@
                     </div>
                     <div id="trackerPairingPanel" hidden class="pairing-panel">
                       <h4>Gateway pairing</h4>
-                      <p>Add this tracker to any gateway. Repeat for every gateway that should receive its data.</p>
+                      <p>Add this tracker to any gateway. The app tries MQTT first, then the gateway's current LAN addresses, then nearby Bluetooth.</p>
                       <label>Gateway<select id="pairingGateway"></select></label>
-                      <label>Gateway IP or hostname<input id="pairingGatewayAddress" inputmode="url" placeholder="192.168.1.103" /></label>
-                      <small>The saved address is filled automatically. You can enter the gateway's current LAN IP if its <code>.local</code> name is unavailable.</small>
+                      <label>Current gateway LAN IP (optional)<input id="pairingGatewayAddress" inputmode="url" placeholder="192.168.1.103" /></label>
+                      <small>The old setup-hotspot address is never saved. Enter a LAN IP only when MQTT and the gateway's <code>.local</code> name are unavailable.</small>
                       <button id="pairTrackerGateway" class="primary">Register and finish pairing</button>
+                      <div id="pairingProgress" hidden class="pairing-progress" role="status" aria-live="polite">
+                        <strong id="pairingProgressTitle">Pairing tracker</strong>
+                        <ol>
+                          <li id="pairingStepLocate">Find and authenticate gateway</li>
+                          <li id="pairingStepRegister">Register tracker key on gateway</li>
+                          <li id="pairingStepConfirm">Confirm gateway on tracker</li>
+                          <li id="pairingStepComplete">Pairing complete</li>
+                        </ol>
+                        <p id="pairingProgressDetail"></p>
+                      </div>
                     </div>
                     <div class="actions onboarding-actions">
                       <button id="rollbackDevice">Rollback</button>

@@ -68,6 +68,7 @@ test("Wi-Fi tracker registration uses the narrow idempotent endpoint", async () 
 
 test("pairing keeps one tracker session and commits gateway before tracker", async () => {
   const steps = [];
+  const progress = [];
   let gatewayClosed = false;
   const result = await pairTrackerTransaction({
     trackerConfig: {
@@ -87,8 +88,10 @@ test("pairing keeps one tracker session and commits gateway before tracker", asy
       steps.push(`confirm:${gatewayId}`);
       return { ok: true, gateway_paired: true, gateway_id: gatewayId };
     },
+    onStep: (step) => progress.push(step),
   });
   assert.deepEqual(steps, ["register", "confirm:gateway-one"]);
+  assert.deepEqual(progress, ["locate", "gateway", "tracker", "complete"]);
   assert.equal(gatewayClosed, true);
   assert.equal(result.gatewayId, "gateway-one");
 });

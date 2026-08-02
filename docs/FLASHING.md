@@ -44,6 +44,11 @@ the operator's responsibility.
    open, attended setup AP (`lora-repeater-<suffix>`): connect to it, add
    `192.168.4.1` in the app, and claim it there. Complete
    [onboarding](ONBOARDING.md) before leaving setup mode.
+8. For a tracker, first finish gateway Wi-Fi/MQTT configuration and connect the
+   app to the same MQTT profile. Then configure the tracker and use **Register
+   and finish pairing**. The pairing panel shows each stage and uses encrypted
+   MQTT when the gateway is remote, falling back to LAN/mDNS or nearby BLE. A
+   gateway's setup-AP address is not its normal management address.
 
 The official [esptool-js project](https://github.com/espressif/esptool-js)
 documents the underlying Web Serial transport. ESP Web Tools requires a merged

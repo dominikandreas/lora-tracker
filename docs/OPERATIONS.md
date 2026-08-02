@@ -98,10 +98,19 @@ count and fix age continue to change after the next normal tracking cycle.
 
 ## No GNSS fixes
 
-The tracker progressively reduces acquisition effort and lengthens sleep after
-repeated no-fix cycles. Typical causes include indoor storage, metal roofs,
-antenna orientation or insufficient sky view. A full acquisition is retried
-periodically.
+The tracker gives a cold or periodic recovery attempt at least 90 seconds of
+continuous NMEA processing. Intermediate retries receive at least 30 seconds,
+and their sleep interval grows after repeated failures. A manual GPS-page hold
+provides 60–180 seconds. Typical no-fix causes include indoor storage, metal
+roofs, antenna orientation or insufficient sky view.
+
+The GPS page distinguishes `Vis` (satellites reported by GSV) from `Used`
+(satellites in the GGA solution). `GPS WAIT NMEA` with zero UART bytes for 12
+seconds triggers one receiver power/UART recovery. Bytes without any valid
+sentences for 15 seconds trigger UART-only resynchronization, preserving the
+receiver's acquisition state. BLE debugging must not change acquisition
+success; if it does, capture the `GNSS acquisition policy`, `GNSS recovery
+condition`, and `GNSS listen ended` log lines.
 
 ## MQTT TLS waits for time
 
@@ -164,9 +173,12 @@ trusted browser profile and a dedicated least-privilege MQTT account.
 Pairing always commits the gateway registry first and the tracker confirmation
 second. If the app reports that gateway registration was saved but tracker
 confirmation failed, reconnect the tracker and press **Register and finish
-pairing** again; the gateway upsert is idempotent. If the gateway cannot be
-reached by its saved `.local` name, enter the LAN IP shown by the router or the
-gateway display in the pairing panel. Do not manually copy LoRa keys.
+pairing** again; the gateway upsert is idempotent. Watch the four pairing stages
+to see whether MQTT, LAN, or Bluetooth was selected. A connected MQTT app can
+register remotely through the broker; otherwise the app tries known station
+addresses, mDNS, and nearby Bluetooth. If none work, enter the LAN IP shown by
+the router or gateway display. The obsolete setup-AP address `192.168.4.1` is
+discarded automatically. Do not manually copy LoRa keys.
 
 The app stores a device owner key under the canonical device ID and local BLE
 identifier. Export a full-authority access QR before clearing app data. If no

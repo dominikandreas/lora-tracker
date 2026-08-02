@@ -64,8 +64,33 @@ mode until all of these are true:
 
 Use **Register and finish pairing**. The app commits the gateway registry first
 and confirms the gateway on the still-connected tracker second. Both operations
-are idempotent, so retrying after a timeout is safe. If mDNS is unavailable,
-enter the gateway's current LAN IP beside the gateway selector.
+are idempotent, so retrying after a timeout is safe. The pairing panel shows
+four live stages: gateway discovery/authentication, gateway registration,
+tracker confirmation, and completion. Transport attempts and failures remain
+visible instead of being hidden in the diagnostic log.
+
+Gateway registration tries these transports in order:
+
+1. **MQTT**, when the app is connected to the gateway's broker. This is the
+   normal remote path and works when the phone and tracker are away from the
+   gateway's Wi-Fi. The registration fields are AES-256-GCM encrypted with the
+   gateway owner key and bound to the gateway configuration revision.
+2. **LAN**, using a manually entered current address, learned station addresses,
+   then `lora-gateway-<gateway-id>.local`.
+3. **Bluetooth**, when the saved gateway is nearby.
+
+The gateway publishes its current station IP and configuration revision in its
+retained MQTT status. The app uses that status to repair its saved device record.
+`192.168.4.1` is only the temporary setup AP and is deliberately never retained
+as a gateway LAN address. If MQTT and mDNS are unavailable, enter the current
+LAN IP beside the gateway selector.
+
+There is no unauthenticated LoRa enrollment fallback. Before registration, a
+gateway intentionally cannot authenticate a new tracker and the tracker cannot
+safely send its LoRa key over the air. Remote pairing therefore uses the
+owner-key-encrypted MQTT command. A future LoRa-only flow would require an
+explicit, expiring gateway invitation transferred to the app/tracker first;
+proximity alone must not grant registry access.
 
 A tracker may confirm more than one gateway. Changing either its canonical
 device ID or LoRa AEAD key invalidates every existing gateway confirmation and
@@ -74,8 +99,9 @@ returns it to setup mode; register the new identity/key before pairing again.
 Tracker button actions are page-specific:
 
 - **Status:** reset the daily distance after the on-screen confirmation.
-- **GPS:** acquire a fix; a longer hold requests a longer listen window. Live
-  satellite count, HDOP, and remaining time are displayed before acceptance.
+- **GPS:** acquire a fix; a normal hold requests at least 60 seconds and a
+  six-second hold requests 180 seconds. Live visible/used satellite counts,
+  HDOP, and remaining time are displayed before acceptance.
 - **Radio:** transmit queued history and show the live ACK countdown.
 - **Debug:** toggle bounded BLE debug logging.
 

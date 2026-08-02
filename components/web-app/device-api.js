@@ -31,9 +31,10 @@ function parseBody(data) {
 }
 
 export class WifiDeviceTransport {
-  constructor(address, ownerKey = null) {
+  constructor(address, ownerKey = null, { timeoutMs = 10000 } = {}) {
     this.address = normalizeDeviceAddress(address);
     this.ownerKey = ownerKey;
+    this.timeoutMs = timeoutMs;
   }
 
   async request(path, { method = "GET", fields, authenticated = true } = {}) {
@@ -54,8 +55,8 @@ export class WifiDeviceTransport {
         method,
         headers,
         data,
-        connectTimeout: 5000,
-        readTimeout: 10000,
+        connectTimeout: Math.min(5000, this.timeoutMs),
+        readTimeout: this.timeoutMs,
         responseType: "text",
       });
       status = response.status;
@@ -65,6 +66,7 @@ export class WifiDeviceTransport {
         method,
         headers,
         body: data,
+        signal: AbortSignal.timeout(this.timeoutMs),
       });
       status = response.status;
       body = parseBody(await response.text());

@@ -40,6 +40,13 @@ import {
 } from "./configuration-profiles.js";
 import { pairTrackerTransaction } from "./pairing-transaction.js";
 import {
+  durableGatewayAddresses,
+  gatewayHashFromId,
+  gatewayRecordAddress,
+  GatewayMqttTransport,
+  isSetupApAddress,
+} from "./gateway-pairing.js";
+import {
   PlatformNotificationService,
   addAppStateListener,
   isNativeApp,
@@ -74,7 +81,24 @@ let selectedHash = null;
 let connected = false;
 let pendingHistoryRequest = null;
 
-let devices = await loadDevices();
+const loadedDevices = await loadDevices();
+let devices = loadedDevices.map((device) => {
+  if (device.role !== "gateway") return device;
+  const resolved = gatewayRecordAddress(
+    { gateway_id: device.id },
+    null,
+    device,
+  );
+  return {
+    ...device,
+    hash: device.hash || gatewayHashFromId(device.id),
+    address: resolved.address,
+    addresses: resolved.addresses,
+  };
+});
+if (JSON.stringify(devices) !== JSON.stringify(loadedDevices)) {
+  await saveDevices(devices);
+}
 let configurationProfiles = normalizeConfigurationProfiles(
   await loadConfigurationProfiles(),
 );
@@ -215,6 +239,114 @@ function uniqueValues(...values) {
   return [...new Set(values.flat().filter(Boolean).map(String))];
 }
 
+async function updateSavedGatewayFromConfig(
+  gatewayId,
+  config,
+  address = null,
+  { mqttSeen = false } = {},
+) {
+  const index = devices.findIndex((device) => device.id === gatewayId);
+  if (index < 0) return;
+  const previous = devices[index];
+  const resolved = gatewayRecordAddress(config, address, previous);
+  const updated = {
+    ...previous,
+    name: config.gateway_name || previous.name,
+    hash: config.gateway_hash || previous.hash || gatewayHashFromId(gatewayId),
+    configRevision: Number.isSafeInteger(config.revision)
+      ? config.revision
+      : previous.configRevision || null,
+    address: resolved.address,
+    addresses: resolved.addresses,
+    ...(mqttSeen
+      ? { mqttOnline: true, lastMqttSeen: new Date().toISOString() }
+      : {}),
+    lastSeen: new Date().toISOString(),
+  };
+  devices = devices.map((device, deviceIndex) =>
+    deviceIndex === index ? updated : device,
+  );
+  await saveDevices(devices);
+  renderDeviceInventory();
+  if (els.pairingGateway.value === gatewayId &&
+      (!els.pairingGatewayAddress.value || isSetupApAddress(els.pairingGatewayAddress.value))) {
+    els.pairingGatewayAddress.value = updated.address || "";
+  }
+}
+
+async function updateSavedGatewayAvailability(gatewayHash, online) {
+  const index = devices.findIndex((device) =>
+    device.role === "gateway" &&
+    (device.hash === gatewayHash || gatewayHashFromId(device.id) === gatewayHash),
+  );
+  if (index < 0 || devices[index].mqttOnline === online) return;
+  devices = devices.map((device, deviceIndex) =>
+    deviceIndex === index
+      ? {
+          ...device,
+          hash: gatewayHash,
+          mqttOnline: online,
+          ...(online ? { lastMqttSeen: new Date().toISOString() } : {}),
+        }
+      : device,
+  );
+  await saveDevices(devices);
+  renderDeviceInventory();
+}
+
+async function updateSavedGatewayFromMqtt(status) {
+  const gatewayId = String(status?.gateway_id || "");
+  if (!gatewayId) return;
+  const existing = devices.find((device) =>
+    device.id === gatewayId ||
+    (device.hash && status.gateway_hash && device.hash === status.gateway_hash),
+  );
+  if (!existing) return;
+  await updateSavedGatewayFromConfig(gatewayId, {
+    gateway_id: gatewayId,
+    gateway_name: status.gateway_name,
+    gateway_hash: status.gateway_hash,
+    revision: Number(status.config_revision),
+    network_ip: status.network_ip,
+  }, status.network_ip, { mqttSeen: true });
+}
+
+async function updateSavedGatewayRegistration(gatewayId, registration) {
+  await updateSavedGatewayFromConfig(gatewayId, {
+    gateway_id: gatewayId,
+    gateway_hash: gatewayHashFromId(gatewayId),
+    revision: Number(registration?.revision),
+  }, null, { mqttSeen: true });
+}
+
+const pairingStepElements = {
+  locate: els.pairingStepLocate,
+  gateway: els.pairingStepRegister,
+  tracker: els.pairingStepConfirm,
+  complete: els.pairingStepComplete,
+};
+
+function resetPairingProgress() {
+  els.pairingProgress.hidden = true;
+  els.pairingProgressTitle.textContent = "Pairing tracker";
+  els.pairingProgressDetail.textContent = "";
+  for (const element of Object.values(pairingStepElements)) {
+    element.className = "";
+  }
+}
+
+function setPairingProgress(step, message, state = "active") {
+  els.pairingProgress.hidden = false;
+  const order = ["locate", "gateway", "tracker", "complete"];
+  const currentIndex = order.indexOf(step);
+  for (const [index, name] of order.entries()) {
+    const element = pairingStepElements[name];
+    element.className = index < currentIndex ? "done" : "";
+  }
+  if (pairingStepElements[step]) pairingStepElements[step].className = state;
+  els.pairingProgressDetail.textContent = message || "";
+}
+
 async function persistCurrentDevice() {
   const config = deviceSession?.config;
   if (!config) return;
@@ -223,15 +355,25 @@ async function persistCurrentDevice() {
   const previous = devices.find((device) => device.id === id) ||
     devices.find((device) => device.id === previousId) ||
     deviceSession.record || {};
+  const gatewayAddress = config.role === "gateway"
+    ? gatewayRecordAddress(config, deviceSession.address, previous)
+    : null;
   const record = {
     ...previous,
     id,
     name: deviceNameFromConfig(config),
     role: config.role,
     bleId: currentBleId(deviceSession.manager) || previous.bleId || null,
-    address: config.network_ip && config.network_ip !== "off"
-      ? config.network_ip
-      : deviceSession.address || previous.address || null,
+    address: gatewayAddress?.address || (
+      config.network_ip && config.network_ip !== "off"
+        ? config.network_ip
+        : deviceSession.address || previous.address || null
+    ),
+    addresses: gatewayAddress?.addresses || previous.addresses || [],
+    hash: config.gateway_hash || previous.hash || null,
+    configRevision: Number.isSafeInteger(config.revision)
+      ? config.revision
+      : previous.configRevision || null,
     credentialAliases: uniqueValues(
       previous.credentialAliases || [],
       previousId,
@@ -283,7 +425,7 @@ function renderDeviceInventory() {
     const title = document.createElement("strong");
     title.textContent = device.name || device.id;
     const detail = document.createElement("span");
-    detail.textContent = `${device.role} · ${device.address || "Bluetooth"}`;
+    detail.textContent = `${device.role} · ${device.role === "gateway" && device.mqttOnline && connected ? "MQTT online · " : ""}${device.address || "Bluetooth"}`;
     button.append(title, detail);
     button.addEventListener("click", () => openSavedDevice(device));
     els.deviceInventory.append(button);
@@ -371,7 +513,7 @@ async function showDeviceConfig(config) {
     for (const gateway of devices.filter((device) => device.role === "gateway")) {
       const option = document.createElement("option");
       option.value = gateway.id;
-      option.textContent = gateway.name || gateway.id;
+      option.textContent = `${gateway.name || gateway.id}${gateway.mqttOnline && connected ? " · MQTT online" : ""}`;
       els.pairingGateway.append(option);
     }
     const selectedGateway = devices.find(
@@ -1058,7 +1200,7 @@ els.importDeviceQrInput.addEventListener("change", async () => {
   }
 });
 
-async function connectGatewayForPairing(gateway) {
+async function connectGatewayForPairing(gateway, onAttempt = () => {}) {
   const ownerKey = await loadDeviceOwnerKey(
     gateway.id,
     gateway.bleId,
@@ -1069,50 +1211,93 @@ async function connectGatewayForPairing(gateway) {
       "The saved gateway authorization is missing. Open the gateway once over Bluetooth to recover it, or factory reset and claim it again",
     );
   }
-  let wifiError;
-  if (gateway.address) {
-    try {
-      const wifi = new WifiDeviceTransport(gateway.address, ownerKey);
-      const config = await wifi.getConfig();
-      if (config.role !== "gateway" || config.gateway_id !== gateway.id) {
-        throw new Error("the address belongs to a different device");
+  const explicitAddress = els.pairingGatewayAddress.value.trim();
+  const addresses = durableGatewayAddresses(gateway, explicitAddress);
+  let activeManager = null;
+
+  return {
+    async registerTracker(tracker) {
+      const failures = [];
+      if (mqtt.mqttConnected) {
+        onAttempt("MQTT", `Contacting ${gateway.id} through the configured broker`);
+        try {
+          const transport = new GatewayMqttTransport({
+            mqtt,
+            baseTopic: els.baseTopic.value.trim() || "lora-tracker",
+            gatewayId: gateway.id,
+            ownerKey,
+            expectedRevision: gateway.configRevision,
+          });
+          const result = await transport.registerTracker(tracker);
+          await updateSavedGatewayRegistration(gateway.id, result);
+          onAttempt("MQTT", "Gateway accepted the encrypted registration command");
+          return { ...result, transport: "MQTT" };
+        } catch (error) {
+          failures.push(`MQTT: ${error.message}`);
+          onAttempt("MQTT", `Unavailable (${error.message}); trying the local network`);
+        }
+      } else {
+        onAttempt("MQTT", "Not connected; trying the local network");
       }
-      return {
-        registerTracker: (tracker) => wifi.registerTracker(tracker),
-        close: async () => {},
-      };
-    } catch (error) {
-      wifiError = error;
-      appendBleOutput(`Gateway Wi-Fi unavailable: ${error.message}. Trying Bluetooth…`);
-    }
-  }
-  if (!gateway.bleId) {
-    throw new Error(
-      wifiError
-        ? `Could not reach the gateway at ${gateway.address}: ${wifiError.message}`
-        : "The gateway has neither a saved network address nor Bluetooth identity",
-    );
-  }
-  const manager = new OnboardingManager(createBleTransport());
-  try {
-    const info = await manager.connect(gateway.bleId);
-    if (info.role !== "gateway" || info.device_id !== gateway.id) {
-      throw new Error("Bluetooth identity does not match the selected gateway");
-    }
-    await manager.auth(ownerKey);
-    return {
-      registerTracker: (tracker) => manager.registerTracker(tracker),
-      close: () => manager.disconnect(),
-    };
-  } catch (error) {
-    await manager.disconnect();
-    throw error;
-  }
+
+      for (const address of addresses) {
+        onAttempt("LAN", `Trying ${address}`);
+        try {
+          const wifi = new WifiDeviceTransport(address, ownerKey, { timeoutMs: 5000 });
+          const config = await wifi.getConfig();
+          if (config.role !== "gateway" || config.gateway_id !== gateway.id) {
+            throw new Error("address belongs to a different device");
+          }
+          const result = await wifi.registerTracker(tracker);
+          await updateSavedGatewayFromConfig(
+            gateway.id,
+            { ...config, revision: Number(result.revision) },
+            address,
+          );
+          onAttempt("LAN", `Connected directly at ${address}`);
+          return { ...result, transport: "LAN" };
+        } catch (error) {
+          failures.push(`${address}: ${error.message}`);
+        }
+      }
+
+      if (gateway.bleId) {
+        onAttempt("Bluetooth", "Looking for the saved nearby gateway");
+        try {
+          activeManager = new OnboardingManager(createBleTransport());
+          const info = await activeManager.connect(gateway.bleId);
+          if (info.role !== "gateway" || info.device_id !== gateway.id) {
+            throw new Error("Bluetooth identity does not match the selected gateway");
+          }
+          await activeManager.auth(ownerKey);
+          const result = await activeManager.registerTracker(tracker);
+          await updateSavedGatewayFromConfig(gateway.id, {
+            gateway_id: gateway.id,
+            revision: Number(result.revision),
+          });
+          onAttempt("Bluetooth", "Nearby gateway accepted the registration");
+          return { ...result, transport: "Bluetooth" };
+        } catch (error) {
+          failures.push(`Bluetooth: ${error.message}`);
+          await activeManager?.disconnect();
+          activeManager = null;
+        }
+      }
+
+      throw new Error(
+        `Could not register on ${gateway.id}. ${failures.join(" | ") || "Connect the app to MQTT, enter the current LAN IP, or move near the gateway for Bluetooth."}`,
+      );
+    },
+    async close() {
+      await activeManager?.disconnect();
+    },
+  };
 }
 
 els.pairingGateway.addEventListener("change", () => {
   const gateway = devices.find((device) => device.id === els.pairingGateway.value);
   els.pairingGatewayAddress.value = gateway?.address || "";
+  resetPairingProgress();
 });
 
 els.pairTrackerGateway.addEventListener("click", async () => {
@@ -1121,6 +1306,7 @@ els.pairTrackerGateway.addEventListener("click", async () => {
   if (!trackerConfig || trackerConfig.role !== "tracker" || !gateway) return;
   if (!trackerConfig.config_complete) {
     appendBleOutput("Save and verify the tracker configuration before pairing.");
+    setPairingProgress("locate", "Save and verify the tracker configuration first.", "failed");
     return;
   }
   const trackerTransport = deviceSession.mode === "wifi"
@@ -1128,9 +1314,15 @@ els.pairTrackerGateway.addEventListener("click", async () => {
     : deviceSession.manager;
   try {
     els.pairTrackerGateway.disabled = true;
+    els.pairTrackerGateway.textContent = "Pairing…";
+    resetPairingProgress();
+    setPairingProgress("locate", `Preparing to contact ${gateway.id}`);
+    els.pairingProgress.scrollIntoView({ behavior: "smooth", block: "nearest" });
     const enteredAddress = els.pairingGatewayAddress.value.trim();
-    if (enteredAddress && enteredAddress !== gateway.address) {
-      gateway = { ...gateway, address: enteredAddress };
+    if (enteredAddress && !isSetupApAddress(enteredAddress) &&
+        enteredAddress !== gateway.address) {
+      const addresses = durableGatewayAddresses(gateway, enteredAddress);
+      gateway = { ...gateway, address: addresses[0], addresses };
       devices = devices.map((device) =>
         device.id === gateway.id ? gateway : device,
       );
@@ -1140,9 +1332,18 @@ els.pairTrackerGateway.addEventListener("click", async () => {
     const result = await pairTrackerTransaction({
       trackerConfig,
       gatewayRecord: gateway,
-      openGateway: connectGatewayForPairing,
+      openGateway: (record) => connectGatewayForPairing(
+        record,
+        (transport, message) => {
+          setPairingProgress("locate", `${transport}: ${message}`);
+          appendBleOutput(`${transport}: ${message}`);
+        },
+      ),
       confirmTracker: (gatewayId) => trackerTransport.pairGateway(gatewayId),
-      onStep: (_step, message) => appendBleOutput(`${message}…`),
+      onStep: (step, message) => {
+        setPairingProgress(step, message);
+        appendBleOutput(`${message}…`);
+      },
     });
     deviceSession.config = {
       ...trackerConfig,
@@ -1161,11 +1362,25 @@ els.pairTrackerGateway.addEventListener("click", async () => {
       deviceSession.config,
       deviceSession.mode === "wifi" ? "Wi-Fi" : "Bluetooth",
     );
+    els.pairingProgressTitle.textContent = "Pairing complete";
+    const gatewayRestart = result.registration.reboot_required
+      ? " The gateway saved the registry change and is restarting to activate it."
+      : " The gateway registry was already active.";
+    setPairingProgress(
+      "complete",
+      `${gateway.id} registered the tracker via ${result.registration.transport || "device management"}; the tracker confirmed the gateway.${gatewayRestart}`,
+      "done",
+    );
     appendBleOutput("Pairing complete. The tracker may now leave setup mode and begin tracking.");
   } catch (error) {
+    const active = Object.entries(pairingStepElements)
+      .find(([, element]) => element.classList.contains("active"))?.[0] || "locate";
+    els.pairingProgressTitle.textContent = "Pairing needs attention";
+    setPairingProgress(active, error.message, "failed");
     appendBleOutput(`Pairing incomplete: ${error.message}.`);
   } finally {
     els.pairTrackerGateway.disabled = false;
+    els.pairTrackerGateway.textContent = "Register and finish pairing";
   }
 });
 
@@ -1535,6 +1750,8 @@ mqtt.addEventListener("status", (event) => {
       `${base}/v1/trackers/+/events/point`,
       `${base}/v1/trackers/+/state`,
       `${base}/v1/trackers/+/history/response/+`,
+      `${base}/v1/gateways/+/status`,
+      `${base}/v1/gateways/+/availability`,
     );
   }
 });
@@ -1544,14 +1761,32 @@ mqtt.addEventListener("error", (event) => {
 });
 mqtt.addEventListener("message", async (event) => {
   const { topic, payload } = event.detail;
+  const tail = parseTopic(topic);
+  if (!tail || tail[0] !== "v1") return;
+  if (tail[1] === "gateways" && tail[3] === "availability") {
+    try {
+      await updateSavedGatewayAvailability(tail[2], payload === "online");
+    } catch (error) {
+      console.warn("Could not update gateway availability", error);
+    }
+    return;
+  }
   let data;
   try {
     data = JSON.parse(payload);
   } catch {
     return;
   }
-  const tail = parseTopic(topic);
-  if (!tail || tail[0] !== "v1" || tail[1] !== "trackers") return;
+  if (tail[1] === "gateways" && tail[3] === "status") {
+    if (data.gateway_hash && data.gateway_hash !== tail[2]) return;
+    try {
+      await updateSavedGatewayFromMqtt(data);
+    } catch (error) {
+      console.warn("Could not update the saved gateway address", error);
+    }
+    return;
+  }
+  if (tail[1] !== "trackers") return;
   if (data.device_hash && data.device_hash !== tail[2]) return;
   if ((tail[3] === "events" && tail[4] === "point") || tail[3] === "state") {
     try {

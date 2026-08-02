@@ -1,8 +1,10 @@
 # MQTT API
 
 The topic API remains `v1`. Point JSON and history response schemas are now
-version 2 to carry tracker fix time. MQTT remains an untrusted transport until
-end-to-end authenticated encryption is added.
+version 2 to carry tracker fix time. MQTT telemetry remains an untrusted
+transport unless TLS is used. The tracker-registration command is the narrow
+exception: its secret-bearing fields have an owner-key AES-GCM envelope even
+when the broker connection itself is plaintext.
 
 ## Point events and latest state
 
@@ -114,5 +116,40 @@ separate reception metadata.
 
 ## Gateway management and archiver status
 
-Gateway command, availability and status routes remain version 1. The archive
-confirmation route above is required for tracker ACK progression.
+```text
+lora-tracker/v1/gateways/<gateway_hash>/availability
+lora-tracker/v1/gateways/<gateway_hash>/status
+lora-tracker/v1/gateways/<gateway_hash>/commands/request
+lora-tracker/v1/gateways/<gateway_hash>/commands/response/<request_id>
+```
+
+Status is retained and includes `gateway_id`, `gateway_hash`,
+`config_revision`, the current station `network_ip`, stable mDNS `hostname`,
+Wi-Fi/MQTT state, uptime, free heap, and tracker counts. `network_ip` is never
+the setup-AP address in this status.
+
+Read-only command schema 1 operations are `ping`, `status.get`, and
+`registry.get`. `registry.upsert` is the narrow idempotent tracker-registration
+operation used by the app. Its request metadata is visible, but its registration
+fields are an AES-256-GCM envelope encrypted with the gateway owner key:
+
+```json
+{
+  "api_version": 1,
+  "schema_version": 1,
+  "request_id": "random-request-id",
+  "command": "registry.upsert",
+  "nonce": "24-hex-characters",
+  "ciphertext": "base64-ciphertext-and-16-byte-tag"
+}
+```
+
+Authenticated plaintext contains `device_id`, `device_name`,
+`lora_aead_key`, and `expected_revision`. The additional authenticated data is
+`lora-tracker|1|1|<request_id>|registry.upsert`. A revision mismatch fails
+closed and causes the gateway to republish current status. This makes a captured
+registration envelope non-replayable after its original configuration commit.
+Broker ACLs must still restrict gateway command topics; encryption does not
+replace least-privilege MQTT accounts.
+
+The archive confirmation route above is required for tracker ACK progression.

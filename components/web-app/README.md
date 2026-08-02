@@ -72,9 +72,11 @@ The APK is written to `android/app/build/outputs/apk/debug/app-debug.apk`.
 project. On Android, open **Manage devices**, select a discovered factory-reset
 device, let the app claim it without an OS bond or PIN, configure Wi-Fi, then
 complete the role-specific settings. Saved gateways are maintained over their
-local IP or custom BLE service. When pairing a tracker, the app fills the saved
-gateway address automatically; enter its current LAN IP in the visible pairing
-field if the network cannot resolve its `.local` hostname. The application ID is
+current local IP or custom BLE service. Retained gateway MQTT status repairs
+stale addresses automatically; the setup AP's `192.168.4.1` address is never
+retained. Tracker pairing displays each transaction stage and tries
+owner-key-encrypted MQTT, current LAN/mDNS addresses, then nearby Bluetooth.
+Enter a LAN IP only if the other paths are unavailable. The application ID is
 `de.dominikandreas.loratracker`; its version is
 derived from the repository-level `VERSION` file. Android CI performs the same
 sync and Gradle build and uploads a debug APK artifact.

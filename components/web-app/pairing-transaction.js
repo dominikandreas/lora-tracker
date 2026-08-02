@@ -42,10 +42,11 @@ export async function pairTrackerTransaction({
     throw new Error("Tracker has no valid LoRa encryption key");
   }
 
-  onStep("gateway", `Registering ${trackerId} on ${gatewayId}`);
+  onStep("locate", `Finding and authenticating ${gatewayId}`);
   const gateway = await openGateway(gatewayRecord);
   let registration;
   try {
+    onStep("gateway", `Registering ${trackerId} on ${gatewayId}`);
     registration = await gateway.registerTracker(trackerConfig);
   } finally {
     await gateway.close?.();

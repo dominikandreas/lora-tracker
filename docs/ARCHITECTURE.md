@@ -29,6 +29,9 @@ with hop count zero and may set the hop limit to zero.
 The tracker wakes on a timer or user action, acquires a GNSS fix under an
 adaptive timeout policy, classifies motion, stores route points in RTC memory,
 and transmits batches when either enough points or enough time has accumulated.
+During acquisition it continuously drains a 4 KiB UART buffer. Full/cold
+attempts run for at least 90 seconds, intermediate retries for at least 30
+seconds, and recovery preserves receiver state whenever UART bytes are present.
 Missing ACKs retain the queue and trigger exponential retry backoff.
 
 The tracker keeps its radio open for the configured ACK window and ignores its
@@ -127,9 +130,15 @@ application logic shared.
 
 The gateway registration API is a narrow idempotent upsert, and the app keeps
 the tracker transport alive between gateway registration and tracker-side
-confirmation. Firmware GATT callbacks only frame incoming bytes. Complete commands are copied
-and processed by the Arduino application task; JSON construction, NVS writes and
-indication transmission must never run on the small ESP-IDF `BTC_TASK` stack.
+confirmation. For a tracker/gateway pair, the app first sends an
+owner-key-encrypted MQTT registration command when both devices share the
+configured broker; it then falls back to station HTTP/mDNS and nearby GATT.
+Retained gateway status reports the live station address and configuration
+revision, so the temporary setup-AP address is never treated as a durable
+endpoint. Firmware GATT callbacks only frame incoming bytes. Complete commands
+are copied and processed by the Arduino application task; JSON construction,
+NVS writes and indication transmission must never run on the small ESP-IDF
+`BTC_TASK` stack.
 
 The Android WebView permits cleartext `ws://` solely to support private brokers
 without a trusted certificate and displays an explicit warning before each such

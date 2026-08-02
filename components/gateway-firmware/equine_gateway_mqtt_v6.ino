@@ -15,6 +15,8 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <mbedtls/base64.h>
+#include <mbedtls/gcm.h>
 #include <string>
 #include <memory>
 #include <new>
@@ -185,7 +187,7 @@ bool ntp_sync_started = false;
 wl_status_t lastWiFiStatus = WL_IDLE_STATUS;
 
 constexpr uint32_t GATEWAY_STATUS_INTERVAL_MS = 60000;
-constexpr size_t MQTT_COMMAND_PAYLOAD_SIZE = 512;
+constexpr size_t MQTT_COMMAND_PAYLOAD_SIZE = 640;
 constexpr size_t MAX_PENDING_ARCHIVE_ACKS = 80;
 constexpr size_t POINT_ID_SIZE = 64;
 constexpr uint32_t ARCHIVE_ACK_TIMEOUT_MS = 5000;
@@ -255,6 +257,110 @@ bool isValidOwnerKey(const char* value) {
     if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
           (c >= 'A' && c <= 'F'))) return false;
   }
+  return true;
+}
+
+int ownerKeyHexNibble(char value) {
+  if (value >= '0' && value <= '9') return value - '0';
+  if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+  if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+  return -1;
+}
+
+bool decodeOwnerKeyHex(const char* value, uint8_t* output, size_t output_size) {
+  if (!isValidOwnerKey(value) || !output || output_size != 32) return false;
+  for (size_t index = 0; index < output_size; index++) {
+    const int high = ownerKeyHexNibble(value[index * 2]);
+    const int low = ownerKeyHexNibble(value[index * 2 + 1]);
+    if (high < 0 || low < 0) return false;
+    output[index] = static_cast<uint8_t>((high << 4) | low);
+  }
+  return true;
+}
+
+bool decodeHexBytes(const char* value, uint8_t* output, size_t output_size) {
+  if (!value || !output || strlen(value) != output_size * 2) return false;
+  for (size_t index = 0; index < output_size; index++) {
+    const int high = ownerKeyHexNibble(value[index * 2]);
+    const int low = ownerKeyHexNibble(value[index * 2 + 1]);
+    if (high < 0 || low < 0) return false;
+    output[index] = static_cast<uint8_t>((high << 4) | low);
+  }
+  return true;
+}
+
+bool decryptGatewayMqttCommand(
+    const char* envelope,
+    const char* request_id,
+    const char* command,
+    char* plaintext,
+    size_t plaintext_size) {
+  if (!envelope || !request_id || !command || !plaintext || plaintext_size < 2 ||
+      !isValidOwnerKey(owner_key)) return false;
+
+  char nonce_hex[25]{};
+  char ciphertext_base64[385]{};
+  if (!EquineMqttApi::jsonGetString(
+        envelope, "nonce", nonce_hex, sizeof(nonce_hex)) ||
+      !EquineMqttApi::jsonGetString(
+        envelope, "ciphertext", ciphertext_base64, sizeof(ciphertext_base64))) {
+    return false;
+  }
+
+  uint8_t key[32]{};
+  uint8_t nonce[12]{};
+  uint8_t encrypted[288]{};
+  size_t encrypted_size = 0;
+  if (!decodeOwnerKeyHex(owner_key, key, sizeof(key)) ||
+      !decodeHexBytes(nonce_hex, nonce, sizeof(nonce)) ||
+      mbedtls_base64_decode(
+        encrypted, sizeof(encrypted), &encrypted_size,
+        reinterpret_cast<const unsigned char*>(ciphertext_base64),
+        strlen(ciphertext_base64)) != 0 ||
+      encrypted_size <= EquineProtocol::AEAD_TAG_SIZE ||
+      encrypted_size - EquineProtocol::AEAD_TAG_SIZE >= plaintext_size) {
+    memset(key, 0, sizeof(key));
+    return false;
+  }
+
+  char aad[144];
+  const int aad_size = snprintf(
+    aad, sizeof(aad), "lora-tracker|%u|%u|%s|%s",
+    EquineMqttApi::API_VERSION,
+    EquineMqttApi::COMMAND_SCHEMA_VERSION,
+    request_id,
+    command);
+  if (aad_size <= 0 || aad_size >= static_cast<int>(sizeof(aad))) {
+    memset(key, 0, sizeof(key));
+    return false;
+  }
+
+  const size_t ciphertext_size = encrypted_size - EquineProtocol::AEAD_TAG_SIZE;
+  mbedtls_gcm_context context;
+  mbedtls_gcm_init(&context);
+  bool ok = mbedtls_gcm_setkey(
+      &context, MBEDTLS_CIPHER_ID_AES, key, sizeof(key) * 8) == 0;
+  if (ok) {
+    ok = mbedtls_gcm_auth_decrypt(
+      &context,
+      ciphertext_size,
+      nonce,
+      sizeof(nonce),
+      reinterpret_cast<const uint8_t*>(aad),
+      static_cast<size_t>(aad_size),
+      encrypted + ciphertext_size,
+      EquineProtocol::AEAD_TAG_SIZE,
+      encrypted,
+      reinterpret_cast<uint8_t*>(plaintext)) == 0;
+  }
+  mbedtls_gcm_free(&context);
+  memset(key, 0, sizeof(key));
+  memset(encrypted, 0, sizeof(encrypted));
+  if (!ok) {
+    plaintext[0] = '\0';
+    return false;
+  }
+  plaintext[ciphertext_size] = '\0';
   return true;
 }
 
@@ -1540,12 +1646,17 @@ bool publishGatewayStatus(bool retained = true) {
   escapeJsonText(GATEWAY_ID, escaped_gateway_id, sizeof(escaped_gateway_id));
   escapeJsonText(GATEWAY_NAME, escaped_gateway_name, sizeof(escaped_gateway_name));
 
-  char payload[512];
+  const String station_ip = WiFi.status() == WL_CONNECTED
+    ? WiFi.localIP().toString()
+    : String("off");
+  char payload[640];
   const int written = snprintf(
     payload, sizeof(payload),
     "{\"api_version\":%u,\"schema_version\":1,"
     "\"gateway_id\":\"%s\",\"gateway_name\":\"%s\","
-    "\"gateway_hash\":\"%s\",\"uptime_ms\":%lu,"
+    "\"gateway_hash\":\"%s\",\"config_revision\":%lu,"
+    "\"network_ip\":\"%s\",\"hostname\":\"%s.local\","
+    "\"uptime_ms\":%lu,"
     "\"wifi_connected\":%s,\"mqtt_connected\":%s,"
     "\"free_heap\":%u,\"tracker_count\":%u,"
     "\"trackers_seen\":%u}",
@@ -1553,6 +1664,9 @@ bool publishGatewayStatus(bool retained = true) {
     escaped_gateway_id,
     escaped_gateway_name,
     gateway_hash_text,
+    (unsigned long)gateway_config.header.revision,
+    station_ip.c_str(),
+    ota_hostname,
     (unsigned long)millis(),
     WiFi.status() == WL_CONNECTED ? "true" : "false",
     client.connected() ? "true" : "false",
@@ -1719,6 +1833,84 @@ void mqttMessageCallback(char* topic, byte* payload_bytes, unsigned int length) 
     publishCommandResponse(request_id, response);
   } else if (strcmp(command, "registry.get") == 0) {
     publishRegistryResponses(request_id);
+  } else if (strcmp(command, "registry.upsert") == 0) {
+    char decrypted[256]{};
+    if (!decryptGatewayMqttCommand(
+          payload, request_id, command, decrypted, sizeof(decrypted))) {
+      publishCommandError(
+        request_id, command, "not_authorized",
+        "Owner-key command authentication failed");
+      return;
+    }
+    char device_id[EquineConfig::DEVICE_ID_SIZE]{};
+    char device_name[EquineConfig::DEVICE_NAME_SIZE]{};
+    char lora_aead_key[EquineProtocol::AEAD_KEY_SIZE * 2 + 1]{};
+    uint32_t expected_revision = 0;
+    if (!EquineMqttApi::jsonGetString(
+          decrypted, "device_id", device_id, sizeof(device_id)) ||
+        !EquineMqttApi::jsonGetString(
+          decrypted, "device_name", device_name, sizeof(device_name)) ||
+        !EquineMqttApi::jsonGetString(
+          decrypted, "lora_aead_key", lora_aead_key,
+          sizeof(lora_aead_key)) ||
+        !EquineMqttApi::jsonGetUnsigned(
+          decrypted, "expected_revision", expected_revision)) {
+      memset(decrypted, 0, sizeof(decrypted));
+      memset(lora_aead_key, 0, sizeof(lora_aead_key));
+      publishCommandError(
+        request_id, command, "invalid_registration",
+        "Encrypted registration fields are missing or invalid");
+      return;
+    }
+    memset(decrypted, 0, sizeof(decrypted));
+    if (expected_revision != gateway_config.header.revision) {
+      memset(lora_aead_key, 0, sizeof(lora_aead_key));
+      char detail[128];
+      snprintf(
+        detail, sizeof(detail),
+        "Gateway configuration changed; current revision is %lu",
+        (unsigned long)gateway_config.header.revision);
+      publishCommandError(
+        request_id, command, "revision_conflict", detail);
+      publishGatewayStatus(true);
+      return;
+    }
+
+    bool changed = false;
+    uint8_t slot = 0;
+    char error[EquineConfigApi::ERROR_SIZE]{};
+    if (!registerGatewayTracker(
+          device_id, device_name, lora_aead_key,
+          changed, slot, error, sizeof(error))) {
+      memset(lora_aead_key, 0, sizeof(lora_aead_key));
+      publishCommandError(
+        request_id, command, "registration_failed", error);
+      return;
+    }
+    memset(lora_aead_key, 0, sizeof(lora_aead_key));
+
+    char escaped_device_id[EquineConfig::DEVICE_ID_SIZE * 2]{};
+    escapeJsonText(device_id, escaped_device_id, sizeof(escaped_device_id));
+    char response[448];
+    const int response_size = snprintf(
+      response, sizeof(response),
+      "{\"api_version\":%u,\"schema_version\":%u,"
+      "\"request_id\":\"%s\",\"command\":\"registry.upsert\","
+      "\"ok\":true,\"tracker_id\":\"%s\",\"slot\":%u,"
+      "\"revision\":%lu,\"changed\":%s,\"reboot_required\":%s}",
+      EquineMqttApi::API_VERSION,
+      EquineMqttApi::COMMAND_SCHEMA_VERSION,
+      request_id,
+      escaped_device_id,
+      (unsigned)slot,
+      (unsigned long)gateway_config.header.revision,
+      changed ? "true" : "false",
+      changed ? "true" : "false");
+    if (response_size <= 0 || response_size >= static_cast<int>(sizeof(response)) ||
+        !publishCommandResponse(request_id, response)) {
+      logPrintln("Failed to publish tracker registration response.");
+    }
+    gateway_config_reboot_requested |= changed;
   } else {
     publishCommandError(request_id, command, "unsupported_command",
                         "Gateway command is not supported");
