@@ -28,12 +28,19 @@ local-network configuration sessions; factory reset clears it so any app can
 claim the device again.
 
 The status page shows the latest effective speed. During a manual GPS action,
-the GPS page refreshes live satellite count and HDOP from incoming NMEA data
-and displays the remaining acquisition window; these values are visible before
-a candidate meets the configured acceptance thresholds. `GPS WAIT NMEA` means
-the receiver has not yet produced a checksum-valid sentence. After three
-seconds in that state the firmware performs one bounded GNSS power/UART restart
-and continues the same acquisition window.
+the GPS page refreshes separate visible (GSV) and used-in-solution (GGA)
+satellite counts plus HDOP and the remaining acquisition window. These values
+appear before a candidate meets the configured acceptance thresholds. `GPS
+WAIT NMEA` means the receiver has not yet produced a checksum-valid sentence.
+A normal hold provides at least 60 seconds and a six-second hold requests the
+180-second maximum.
+
+GNSS acquisition continuously services the UART; it no longer sleeps the ESP32
+between short NMEA windows. Cold and periodic recovery attempts receive at least
+90 seconds, while intermediate retries receive at least 30 seconds. After 12
+seconds with zero UART bytes the firmware performs one receiver power/UART
+restart. If bytes arrive but remain invalid for 15 seconds, only the UART is
+resynchronized so the receiver does not lose its acquisition state.
 
 ## PlatformIO
 

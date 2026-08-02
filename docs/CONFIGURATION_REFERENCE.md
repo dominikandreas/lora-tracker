@@ -47,14 +47,21 @@ on repeaters. The shipped origin limit is two.
 | Moving sleep | 60 s | Nominal active tracking interval |
 | Stationary sleep | 300 s after 3 stationary fixes | Saves energy when stopped |
 | Long stationary sleep | 600 s after 12 stationary fixes | Further stationary saving |
-| No-fix acquisition | 30, 20, 10, 8 s | Progressively reduces GNSS effort |
+| GNSS acquisition | 90 s full/cold, 30 s intermediate retry minimum | Allows a complete cold start without making every obstructed retry equally expensive |
 | No-fix sleep | 120, 300, 600, 900 s | Progressively extends retry interval |
-| Forced full GNSS attempt | 3600 s | Periodic recovery from quick-probe failures |
+| Forced full GNSS attempt | 900 s maximum | Periodic recovery from short retry failures |
 | RTC history capacity | 448 points | Fits with retained state plus metadata/CRC in 8 KiB RTC slow memory |
 
 These values came from the earlier field prototype and are starting points,
 not validated universal settings. Tune only after collecting fix quality,
 missed movement, airtime and measured energy data together.
+
+The current configuration blob still carries `gps_initial_listen_ms`,
+`gps_light_sleep_chunk_ms`, and `gps_listen_window_ms` so existing schema-5
+devices can be updated transactionally. Firmware no longer uses those fields:
+multi-second ESP32 light-sleep gaps could lose NMEA framing. They are hidden by
+the app and will be removed with the next intentional configuration-schema
+revision.
 
 ## Gateway defaults
 

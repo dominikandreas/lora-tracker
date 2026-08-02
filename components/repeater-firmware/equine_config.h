@@ -487,11 +487,11 @@ inline void makeDefaultTrackerConfig(
   config.min_satellites = 6;
   config.max_speed_mps = 20.0f;
   config.max_fix_age_s = 43200;
-  config.gps_timeout_ms[0] = 30000;
-  config.gps_timeout_ms[1] = 20000;
-  config.gps_timeout_ms[2] = 10000;
-  config.gps_timeout_ms[3] = 8000;
-  config.gps_full_retry_interval_s = 3600;
+  config.gps_timeout_ms[0] = 90000;
+  config.gps_timeout_ms[1] = 30000;
+  config.gps_timeout_ms[2] = 30000;
+  config.gps_timeout_ms[3] = 30000;
+  config.gps_full_retry_interval_s = 900;
   config.gps_initial_listen_ms = 5000;
   config.gps_light_sleep_chunk_ms = 5000;
   config.gps_listen_window_ms = 2000;

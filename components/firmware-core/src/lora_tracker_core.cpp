@@ -156,10 +156,25 @@ TrackerDisplayAction trackerDisplayAction(
 uint32_t trackerGpsListenDurationMs(
     uint32_t hold_ms, uint32_t minimum_ms, uint32_t maximum_ms) {
   if (minimum_ms > maximum_ms) return 0;
-  uint64_t listen_ms = static_cast<uint64_t>(hold_ms) * 15ULL;
+  // A normal one-to-two second hold must still be long enough for a real cold
+  // start. Longer holds deliberately scale up to the bounded diagnostic limit.
+  uint64_t listen_ms = static_cast<uint64_t>(hold_ms) * 30ULL;
   if (listen_ms < minimum_ms) listen_ms = minimum_ms;
   if (listen_ms > maximum_ms) listen_ms = maximum_ms;
   return static_cast<uint32_t>(listen_ms);
+}
+
+uint32_t trackerGpsAcquisitionBudgetMs(
+    uint32_t configured_ms,
+    bool has_recent_context,
+    uint8_t consecutive_no_fix_cycles,
+    uint32_t warm_minimum_ms,
+    uint32_t cold_minimum_ms) {
+  const uint32_t minimum_ms =
+      consecutive_no_fix_cycles == 0 && !has_recent_context
+      ? cold_minimum_ms
+      : warm_minimum_ms;
+  return configured_ms < minimum_ms ? minimum_ms : configured_ms;
 }
 
 uint64_t mix64(uint64_t value) {

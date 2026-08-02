@@ -150,11 +150,17 @@ const size_t MIN_WPA2_PASSWORD_LENGTH = 8;
 #define STATIONARY_FIXES_FOR_MAX_SLEEP    ((uint16_t)tracker_config.stationary_fixes_for_max_sleep)
 
 // Fixed implementation limits and UI timing are not part of the user config.
-const uint8_t GNSS_CONFIG_VERSION = 1;
+const uint8_t GNSS_CONFIG_VERSION = 2;
 const uint32_t GNSS_COMMAND_TIMEOUT_MS = 500;
 const uint32_t GNSS_ASSISTANCE_MAX_AGE_S = 12UL * 60UL * 60UL;
 const uint32_t GNSS_POWER_STABILIZE_MS = 500;
-const uint32_t GNSS_NMEA_STALL_MS = 3000;
+const uint32_t GNSS_NO_BYTES_RECOVERY_MS = 12000;
+const uint32_t GNSS_INVALID_STREAM_RECOVERY_MS = 15000;
+const uint32_t GNSS_VISIBLE_SATELLITE_MAX_AGE_MS = 3000;
+const size_t GNSS_UART_RX_BUFFER_SIZE = 4096;
+const uint32_t GNSS_WARM_ACQUISITION_MIN_MS = 30000;
+const uint32_t GNSS_COLD_ACQUISITION_MIN_MS = 90000;
+const uint32_t GNSS_FULL_RETRY_MAX_INTERVAL_S = 900;
 const uint8_t WIFI_MAX_CONNECT_ATTEMPTS = 5;
 const uint32_t WIFI_CONNECT_TIMEOUT_MS = 10000;
 const uint32_t WEB_CLIENT_IDLE_TIMEOUT_MS = 15000;
@@ -164,7 +170,7 @@ const uint32_t DISPLAY_PAGE_INTERVAL_MS = 10000;
 const uint32_t DISPLAY_BATTERY_REFRESH_MS = 5000;
 const uint32_t BUTTON_DEBOUNCE_MS = 30;
 const uint32_t BUTTON_ACTION_HOLD_MS = 900;
-const uint32_t GPS_ACTION_MIN_LISTEN_MS = 15000;
+const uint32_t GPS_ACTION_MIN_LISTEN_MS = 60000;
 const uint32_t GPS_ACTION_MAX_LISTEN_MS = 180000;
 const uint32_t WIFI_SETUP_POST_BOOT_WINDOW_MS = 5000;
 const uint8_t DISPLAY_PAGE_COUNT = 4;
@@ -197,10 +203,24 @@ struct StoredHistoryPoint {
   uint32_t unix_time_s; // GNSS UTC; zero only when time is unavailable
 } __attribute__((packed));
 
+struct GsvSatelliteCount {
+  uint16_t count = 0;
+  uint32_t updated_ms = 0;
+  bool valid = false;
+};
+
 // =====================================================
 // GLOBALS / RTC STATE
 // =====================================================
 TinyGPSPlus gps;
+TinyGPSCustom gps_gsv_gn(gps, "GNGSV", 3);
+TinyGPSCustom gps_gsv_gp(gps, "GPGSV", 3);
+TinyGPSCustom gps_gsv_gl(gps, "GLGSV", 3);
+TinyGPSCustom gps_gsv_ga(gps, "GAGSV", 3);
+TinyGPSCustom gps_gsv_gb(gps, "GBGSV", 3);
+TinyGPSCustom gps_gsv_bd(gps, "BDGSV", 3);
+TinyGPSCustom gps_gsv_gq(gps, "GQGSV", 3);
+TinyGPSCustom gps_gsv_gi(gps, "GIGSV", 3);
 Preferences prefs;
 Preferences configPrefs;
 char owner_key[OWNER_KEY_HEX_LENGTH + 1]{};
@@ -428,6 +448,15 @@ uint32_t gps_live_metrics_deadline_ms = 0;
 bool gps_live_nmea_seen = false;
 bool gps_recovery_attempted_this_cycle = false;
 uint32_t gps_uart_bytes_received = 0;
+
+GsvSatelliteCount gps_visible_gn;
+GsvSatelliteCount gps_visible_gp;
+GsvSatelliteCount gps_visible_gl;
+GsvSatelliteCount gps_visible_ga;
+GsvSatelliteCount gps_visible_gb;
+GsvSatelliteCount gps_visible_bd;
+GsvSatelliteCount gps_visible_gq;
+GsvSatelliteCount gps_visible_gi;
 
 enum class ConfirmationState { NONE, DISTANCE_RESET };
 ConfirmationState pending_confirmation = ConfirmationState::NONE;
@@ -1677,6 +1706,82 @@ void waitForBleConnectionWindow() {
 // =====================================================
 // GNSS CONFIGURATION AND ASSISTANCE
 // =====================================================
+void updateGsvSatelliteCount(
+    TinyGPSCustom& field, GsvSatelliteCount& destination) {
+  if (!field.isUpdated()) return;
+
+  const char* value = field.value();
+  if (!value || !value[0]) return;
+  char* end = nullptr;
+  const unsigned long parsed = strtoul(value, &end, 10);
+  if (end == value || *end != '\0' || parsed > 99UL) return;
+
+  destination.count = static_cast<uint16_t>(parsed);
+  destination.updated_ms = millis();
+  destination.valid = true;
+}
+
+void refreshGpsVisibleSatelliteCounts() {
+  updateGsvSatelliteCount(gps_gsv_gn, gps_visible_gn);
+  updateGsvSatelliteCount(gps_gsv_gp, gps_visible_gp);
+  updateGsvSatelliteCount(gps_gsv_gl, gps_visible_gl);
+  updateGsvSatelliteCount(gps_gsv_ga, gps_visible_ga);
+  updateGsvSatelliteCount(gps_gsv_gb, gps_visible_gb);
+  updateGsvSatelliteCount(gps_gsv_bd, gps_visible_bd);
+  updateGsvSatelliteCount(gps_gsv_gq, gps_visible_gq);
+  updateGsvSatelliteCount(gps_gsv_gi, gps_visible_gi);
+}
+
+bool isFreshGsvCount(const GsvSatelliteCount& value, uint32_t now_ms) {
+  return value.valid &&
+    (uint32_t)(now_ms - value.updated_ms) <=
+      GNSS_VISIBLE_SATELLITE_MAX_AGE_MS;
+}
+
+bool getGpsVisibleSatelliteCount(uint16_t& count) {
+  refreshGpsVisibleSatelliteCounts();
+  const uint32_t now_ms = millis();
+
+  // A combined GN talker already represents the receiver's complete view and
+  // must not be added to the individual constellation talkers.
+  if (isFreshGsvCount(gps_visible_gn, now_ms)) {
+    count = gps_visible_gn.count;
+    return true;
+  }
+
+  uint16_t total = 0;
+  bool any = false;
+  const GsvSatelliteCount* independent[] = {
+    &gps_visible_gp, &gps_visible_gl, &gps_visible_ga,
+    &gps_visible_gq, &gps_visible_gi
+  };
+  for (const GsvSatelliteCount* value : independent) {
+    if (!isFreshGsvCount(*value, now_ms)) continue;
+    const uint32_t combined = static_cast<uint32_t>(total) + value->count;
+    total = static_cast<uint16_t>(combined > 99U ? 99U : combined);
+    any = true;
+  }
+
+  // UC6580 firmware revisions use either GB or BD for BeiDou. If both appear,
+  // use the fresher naming variant only so the same satellites are not counted
+  // twice.
+  const bool gb_fresh = isFreshGsvCount(gps_visible_gb, now_ms);
+  const bool bd_fresh = isFreshGsvCount(gps_visible_bd, now_ms);
+  if (gb_fresh || bd_fresh) {
+    const GsvSatelliteCount& beidou =
+      gb_fresh && (!bd_fresh ||
+        (uint32_t)(now_ms - gps_visible_gb.updated_ms) <=
+          (uint32_t)(now_ms - gps_visible_bd.updated_ms))
+        ? gps_visible_gb : gps_visible_bd;
+    const uint32_t combined = static_cast<uint32_t>(total) + beidou.count;
+    total = static_cast<uint16_t>(combined > 99U ? 99U : combined);
+    any = true;
+  }
+
+  count = total;
+  return any;
+}
+
 int64_t daysFromCivil(int year, unsigned month, unsigned day) {
   year -= month <= 2;
   const int era = (year >= 0 ? year : year - 399) / 400;
@@ -1735,6 +1840,11 @@ void drainGnssInput() {
   while (Serial2.available() > 0) (void)Serial2.read();
 }
 
+void beginGnssUart() {
+  Serial2.setRxBufferSize(GNSS_UART_RX_BUFFER_SIZE);
+  Serial2.begin(GPS_BAUD, SERIAL_8N1, RXD2, TXD2);
+}
+
 #if defined(BOARD_WIRELESS_TRACKER)
 bool waitForUc6580Result(uint32_t timeout_ms) {
   char line[128] = {};
@@ -1780,13 +1890,13 @@ void configureUc6580OutputIfNeeded() {
   if (configured_version == GNSS_CONFIG_VERSION) return;
 
   setTrackerPhase("GNSS configure");
-  logPrintln("Configuring UC6580 for GGA/RMC-only output...");
+  logPrintln("Configuring UC6580 for GGA/GSV/RMC output...");
 
   bool ok = true;
   ok = sendUc6580Command("$CFGMSG,0,0,1") && ok; // GGA on
   ok = sendUc6580Command("$CFGMSG,0,1,0") && ok; // GLL off
   ok = sendUc6580Command("$CFGMSG,0,2,0") && ok; // GSA off
-  ok = sendUc6580Command("$CFGMSG,0,3,0") && ok; // GSV off
+  ok = sendUc6580Command("$CFGMSG,0,3,1") && ok; // GSV on for visible-satellite diagnostics
   ok = sendUc6580Command("$CFGMSG,0,4,1") && ok; // RMC on
   ok = sendUc6580Command("$CFGMSG,0,5,0") && ok; // VTG off
   ok = sendUc6580Command("$CFGMSG,0,6,0") && ok; // ZDA off
@@ -1990,30 +2100,35 @@ void sleepGPS() {
   delay(50);
 }
 
-void recoverGpsUartStream() {
+void recoverGpsUartStream(bool power_cycle_receiver) {
   if (gps_recovery_attempted_this_cycle) return;
   gps_recovery_attempted_this_cycle = true;
   setTrackerPhase("GNSS recovery");
-  logPrintln("No valid NMEA received; restarting GNSS power and UART once.");
+  logPrintln(power_cycle_receiver
+    ? "No GNSS UART bytes received; restarting receiver power and UART once."
+    : "GNSS UART bytes are invalid; restarting UART without resetting receiver.");
 
   Serial2.end();
+  delay(25);
+  if (power_cycle_receiver) {
 #if defined(BOARD_WIRELESS_TRACKER)
-  digitalWrite(GNSS_PWR_PIN, LOW);
-  pinMode(GNSS_RST_PIN, INPUT);
-  digitalWrite(VEXT_CTRL_PIN, LOW);
-  display_initialized = false;
-  display_awake = false;
-  gps_powered = false;
-  delay(150);
+    digitalWrite(GNSS_PWR_PIN, LOW);
+    pinMode(GNSS_RST_PIN, INPUT);
+    digitalWrite(VEXT_CTRL_PIN, LOW);
+    display_initialized = false;
+    display_awake = false;
+    gps_powered = false;
+    delay(250);
 #else
-  gps_powered = false;
-  delay(50);
+    gps_powered = false;
+    delay(100);
 #endif
+  }
 
-  Serial2.begin(GPS_BAUD, SERIAL_8N1, RXD2, TXD2);
-  wakeupGPS();
+  beginGnssUart();
+  if (power_cycle_receiver) wakeupGPS();
 #if defined(BOARD_WIRELESS_TRACKER)
-  sendUc6580Assistance();
+  if (power_cycle_receiver) sendUc6580Assistance();
 #endif
   setTrackerPhase("GPS listen");
   serviceDisplayAndButton(true);
@@ -3125,22 +3240,32 @@ void renderStatusPage() {
     case 1:
       // GPS
       {
-        // During an interactive acquisition, only render values received in
-        // the current NMEA stream. TinyGPS++ otherwise retains the previous
-        // acquisition's values while the receiver starts up.
+        uint16_t satellites_visible = 0;
+        const bool visible_current =
+          getGpsVisibleSatelliteCount(satellites_visible);
+        // GGA reports satellites used in the solution, whereas GSV reports
+        // satellites visible to the receiver. Keep both distinct and reject
+        // stale TinyGPS++ values left over from an earlier power cycle.
         const bool satellites_current = gps.satellites.isValid() &&
-          (!gps_live_metrics_active || gps.satellites.age() < 2000U);
+          gps.satellites.age() < GNSS_VISIBLE_SATELLITE_MAX_AGE_MS;
         const bool hdop_current = gps.hdop.isValid() &&
-          (!gps_live_metrics_active || gps.hdop.age() < 2000U);
+          gps.hdop.age() < GNSS_VISIBLE_SATELLITE_MAX_AGE_MS;
         snprintf(lines[0], sizeof(lines[0]), "%s",
                  gps_live_metrics_active ?
                    (gps_live_nmea_seen ? "GPS LIVE (2/4)" : "GPS WAIT NMEA") :
                    "GPS (2/4)");
-        if (satellites_current) {
-          snprintf(lines[1], sizeof(lines[1]), "Sats: %lu",
+        if (visible_current && satellites_current) {
+          snprintf(lines[1], sizeof(lines[1]), "Vis:%u Used:%lu",
+                   satellites_visible,
+                   (unsigned long)gps.satellites.value());
+        } else if (visible_current) {
+          snprintf(lines[1], sizeof(lines[1]), "Vis:%u Used:--",
+                   satellites_visible);
+        } else if (satellites_current) {
+          snprintf(lines[1], sizeof(lines[1]), "Vis:-- Used:%lu",
                    (unsigned long)gps.satellites.value());
         } else {
-          snprintf(lines[1], sizeof(lines[1]), "Sats: --");
+          snprintf(lines[1], sizeof(lines[1]), "Vis:-- Used:--");
         }
         if (hdop_current) {
           snprintf(lines[2], sizeof(lines[2]), "HDOP: %.2f", gps.hdop.hdop());
@@ -3148,7 +3273,14 @@ void renderStatusPage() {
           snprintf(lines[2], sizeof(lines[2]), "HDOP: --");
         }
         snprintf(lines[3], sizeof(lines[3]), "FixAge:%lus", (unsigned long)seconds_since_last_fix);
-        if (gps_live_metrics_active && gps_live_metrics_deadline_ms != 0) {
+        if (button_is_held && !gps_live_metrics_active &&
+            button_hold_duration_ms < BUTTON_ACTION_HOLD_MS) {
+          snprintf(lines[4], sizeof(lines[4]), "Keep holding...");
+        } else if (button_is_held && !gps_live_metrics_active) {
+          snprintf(lines[4], sizeof(lines[4]), "Release: %lus",
+                   (unsigned long)(gpsListenDurationForHold(
+                     button_hold_duration_ms) / 1000U));
+        } else if (gps_live_metrics_active && gps_live_metrics_deadline_ms != 0) {
           const uint32_t remaining_ms =
             (int32_t)(gps_live_metrics_deadline_ms - millis()) > 0 ?
             gps_live_metrics_deadline_ms - millis() : 0;
@@ -3405,24 +3537,38 @@ bool listenForGpsFix(uint32_t listen_duration_ms,
   const uint32_t listen_start_ms = millis();
   uint32_t valid_sentences_at_start = gps.passedChecksum();
   uint32_t bytes_at_start = gps_uart_bytes_received;
+  const uint32_t total_valid_sentences_at_start = valid_sentences_at_start;
+  const uint32_t total_bytes_at_start = bytes_at_start;
 
   while ((uint32_t)(millis() - listen_start_ms) < listen_duration_ms) {
     bool processed_gps_bytes = false;
 
     while (Serial2.available() > 0) {
-      if (gps.encode(Serial2.read())) gps_live_nmea_seen = true;
+      if (gps.encode(Serial2.read())) {
+        gps_live_nmea_seen = true;
+        refreshGpsVisibleSatelliteCounts();
+      }
       gps_uart_bytes_received++;
       processed_gps_bytes = true;
     }
 
     const uint32_t listen_elapsed_ms = millis() - listen_start_ms;
+    const uint32_t received_bytes = gps_uart_bytes_received - bytes_at_start;
+    const uint32_t valid_sentences =
+      gps.passedChecksum() - valid_sentences_at_start;
+    const bool no_uart_bytes = received_bytes == 0;
+    const bool invalid_uart_stream = received_bytes > 0 && valid_sentences == 0;
     if (!gps_recovery_attempted_this_cycle &&
-        listen_elapsed_ms >= GNSS_NMEA_STALL_MS &&
-        gps.passedChecksum() == valid_sentences_at_start) {
-      logPrintf("GNSS stalled: %lu UART bytes, no valid NMEA in %lu ms.\n",
-                (unsigned long)(gps_uart_bytes_received - bytes_at_start),
+        ((no_uart_bytes && listen_elapsed_ms >= GNSS_NO_BYTES_RECOVERY_MS) ||
+         (invalid_uart_stream &&
+          listen_elapsed_ms >= GNSS_INVALID_STREAM_RECOVERY_MS))) {
+      logPrintf("GNSS recovery condition: %lu UART bytes, %lu valid NMEA in %lu ms.\n",
+                (unsigned long)received_bytes,
+                (unsigned long)valid_sentences,
                 (unsigned long)listen_elapsed_ms);
-      recoverGpsUartStream();
+      // Power cycling is reserved for a genuinely silent receiver. If bytes
+      // are present, preserve acquisition state and only resynchronize UART.
+      recoverGpsUartStream(no_uart_bytes);
       valid_sentences_at_start = gps.passedChecksum();
       bytes_at_start = gps_uart_bytes_received;
     }
@@ -3605,9 +3751,20 @@ bool listenForGpsFix(uint32_t listen_duration_ms,
     if (!processed_gps_bytes) delay(10);
   }
 
-  logPrintf("GNSS listen ended: %lu UART bytes, %lu valid NMEA sentences.\n",
-            (unsigned long)(gps_uart_bytes_received - bytes_at_start),
-            (unsigned long)(gps.passedChecksum() - valid_sentences_at_start));
+  uint16_t visible_satellites = 0;
+  const bool visible_valid =
+    getGpsVisibleSatelliteCount(visible_satellites);
+  logPrintf("GNSS listen ended: %lu UART bytes, %lu valid NMEA, "
+            "visible=%d used=%ld hdop=%.2f.\n",
+            (unsigned long)(gps_uart_bytes_received - total_bytes_at_start),
+            (unsigned long)(gps.passedChecksum() - total_valid_sentences_at_start),
+            visible_valid ? static_cast<int>(visible_satellites) : -1,
+            gps.satellites.isValid() &&
+              gps.satellites.age() < GNSS_VISIBLE_SATELLITE_MAX_AGE_MS
+              ? static_cast<long>(gps.satellites.value()) : -1L,
+            gps.hdop.isValid() &&
+              gps.hdop.age() < GNSS_VISIBLE_SATELLITE_MAX_AGE_MS
+              ? gps.hdop.hdop() : -1.0);
   return false;
 }
 
@@ -3629,10 +3786,18 @@ LoraTrackerCore::TrackerPolicy currentTrackerPolicy() {
   return policy;
 }
 
+bool isFullGpsAttemptDue() {
+  const uint32_t retry_interval_s =
+    GPS_FULL_RETRY_INTERVAL_S > GNSS_FULL_RETRY_MAX_INTERVAL_S
+    ? GNSS_FULL_RETRY_MAX_INTERVAL_S
+    : GPS_FULL_RETRY_INTERVAL_S;
+  return consecutive_no_fix_cycles == 0 ||
+    seconds_since_last_full_gnss_attempt >= retry_interval_s;
+}
+
 uint32_t chooseGpsAcquisitionTimeoutMs() {
   const bool full_attempt_due =
-    consecutive_no_fix_cycles == 0 ||
-    seconds_since_last_full_gnss_attempt >= GPS_FULL_RETRY_INTERVAL_S;
+    isFullGpsAttemptDue();
 
   if (full_attempt_due) {
     seconds_since_last_full_gnss_attempt = 0;
@@ -3853,7 +4018,7 @@ void setup() {
     resetDailyDistanceAndHistory();
   }
 
-  Serial2.begin(GPS_BAUD, SERIAL_8N1, RXD2, TXD2);
+  beginGnssUart();
 
 #if !defined(BOARD_WIRELESS_TRACKER)
   // The BN-220 is powered independently and is physically awake after a hard
@@ -4030,11 +4195,26 @@ void performTrackingCycle() {
       has_initial_fix = false;
     }
 
-    const uint32_t gps_timeout_ms = manual_gps_action ?
+    const bool full_gps_attempt_due =
+      !manual_gps_action && isFullGpsAttemptDue();
+    const uint32_t configured_gps_timeout_ms = manual_gps_action ?
       requested_gps_listen_ms : chooseGpsAcquisitionTimeoutMs();
-    logPrintf("GNSS acquisition policy -> no_fix=%u, full_retry_age=%u s, deadline=%u ms.\n",
+    const bool has_recent_gnss_context = has_initial_fix &&
+      fix_age_at_cycle_start <= GNSS_ASSISTANCE_MAX_AGE_S;
+    const uint32_t gps_timeout_ms = manual_gps_action
+      ? configured_gps_timeout_ms
+      : LoraTrackerCore::trackerGpsAcquisitionBudgetMs(
+          configured_gps_timeout_ms,
+          has_recent_gnss_context && consecutive_no_fix_cycles == 0,
+          full_gps_attempt_due ? 0 : consecutive_no_fix_cycles,
+          GNSS_WARM_ACQUISITION_MIN_MS,
+          GNSS_COLD_ACQUISITION_MIN_MS);
+    logPrintf("GNSS acquisition policy -> no_fix=%u, full_attempt=%s, recent_context=%s, "
+              "configured=%u ms, effective=%u ms.\n",
               consecutive_no_fix_cycles,
-              seconds_since_last_full_gnss_attempt,
+              full_gps_attempt_due ? "yes" : "no",
+              has_recent_gnss_context ? "yes" : "no",
+              configured_gps_timeout_ms,
               gps_timeout_ms);
 
     if (manual_gps_action) {
@@ -4051,60 +4231,17 @@ void performTrackingCycle() {
         cycle_position_accepted
       );
     } else {
-      uint32_t first_window_ms = GPS_INITIAL_LISTEN_MS;
-      if (first_window_ms > gps_timeout_ms) first_window_ms = gps_timeout_ms;
+      // Keep the UART serviced for the complete acquisition. The UC6580 is the
+      // dominant load while searching; putting the ESP32 into multi-second
+      // light sleeps loses NMEA framing and saves little compared with having
+      // to repeat a failed cold start.
       cycle_fix_found = listenForGpsFix(
-        first_window_ms,
+        gps_timeout_ms,
         fix_age_at_cycle_start,
         cycle_start_ms,
         cycle_movement_accepted,
         cycle_position_accepted
       );
-
-      while (!cycle_fix_found) {
-        const uint32_t elapsed_ms = millis() - acquisition_start_ms;
-        if (elapsed_ms >= gps_timeout_ms) break;
-
-        uint32_t remaining_ms = gps_timeout_ms - elapsed_ms;
-        uint32_t sleep_chunk_ms = GPS_LIGHT_SLEEP_CHUNK_MS;
-        if (sleep_chunk_ms > remaining_ms) sleep_chunk_ms = remaining_ms;
-
-        if (isDebugModeActive()) {
-          setTrackerPhase("GPS wait (debug)");
-          responsiveDelay(sleep_chunk_ms);
-        } else {
-          setTrackerPhase("GPS light sleep");
-          Serial.flush();
-          esp_sleep_enable_ext0_wakeup((gpio_num_t)USER_BTN_PIN, 0);
-          esp_sleep_enable_timer_wakeup((uint64_t)sleep_chunk_ms * 1000ULL);
-          esp_light_sleep_start();
-
-          if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
-            previous_button_pressed = digitalRead(USER_BTN_PIN) == LOW;
-            last_button_event_ms = millis();
-            logPrintln("Button pressed during GNSS light sleep.");
-            requestDisplayWake(DISPLAY_BUTTON_TIMEOUT_MS, false);
-          }
-        }
-
-        const uint32_t elapsed_after_sleep_ms = millis() - acquisition_start_ms;
-        if (elapsed_after_sleep_ms >= gps_timeout_ms) break;
-
-        remaining_ms = gps_timeout_ms - elapsed_after_sleep_ms;
-        uint32_t listen_ms = GPS_LISTEN_WINDOW_MS;
-        if (listen_ms > remaining_ms) listen_ms = remaining_ms;
-
-        setTrackerPhase("GPS listen");
-        const uint32_t elapsed_s =
-          fix_age_at_cycle_start + elapsed_after_sleep_ms / 1000U;
-        cycle_fix_found = listenForGpsFix(
-          listen_ms,
-          elapsed_s,
-          cycle_start_ms,
-          cycle_movement_accepted,
-          cycle_position_accepted
-        );
-      }
     }
 
     const uint32_t acquisition_elapsed_ms = millis() - acquisition_start_ms;

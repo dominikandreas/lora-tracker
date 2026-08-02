@@ -198,9 +198,15 @@ void testPortableCore() {
   assert(trackerDisplayAction(1, 900) == TrackerDisplayAction::ACQUIRE_GPS);
   assert(trackerDisplayAction(2, 900) == TrackerDisplayAction::TRANSMIT_RADIO);
   assert(trackerDisplayAction(3, 900) == TrackerDisplayAction::TOGGLE_BLE_LOGS);
-  assert(trackerGpsListenDurationMs(900) == 15000);
-  assert(trackerGpsListenDurationMs(2000) == 30000);
+  assert(trackerGpsListenDurationMs(900) == 60000);
+  assert(trackerGpsListenDurationMs(2000) == 60000);
+  assert(trackerGpsListenDurationMs(6000) == 180000);
   assert(trackerGpsListenDurationMs(20000) == 180000);
+  assert(trackerGpsAcquisitionBudgetMs(8000, true, 0) == 30000);
+  assert(trackerGpsAcquisitionBudgetMs(30000, false, 0) == 90000);
+  assert(trackerGpsAcquisitionBudgetMs(8000, true, 1) == 30000);
+  assert(trackerGpsAcquisitionBudgetMs(8000, false, 1) == 30000);
+  assert(trackerGpsAcquisitionBudgetMs(120000, false, 4) == 120000);
 }
 
 void testConfiguration() {

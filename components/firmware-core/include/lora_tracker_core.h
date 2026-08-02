@@ -68,8 +68,14 @@ TrackerDisplayAction trackerDisplayAction(
     uint8_t page, uint32_t hold_ms, uint32_t action_hold_ms = 900);
 uint32_t trackerGpsListenDurationMs(
     uint32_t hold_ms,
-    uint32_t minimum_ms = 15000,
+    uint32_t minimum_ms = 60000,
     uint32_t maximum_ms = 180000);
+uint32_t trackerGpsAcquisitionBudgetMs(
+    uint32_t configured_ms,
+    bool has_recent_context,
+    uint8_t consecutive_no_fix_cycles,
+    uint32_t warm_minimum_ms = 30000,
+    uint32_t cold_minimum_ms = 90000);
 uint64_t mix64(uint64_t value);
 uint32_t forwardingDelayMs(
     uint64_t device_hash,
