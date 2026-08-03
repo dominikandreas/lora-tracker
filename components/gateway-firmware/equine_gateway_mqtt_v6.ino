@@ -2290,11 +2290,17 @@ void setupWebInterface() {
   webServer.on("/enable-config", HTTP_GET, []() {
     webServer.send(200, "text/html",
       "<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
-      "<title>Enable gateway configuration</title><style>body{font:16px sans-serif;max-width:42rem;margin:3rem auto;padding:0 1rem}input,button{box-sizing:border-box;font:inherit;padding:.75rem;width:100%;margin:.4rem 0}#result{white-space:pre-wrap}</style>"
-      "<h1>Enable configuration and OTA</h1><p>Paste this gateway's owner key. It remains in this page only and is sent directly to the gateway.</p>"
-      "<input id='key' autocomplete='off' autocapitalize='none' spellcheck='false' placeholder='64-character owner key'>"
-      "<button id='enable'>Enable for 10 minutes</button><p id='result'></p>"
-      "<script>enable.onclick=async()=>{let k=key.value.trim(),o=result;o.textContent='Enabling...';try{let r=await fetch('/api/v1/config-mode',{method:'POST',headers:{Authorization:'Bearer '+k}}),t=await r.text();if(r.ok){location.replace('/')}else{o.textContent='Request failed: '+t}}catch(e){o.textContent='Request failed: '+e.message}}</script>");
+      "<title>Gateway access</title><style>body{font:16px sans-serif;max-width:42rem;margin:3rem auto;padding:0 1rem}input,button{box-sizing:border-box;font:inherit;padding:.75rem;width:100%;margin:.4rem 0}button{cursor:pointer}#result{white-space:pre-wrap}.muted{color:#555}</style>"
+      "<h1>Gateway access</h1><p>Enter this gateway's owner key to open its configuration and live logs.</p>"
+      "<input id='key' type='password' autocomplete='off' autocapitalize='none' spellcheck='false' placeholder='64-character owner key'>"
+      "<button id='open'>Open gateway dashboard</button><button id='enable'>Enable configuration and OTA for 10 minutes</button><button id='forget'>Forget key on this browser</button>"
+      "<p class='muted'>The key is stored only in this browser's local storage and is sent directly to this gateway. Anyone with it can manage this gateway.</p><p id='result'></p>"
+      "<script>(()=>{const n='lora-tracker.gateway.owner-key',k=document.getElementById('key'),o=document.getElementById('result');try{k.value=localStorage.getItem(n)||''}catch(e){}const h=()=>({Authorization:'Bearer '+k.value.trim()});const save=()=>{if(!/^[0-9a-fA-F]{64}$/.test(k.value.trim()))throw Error('Enter the 64-character owner key.');try{localStorage.setItem(n,k.value.trim())}catch(e){throw Error('This browser could not save the key: '+e.message)}};async function request(path){save();let r=await fetch(path,{method:'POST',headers:h()}),t=await r.text();if(!r.ok)throw Error(t||('HTTP '+r.status));return t}document.getElementById('open').onclick=async()=>{o.textContent='Authenticating...';try{await request('/api/v1/session');location.replace('/')}catch(e){o.textContent='Request failed: '+e.message}};document.getElementById('enable').onclick=async()=>{o.textContent='Enabling...';try{await request('/api/v1/config-mode');location.replace('/')}catch(e){o.textContent='Request failed: '+e.message}};document.getElementById('forget').onclick=()=>{try{localStorage.removeItem(n)}catch(e){}k.value='';o.textContent='Saved key removed from this browser.'}})()</script>");
+  });
+  webServer.on("/api/v1/session", HTTP_POST, []() {
+    if (!requireWebAuthentication()) return;
+    webServer.sendHeader("Cache-Control", "no-store");
+    webServer.send(200, "application/json", "{\"ok\":true,\"session\":true}");
   });
   webServer.on("/api/v1/claim", HTTP_POST, []() {
     if (!gatewayConfigWritesAllowed()) {
@@ -2358,6 +2364,12 @@ void setupWebInterface() {
     }
     html += "</table>";
     html += "<h2>Configuration</h2><p>Authenticated local-network and custom-BLE management: <b>enabled</b>. OTA is available only during a ten-minute configuration window.</p>";
+    html += "<h3>Current settings</h3><table><tr><th>Setting</th><th>Value</th></tr>";
+    html += "<tr><td>Wi-Fi SSID</td><td><code>" + String(gateway_config.wifi_ssid) + "</code></td></tr>";
+    html += "<tr><td>MQTT endpoint</td><td><code>" + String(gateway_config.mqtt_host) + ":" + String(gateway_config.mqtt_port) + "</code> (TLS " + String(gateway_config.mqtt_tls_enabled ? "enabled" : "disabled") + ")</td></tr>";
+    html += "<tr><td>MQTT base topic</td><td><code>" + String(gateway_config.mqtt_base_topic) + "</code></td></tr>";
+    html += "<tr><td>LoRa</td><td>" + String(gateway_config.lora.frequency_hz) + " Hz, " + String(gateway_config.lora.tx_power_dbm) + " dBm, SF" + String(gateway_config.lora.spreading_factor) + ", " + String(gateway_config.lora.bandwidth_hz) + " Hz</td></tr>";
+    html += "</table><p>Passwords and owner keys are never displayed.</p>";
     if (gatewayConfigWritesAllowed()) {
       html += "<form action='/api/v1/config' method='POST'>";
       html += "<input type='hidden' name='expected_revision' value='" + String(gateway_config.header.revision) + "'>";

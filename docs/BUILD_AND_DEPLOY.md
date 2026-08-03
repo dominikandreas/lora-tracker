@@ -50,9 +50,10 @@ current ESP32-S3/SX1262 board is a production TODO.
 
 An unprovisioned gateway starts `LoRaGateway-<gateway_id>`. Once provisioned,
 hold USER for five seconds to unlock writes for ten minutes; HTTP authentication
-is still required. The saved owner key can also open
-`http://<gateway-ip>/enable-config` or the app can enable the same window over
-BLE/Wi-Fi before a PlatformIO OTA upload.
+is still required. The saved owner key can open
+`http://<gateway-ip>/enable-config` to inspect settings and live logs, or
+enable the same window over the gateway page or app before a PlatformIO OTA
+upload.
 
 ## Repeater firmware
 

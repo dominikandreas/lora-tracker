@@ -147,16 +147,18 @@ OTA is disabled during ordinary operation. Enable it for ten minutes using one
 of these paths:
 
 - **Enable config + OTA** in the app over authenticated BLE or Wi-Fi;
-- open `http://<device-ip>/enable-config`, paste the owner key, and choose
-  **Enable for 10 minutes**;
+- open `http://<gateway-ip>/enable-config`, paste the owner key, then choose
+  **Open gateway dashboard** to inspect settings and live logs, or **Enable
+  configuration and OTA for 10 minutes** when writes/OTA are needed;
 - `POST /api/v1/config-mode` with the owner key;
 - `ENTER_CONFIG_MODE` in an authenticated BLE session;
 - the documented boot/button action.
 
-The dependency-free device page exchanges a valid Bearer key for a random,
+The dependency-free gateway page stores the entered owner key in that browser's
+local storage (never on the gateway), then exchanges it for a random,
 memory-only, HttpOnly browser session cookie lasting at most ten minutes. Its
 forms and live-log requests use that cookie; the owner key is not placed in a
-URL or form field.
+URL or form field. Use **Forget key on this browser** on shared devices.
 
 Set the owner key in the shell, then select the matching OTA environment and
 device IP. The app exposes **Copy owner key for PlatformIO** inside the access

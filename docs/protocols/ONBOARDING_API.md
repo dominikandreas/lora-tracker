@@ -22,12 +22,17 @@ Bodies use `application/x-www-form-urlencoded`.
 
 ### Public routes
 
-`GET /enable-config` serves a local, dependency-free page that accepts the
-owner key in memory and calls the authenticated configuration-mode endpoint.
-It does not save or transmit the key anywhere except directly to that device.
-After validation, firmware issues a random, memory-only, HttpOnly session
-cookie so normal form submissions and log polling remain authorized. The
-cookie and configuration/OTA window expire after ten minutes.
+`GET /enable-config` serves a local, dependency-free gateway page that stores
+the entered owner key in that browser's local storage and sends it only to that
+gateway. It can open the authenticated dashboard (including read-only settings
+and live logs) without changing device state, or enable the ten-minute
+configuration/OTA window. Use **Forget key on this browser** to remove the
+stored value on shared devices.
+
+`POST /api/v1/session` accepts `Authorization: Bearer <owner-key>` and issues a
+random, memory-only, HttpOnly session cookie lasting at most ten minutes. The
+dashboard's normal form submissions and log polling use that cookie. The
+cookie and configuration/OTA window expire independently.
 
 `GET /api/v1/onboarding` returns:
 
