@@ -18,8 +18,6 @@
 #include <mbedtls/base64.h>
 #include <mbedtls/gcm.h>
 #include <string>
-#include <memory>
-#include <new>
 #include <U8g2lib.h>
 #include "secrets.h"
 #include "equine_protocol.h"
@@ -50,16 +48,22 @@ U8G2_SSD1306_128X64_NONAME_F_SW_I2C gateway_display(U8G2_R0, 15, 4, 16);
 bool gateway_onboarding_required = false;
 bool gateway_config_mode = false;
 bool gateway_ap_active = false;
+bool gateway_mdns_started = false;
 bool gateway_config_reboot_requested = false;
 bool gateway_factory_reset_requested = false;
 bool gateway_ota_active = false;
 uint32_t gateway_config_mode_deadline_ms = 0;
+uint32_t gateway_wifi_disconnect_since_ms = 0;
 String gateway_network_ip = "off";
 bool gateway_button_previous = false;
 bool gateway_button_hold_handled = false;
 uint32_t gateway_button_press_start_ms = 0;
+bool gateway_packet_processing = false;
 
 void setupOTA();
+void handleWiFiConnection();
+void serviceGatewayNetwork();
+void serviceGatewayHttpDuringPacketWait();
 
 constexpr const char* CONFIG_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
 constexpr const char* CONFIG_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
@@ -69,15 +73,24 @@ BLEServer* gateway_ble_server = nullptr;
 BLECharacteristic* gateway_ble_tx = nullptr;
 BLECharacteristic* gateway_ble_rx = nullptr;
 bool gateway_ble_initialized = false;
-bool gateway_ble_connected = false;
-bool gateway_ble_authenticated = false;
+bool gateway_ble_permanently_released = false;
+volatile bool gateway_ble_connected = false;
+volatile bool gateway_ble_authenticated = false;
+uint32_t gateway_ble_management_deadline_ms = 0;
 char gateway_ble_command[BLE_CONFIG_COMMAND_MAX]{};
-size_t gateway_ble_command_length = 0;
+volatile size_t gateway_ble_command_length = 0;
 volatile bool gateway_ble_command_pending = false;
+volatile bool gateway_ble_command_processing = false;
+volatile bool gateway_ble_restart_advertising = false;
+portMUX_TYPE gateway_ble_command_mux = portMUX_INITIALIZER_UNLOCKED;
+constexpr uint32_t GATEWAY_CONFIG_RESTART_MAGIC = 0x4C544743UL;
+RTC_DATA_ATTR uint32_t gateway_config_restart_magic = 0;
 
 void processGatewayBleCommand(char* command);
 void startGatewayBleConfiguration();
 void stopGatewayBleConfiguration();
+void serviceGatewayBleLifetime();
+void configureGatewayWifiPowerSave();
 bool gatewayConfigWritesAllowed();
 void showGatewayOnboardingDisplay();
 
@@ -123,7 +136,6 @@ char gateway_hash_text[17];
 char gateway_availability_topic[96];
 char gateway_status_topic[112];
 char gateway_command_topic[112];
-char gateway_archive_ack_topic[112];
 char gateway_response_prefix[112];
 char ota_hostname[64];
 
@@ -139,6 +151,13 @@ const int32_t DELTA_UNIT_MICRODEG = 10;
 const uint32_t LOG_HEARTBEAT_INTERVAL_MS = 30000;
 const uint8_t LOG_HISTORY_LINES = 25;
 const size_t LOG_HISTORY_LINE_LENGTH = 160;
+constexpr uint32_t WIFI_FALLBACK_AP_DELAY_MS = 15000;
+constexpr uint32_t WIFI_FALLBACK_AP_RETRY_MS = 30000;
+constexpr uint16_t MQTT_SOCKET_TIMEOUT_SECONDS = 3;
+constexpr uint16_t MQTT_KEEPALIVE_SECONDS = 30;
+constexpr int32_t MQTT_PLAIN_CONNECT_TIMEOUT_MS = 1000;
+constexpr uint16_t MQTT_TLS_CONNECT_TIMEOUT_SECONDS = 5;
+constexpr uint32_t GATEWAY_BLE_STARTUP_WINDOW_MS = 60000;
 
 // ==========================================
 // VERSIONED PAYLOAD FORMAT
@@ -160,7 +179,29 @@ struct DecodedHistoryHeader {
   uint8_t batt_pct;
 };
 
-WiFiClient plainMqttClient;
+class GatewayMqttWiFiClient : public WiFiClient {
+ public:
+  using WiFiClient::connect;
+
+  int connect(IPAddress address, uint16_t port) override {
+    const int connected = WiFiClient::connect(
+      address, port, MQTT_PLAIN_CONNECT_TIMEOUT_MS);
+    if (connected) {
+      // The short deadline only bounds initial TCP connection attempts. Once
+      // connected, restore a practical socket timeout for MQTT bursts.
+      WiFiClient::setTimeout(MQTT_SOCKET_TIMEOUT_SECONDS);
+    }
+    return connected;
+  }
+
+  int connect(const char* host, uint16_t port) override {
+    IPAddress address;
+    if (!host || !WiFi.hostByName(host, address)) return 0;
+    return connect(address, port);
+  }
+};
+
+GatewayMqttWiFiClient plainMqttClient;
 WiFiClientSecure secureMqttClient;
 PubSubClient client;
 #ifdef LORA_TRACKER_ENABLE_INSECURE_TELNET
@@ -172,11 +213,14 @@ WiFiServer telnetServer(23);
 WiFiClient telnetClient;
 WebServer webServer(80);
 char logHistory[LOG_HISTORY_LINES][LOG_HISTORY_LINE_LENGTH];
+String gateway_log_json_response;
+String gateway_log_plain_response;
 uint8_t logHistoryHead = 0;
 uint8_t logHistoryCount = 0;
 unsigned long lastHeartbeatMs = 0;
 unsigned long lastLoRaPacketMs = 0;
 unsigned long lastWiFiReconnectAttemptMs = 0;
+unsigned long lastGatewayApAttemptMs = 0;
 unsigned long lastMqttReconnectAttemptMs = 0;
 unsigned long lastGatewayStatusPublishMs = 0;
 uint64_t gateway_tx_nonce_prefix = 0;
@@ -188,36 +232,6 @@ wl_status_t lastWiFiStatus = WL_IDLE_STATUS;
 
 constexpr uint32_t GATEWAY_STATUS_INTERVAL_MS = 60000;
 constexpr size_t MQTT_COMMAND_PAYLOAD_SIZE = 640;
-constexpr size_t MAX_PENDING_ARCHIVE_ACKS = 80;
-constexpr size_t POINT_ID_SIZE = 64;
-constexpr uint32_t ARCHIVE_ACK_TIMEOUT_MS = 5000;
-char pending_archive_point_ids[MAX_PENDING_ARCHIVE_ACKS][POINT_ID_SIZE]{};
-bool pending_archive_confirmed[MAX_PENDING_ARCHIVE_ACKS]{};
-size_t pending_archive_count = 0;
-
-void resetPendingArchiveConfirmations() {
-  pending_archive_count = 0;
-  memset(pending_archive_point_ids, 0, sizeof(pending_archive_point_ids));
-  memset(pending_archive_confirmed, 0, sizeof(pending_archive_confirmed));
-}
-
-bool addPendingArchiveConfirmation(const char* point_id) {
-  if (!point_id || pending_archive_count >= MAX_PENDING_ARCHIVE_ACKS) {
-    return false;
-  }
-  strlcpy(pending_archive_point_ids[pending_archive_count], point_id,
-          POINT_ID_SIZE);
-  pending_archive_confirmed[pending_archive_count] = false;
-  pending_archive_count++;
-  return true;
-}
-
-bool allArchiveConfirmationsReceived() {
-  for (size_t index = 0; index < pending_archive_count; index++) {
-    if (!pending_archive_confirmed[index]) return false;
-  }
-  return true;
-}
 
 void refillGatewayAirtime() {
   const uint32_t now = millis();
@@ -475,6 +489,53 @@ void replayRecentLogsToClient(WiFiClient& clientRef) {
   }
 }
 
+String& gatewayLogsJson(uint8_t maximum_lines = LOG_HISTORY_LINES) {
+  // Keep one reusable response buffer. The HTTP log page polls frequently;
+  // allocating and freeing a multi-kilobyte String on every poll fragments
+  // the ESP32 heap and eventually makes unrelated network requests fail.
+  String& out = gateway_log_json_response;
+  const uint8_t returned_count = min(logHistoryCount, maximum_lines);
+  out.reserve(160 + static_cast<size_t>(maximum_lines) *
+              (LOG_HISTORY_LINE_LENGTH + 32));
+  out = "";
+  out = "{\"ok\":true,\"command\":\"GET LOGS\",\"count\":" +
+        String(returned_count) + ",\"total\":" + String(logHistoryCount) +
+        ",\"truncated\":" +
+        String(returned_count < logHistoryCount ? "true" : "false") +
+        ",\"lines\":[";
+
+  const uint8_t oldestIndex =
+    (logHistoryHead + LOG_HISTORY_LINES - returned_count) % LOG_HISTORY_LINES;
+  for (uint8_t i = 0; i < returned_count; i++) {
+    if (i > 0) out += ',';
+    out += '"';
+    EquineConfigApi::appendJsonEscaped(
+      out, logHistory[(oldestIndex + i) % LOG_HISTORY_LINES]);
+    out += '"';
+  }
+  out += "]}";
+  return out;
+}
+
+String& gatewayLogsPlainText() {
+  String& out = gateway_log_plain_response;
+  out.reserve(static_cast<size_t>(LOG_HISTORY_LINES) *
+              (LOG_HISTORY_LINE_LENGTH + 1));
+  out = "";
+  if (logHistoryCount == 0) {
+    out = "No logs yet.\n";
+    return out;
+  }
+
+  const uint8_t oldestIndex =
+    (logHistoryHead + LOG_HISTORY_LINES - logHistoryCount) % LOG_HISTORY_LINES;
+  for (uint8_t i = 0; i < logHistoryCount; i++) {
+    out += logHistory[(oldestIndex + i) % LOG_HISTORY_LINES];
+    out += '\n';
+  }
+  return out;
+}
+
 void logPrint(const char* message) {
   Serial.print(message);
   rememberLogLine(message);
@@ -541,7 +602,10 @@ bool publishRetainedMessage(const char* topic, const char* payload) {
 void initializeOwnerKey() {
   Preferences credentials;
   if (!credentials.begin("ltcred", false)) return;
-  String stored = credentials.getString("owner_key", "");
+  String stored;
+  if (credentials.isKey("owner_key")) {
+    stored = credentials.getString("owner_key", "");
+  }
   if (isValidOwnerKey(stored.c_str())) {
     strlcpy(owner_key, stored.c_str(), sizeof(owner_key));
   }
@@ -580,7 +644,10 @@ bool isValidMqttCaCertificate(const String& certificate, bool allow_empty) {
 void initializeMqttCaCertificate() {
   Preferences trust;
   if (!trust.begin("lttrust", false)) return;
-  String stored = trust.getString("mqtt_ca", "");
+  String stored;
+  if (trust.isKey("mqtt_ca")) {
+    stored = trust.getString("mqtt_ca", "");
+  }
   if (stored.isEmpty() && mqtt_ca_certificate && mqtt_ca_certificate[0]) {
     stored = mqtt_ca_certificate;
     trust.putString("mqtt_ca", stored);
@@ -688,7 +755,8 @@ bool saveGatewayConfigValue(EquineConfig::GatewayConfigV1& value,
                             gateway_config_storage_scratch)) {
     if (!writeGatewayConfigBlob(EquineConfig::BACKUP_CONFIG_KEY,
                                 gateway_config_storage_scratch)) {
-      logPrintln("Warning: failed to update gateway configuration backup.");
+      logPrintln("Failed to update gateway configuration backup; active configuration preserved.");
+      return false;
     }
   }
 
@@ -787,6 +855,11 @@ void markGatewayOnboardingComplete() {
   if (gateway_config_mode && gateway_config_mode_deadline_ms == 0) {
     gateway_config_mode_deadline_ms = millis() + 600000UL;
   }
+  if (gateway_ble_initialized) {
+    gateway_ble_management_deadline_ms = gateway_config_mode_deadline_ms != 0
+      ? gateway_config_mode_deadline_ms
+      : millis() + GATEWAY_BLE_STARTUP_WINDOW_MS;
+  }
 }
 
 
@@ -865,6 +938,13 @@ bool registerGatewayTracker(
     size_t error_size) {
   changed = false;
   slot = 0;
+  // Enforce the guard here so BLE, HTTP and MQTT registration all share the
+  // same safety rule. MQTT callbacks can run while the receive path still
+  // holds a TrackerRuntime pointer during relay collision guarding.
+  if (!gatewayConfigWritesAllowed()) {
+    snprintf(error, error_size, "gateway_busy");
+    return false;
+  }
   if (!device_id || !device_name || !lora_aead_key) {
     snprintf(error, error_size, "device_id, device_name and lora_aead_key are required");
     return false;
@@ -1107,8 +1187,12 @@ class GatewayBleConfigCallbacks : public BLECharacteristicCallbacks {
     if (!characteristic) return;
     // Keep BTC_TASK bounded to byte framing. Command parsing, NVS and notify
     // calls execute from loop(), whose stack is sized for application work.
-    if (gateway_ble_command_pending) return;
     const std::string value = characteristic->getValue();
+    portENTER_CRITICAL(&gateway_ble_command_mux);
+    if (gateway_ble_command_pending || gateway_ble_command_processing) {
+      portEXIT_CRITICAL(&gateway_ble_command_mux);
+      return;
+    }
     for (char c : value) {
       if (c == '\r') continue;
       if (c == '\n') {
@@ -1116,6 +1200,7 @@ class GatewayBleConfigCallbacks : public BLECharacteristicCallbacks {
         if (gateway_ble_command_length > 0) {
           gateway_ble_command_pending = true;
         }
+        portEXIT_CRITICAL(&gateway_ble_command_mux);
         return;
       }
       if (gateway_ble_command_length + 1 >= BLE_CONFIG_COMMAND_MAX) {
@@ -1123,27 +1208,41 @@ class GatewayBleConfigCallbacks : public BLECharacteristicCallbacks {
                 sizeof(gateway_ble_command));
         gateway_ble_command_length = strlen(gateway_ble_command);
         gateway_ble_command_pending = true;
+        portEXIT_CRITICAL(&gateway_ble_command_mux);
         return;
       }
       gateway_ble_command[gateway_ble_command_length++] = c;
     }
+    portEXIT_CRITICAL(&gateway_ble_command_mux);
   }
 };
 
 void serviceGatewayBleCommand() {
-  if (!gateway_ble_command_pending) return;
-  const size_t length = gateway_ble_command_length;
-  std::unique_ptr<char[]> command_copy(
-    new (std::nothrow) char[length + 1]);
-  if (command_copy) memcpy(command_copy.get(), gateway_ble_command, length + 1);
+  if (gateway_ble_restart_advertising && gateway_ble_initialized &&
+      gateway_ble_server && !gateway_ble_connected) {
+    gateway_ble_restart_advertising = false;
+    BLEDevice::startAdvertising();
+  }
+
+  portENTER_CRITICAL(&gateway_ble_command_mux);
+  if (!gateway_ble_command_pending || gateway_ble_command_processing) {
+    portEXIT_CRITICAL(&gateway_ble_command_mux);
+    return;
+  }
+  gateway_ble_command_processing = true;
+  portEXIT_CRITICAL(&gateway_ble_command_mux);
+
+  // Keep the completed frame pending while it is processed. The BLE callback
+  // rejects writes in this state, so the loop can safely parse the static
+  // command buffer without a large, failure-prone heap allocation.
+  processGatewayBleCommand(gateway_ble_command);
+
+  portENTER_CRITICAL(&gateway_ble_command_mux);
   gateway_ble_command_length = 0;
   gateway_ble_command[0] = '\0';
   gateway_ble_command_pending = false;
-  if (!command_copy) {
-    sendGatewayBleError("out_of_memory", "could not queue BLE command");
-    return;
-  }
-  processGatewayBleCommand(command_copy.get());
+  gateway_ble_command_processing = false;
+  portEXIT_CRITICAL(&gateway_ble_command_mux);
 }
 
 class GatewayBleServerCallbacks : public BLEServerCallbacks {
@@ -1151,11 +1250,20 @@ class GatewayBleServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer*) override {
     gateway_ble_connected = true;
     gateway_ble_authenticated = false;
+    gateway_ble_restart_advertising = false;
   }
   void onDisconnect(BLEServer* server) override {
+    (void)server;
     gateway_ble_connected = false;
     gateway_ble_authenticated = false;
-    server->startAdvertising();
+    gateway_ble_restart_advertising = true;
+    portENTER_CRITICAL(&gateway_ble_command_mux);
+    if (!gateway_ble_command_processing) {
+      gateway_ble_command_length = 0;
+      gateway_ble_command[0] = '\0';
+      gateway_ble_command_pending = false;
+    }
+    portEXIT_CRITICAL(&gateway_ble_command_mux);
   }
 };
 
@@ -1193,6 +1301,10 @@ void processGatewayBleCommand(char* command) {
     return;
   }
   if (strncmp(command, "CLAIM ", 6) == 0) {
+    if (!gatewayConfigWritesAllowed()) {
+      sendGatewayBleError("gateway_busy", "retry after the radio operation completes");
+      return;
+    }
     if (!gateway_config_mode || owner_key[0]) {
       sendGatewayBleError("claim_not_allowed", "device has already been claimed");
       return;
@@ -1226,8 +1338,13 @@ void processGatewayBleCommand(char* command) {
     return;
   }
   if (strcmp(command, "ENTER_CONFIG_MODE") == 0) {
+    if (!gatewayConfigWritesAllowed()) {
+      sendGatewayBleError("gateway_busy", "retry after the radio operation completes");
+      return;
+    }
     gateway_config_mode = true;
     gateway_config_mode_deadline_ms = millis() + 600000UL;
+    gateway_ble_management_deadline_ms = gateway_config_mode_deadline_ms;
     setupOTA();
     sendGatewayBleText("{\"ok\":true,\"config_mode\":true,\"ota_enabled\":true}");
     return;
@@ -1236,7 +1353,17 @@ void processGatewayBleCommand(char* command) {
     sendGatewayBleText(gatewayConfigJson());
     return;
   }
+  if (strcmp(command, "GET LOGS") == 0) {
+    // Keep BLE diagnostics short enough that acknowledged indication framing
+    // does not leave the polling LoRa receiver blind for several seconds.
+    sendGatewayBleText(gatewayLogsJson(8));
+    return;
+  }
   if (strncmp(command, "REGISTER_TRACKER ", 17) == 0) {
+    if (!gatewayConfigWritesAllowed()) {
+      sendGatewayBleError("gateway_busy", "retry after the radio operation completes");
+      return;
+    }
     char* encoded = command + 17;
     String device_id;
     String device_name;
@@ -1262,7 +1389,9 @@ void processGatewayBleCommand(char* command) {
           device_id.c_str(), device_name.c_str(), lora_aead_key.c_str(),
           changed, slot, error, sizeof(error))) {
       sendGatewayBleError(
-        "tracker_registration_failed", parsed ? error : parse_error);
+        parsed && strcmp(error, "gateway_busy") == 0
+          ? "gateway_busy" : "tracker_registration_failed",
+        parsed ? error : parse_error);
       return;
     }
     String out = "{\"ok\":true,\"tracker_id\":\"";
@@ -1277,7 +1406,7 @@ void processGatewayBleCommand(char* command) {
   }
   if (strncmp(command, "PATCH ", 6) == 0) {
     if (!gatewayConfigWritesAllowed()) {
-      sendGatewayBleError("physical_config_mode_required", "hold USER for 5 seconds");
+      sendGatewayBleError("gateway_busy", "retry after the radio operation completes");
       return;
     }
     const size_t length = strlen(command + 6);
@@ -1350,7 +1479,7 @@ void processGatewayBleCommand(char* command) {
   }
   if (strcmp(command, "FACTORY_RESET FACTORY_RESET") == 0) {
     if (!gatewayConfigWritesAllowed()) {
-      sendGatewayBleError("physical_config_mode_required", "hold USER for 5 seconds");
+      sendGatewayBleError("gateway_busy", "retry after the radio operation completes");
       return;
     }
     sendGatewayBleText("{\"ok\":true,\"factory_reset\":true}");
@@ -1358,16 +1487,36 @@ void processGatewayBleCommand(char* command) {
     return;
   }
   if (strcmp(command, "REBOOT") == 0) {
+    if (!gatewayConfigWritesAllowed()) {
+      sendGatewayBleError("gateway_busy", "retry after the radio operation completes");
+      return;
+    }
     sendGatewayBleText("{\"ok\":true,\"rebooting\":true}");
     gateway_config_reboot_requested = true;
     return;
   }
   sendGatewayBleError("unknown_command",
-    "use INFO, CLAIM, AUTH, HELLO, GET CONFIG, PATCH, ENTER_CONFIG_MODE, ROLLBACK, FACTORY_RESET or REBOOT");
+    "use INFO, CLAIM, AUTH, HELLO, GET CONFIG, GET LOGS, PATCH, ENTER_CONFIG_MODE, ROLLBACK, FACTORY_RESET or REBOOT");
 }
 
 void startGatewayBleConfiguration() {
-  if (gateway_ble_initialized) return;
+  if (gateway_ble_permanently_released) {
+    logPrintln("BLE memory was released for Wi-Fi stability; restart to reopen BLE management.");
+    return;
+  }
+  if (gateway_ble_initialized) {
+    if (!gateway_onboarding_required && gateway_config_mode_deadline_ms != 0) {
+      gateway_ble_management_deadline_ms = gateway_config_mode_deadline_ms;
+    }
+    return;
+  }
+  // The classic ESP32 Wi-Fi driver requires modem sleep before Bluetooth is
+  // enabled. This matters when USER or HTTP reopens BLE after the initial
+  // management window has already shut the controller down.
+  if (WiFi.getMode() != WIFI_OFF) {
+    WiFi.setSleep(true);
+    delay(10);
+  }
   String name = "LG-" + String(GATEWAY_ID);
   BLEDevice::init(name.c_str());
   logPrintln("Gateway BLE uses application-layer owner-key authentication; OS pairing is disabled.");
@@ -1387,12 +1536,22 @@ void startGatewayBleConfiguration() {
   advertising->setScanResponse(true);
   BLEDevice::startAdvertising();
   gateway_ble_initialized = true;
+  gateway_ble_restart_advertising = false;
+  gateway_ble_management_deadline_ms = gateway_onboarding_required
+    ? 0
+    : (gateway_config_mode_deadline_ms != 0
+        ? gateway_config_mode_deadline_ms
+        : millis() + GATEWAY_BLE_STARTUP_WINDOW_MS);
   logPrintln("Gateway BLE configuration active; awaiting owner-key claim or authentication.");
   if (gateway_onboarding_required) showGatewayOnboardingDisplay();
 }
 
 void stopGatewayBleConfiguration() {
   if (!gateway_ble_initialized) return;
+  // Release BTDM memory only after onboarding/configuration is complete. The
+  // legacy ESP32 BLE library leaks server objects across deinit(false) cycles;
+  // release once, then use a controlled reboot if physical access requests a
+  // later BLE window.
   BLEDevice::deinit(true);
   gateway_ble_server = nullptr;
   gateway_ble_tx = nullptr;
@@ -1400,8 +1559,39 @@ void stopGatewayBleConfiguration() {
   gateway_ble_initialized = false;
   gateway_ble_connected = false;
   gateway_ble_authenticated = false;
+  gateway_ble_restart_advertising = false;
+  gateway_ble_management_deadline_ms = 0;
+  portENTER_CRITICAL(&gateway_ble_command_mux);
   gateway_ble_command_length = 0;
+  gateway_ble_command[0] = '\0';
   gateway_ble_command_pending = false;
+  gateway_ble_command_processing = false;
+  portEXIT_CRITICAL(&gateway_ble_command_mux);
+  gateway_ble_permanently_released = true;
+}
+
+void serviceGatewayBleLifetime() {
+  if (!gateway_ble_initialized || gateway_onboarding_required ||
+      (gateway_ble_connected && gateway_ble_authenticated) ||
+      gateway_ble_management_deadline_ms == 0 ||
+      static_cast<int32_t>(millis() - gateway_ble_management_deadline_ms) < 0) {
+    return;
+  }
+
+  logPrintln("Gateway BLE management window closed; stopping Bluetooth to prioritize Wi-Fi.");
+  stopGatewayBleConfiguration();
+  configureGatewayWifiPowerSave();
+  if (gateway_config.wifi_ssid[0] != '\0' && WiFi.status() != WL_CONNECTED) {
+    // Reassociate only when coexistence actually left the station offline.
+    // Dropping a healthy connection here can interrupt an in-flight LoRa
+    // packet and make an otherwise accepted MQTT hand-off fail.
+    WiFi.reconnect();
+    lastWiFiReconnectAttemptMs = millis();
+    gateway_wifi_disconnect_since_ms = millis();
+    logPrintln("Bluetooth stopped; station Wi-Fi reassociation requested.");
+  } else {
+    logPrintln("Bluetooth stopped; retaining healthy station Wi-Fi connection.");
+  }
 }
 
 bool applyGatewayWebPatch(EquineConfigApi::PatchStatus& status,
@@ -1494,7 +1684,10 @@ bool gatewayConfigWritesAllowed() {
   // trusted local network so a provisioned gateway can be maintained from the
   // app. The custom BLE service remains discoverable and requires the same
   // owner key; the narrower configuration-mode window controls OTA only.
-  return true;
+  // A radio packet is processed synchronously. Defer configuration mutations
+  // while it is being decoded/published so a registry/config rebuild cannot
+  // invalidate the TrackerRuntime pointer used to send its ACK.
+  return !gateway_packet_processing;
 }
 
 
@@ -1538,9 +1731,6 @@ bool initializeTrackerRegistry() {
   EquineMqttApi::formatGatewayTopic(
     gateway_response_prefix, sizeof(gateway_response_prefix),
     gateway_config.mqtt_base_topic, gateway_hash_text, "commands/response");
-  EquineMqttApi::formatGatewayTopic(
-    gateway_archive_ack_topic, sizeof(gateway_archive_ack_topic),
-    gateway_config.mqtt_base_topic, gateway_hash_text, "archive/ack");
   snprintf(ota_hostname, sizeof(ota_hostname), "lora-gateway-%s", GATEWAY_ID);
 
   for (uint8_t config_index = 0;
@@ -1614,7 +1804,9 @@ void publishGatewayAvailability(const char* payload) {
 
 bool publishTrackerPoint(TrackerRuntime& tracker, const char* payload) {
   // The non-retained point event is the canonical stream consumed by
-  // archivers and apps. It determines whether a LoRa frame may be ACKed.
+  // dashboards and optional archivers. A successful hand-off to the MQTT
+  // client permits the LoRa ACK; archiver availability must not decide radio
+  // delivery.
   // PubSubClient publishes at MQTT QoS 0; point_id makes retries idempotent,
   // while a future transport upgrade can add broker-confirmed QoS 1.
   if (!client.publish(tracker.point_event_topic, payload, false)) {
@@ -1761,18 +1953,6 @@ void publishRegistryResponses(const char* request_id) {
 
 void mqttMessageCallback(char* topic, byte* payload_bytes, unsigned int length) {
   if (!topic) return;
-  if (strcmp(topic, gateway_archive_ack_topic) == 0) {
-    if (!payload_bytes || length == 0 || length >= POINT_ID_SIZE) return;
-    char point_id[POINT_ID_SIZE]{};
-    memcpy(point_id, payload_bytes, length);
-    for (size_t index = 0; index < pending_archive_count; index++) {
-      if (strcmp(point_id, pending_archive_point_ids[index]) == 0) {
-        pending_archive_confirmed[index] = true;
-        break;
-      }
-    }
-    return;
-  }
   if (strcmp(topic, gateway_command_topic) != 0) return;
   if (!payload_bytes || length == 0 || length >= MQTT_COMMAND_PAYLOAD_SIZE) {
     logPrintln("Rejected oversized or empty MQTT command.");
@@ -1884,7 +2064,10 @@ void mqttMessageCallback(char* topic, byte* payload_bytes, unsigned int length) 
           changed, slot, error, sizeof(error))) {
       memset(lora_aead_key, 0, sizeof(lora_aead_key));
       publishCommandError(
-        request_id, command, "registration_failed", error);
+        request_id, command,
+        strcmp(error, "gateway_busy") == 0
+          ? "gateway_busy" : "registration_failed",
+        error);
       return;
     }
     memset(lora_aead_key, 0, sizeof(lora_aead_key));
@@ -1923,13 +2106,7 @@ bool subscribeMqttTopics() {
               gateway_command_topic);
     return false;
   }
-  if (!client.subscribe(gateway_archive_ack_topic, 1)) {
-    logPrintf("Failed to subscribe to archive confirmation topic %s.\n",
-              gateway_archive_ack_topic);
-    return false;
-  }
-  logPrintf("Subscribed to MQTT commands and archive confirmations: %s, %s\n",
-            gateway_command_topic, gateway_archive_ack_topic);
+  logPrintf("Subscribed to MQTT commands: %s\n", gateway_command_topic);
   return true;
 }
 
@@ -2120,6 +2297,11 @@ void setupWebInterface() {
       "<script>enable.onclick=async()=>{let k=key.value.trim(),o=result;o.textContent='Enabling...';try{let r=await fetch('/api/v1/config-mode',{method:'POST',headers:{Authorization:'Bearer '+k}}),t=await r.text();if(r.ok){location.replace('/')}else{o.textContent='Request failed: '+t}}catch(e){o.textContent='Request failed: '+e.message}}</script>");
   });
   webServer.on("/api/v1/claim", HTTP_POST, []() {
+    if (!gatewayConfigWritesAllowed()) {
+      webServer.send(503, "application/json",
+        "{\"ok\":false,\"error\":\"gateway_busy\"}");
+      return;
+    }
     if (!gateway_config_mode || owner_key[0]) {
       webServer.send(409, "application/json", "{\"ok\":false,\"error\":\"claim_not_allowed\"}");
       return;
@@ -2222,8 +2404,8 @@ void setupWebInterface() {
   webServer.on("/api/v1/config", HTTP_POST, []() {
     if (!requireWebAuthentication()) return;
     if (!gatewayConfigWritesAllowed()) {
-      webServer.send(403, "application/json",
-        "{\"ok\":false,\"error\":\"physical_config_mode_required\"}");
+      webServer.send(503, "application/json",
+        "{\"ok\":false,\"error\":\"gateway_busy\"}");
       return;
     }
     EquineConfigApi::PatchStatus status;
@@ -2249,8 +2431,8 @@ void setupWebInterface() {
   webServer.on("/api/v1/config/rollback", HTTP_POST, []() {
     if (!requireWebAuthentication()) return;
     if (!gatewayConfigWritesAllowed()) {
-      webServer.send(403, "application/json",
-        "{\"ok\":false,\"error\":\"physical_config_mode_required\"}");
+      webServer.send(503, "application/json",
+        "{\"ok\":false,\"error\":\"gateway_busy\"}");
       return;
     }
     uint32_t expected = 0;
@@ -2277,8 +2459,8 @@ void setupWebInterface() {
   webServer.on("/api/v1/factory-reset", HTTP_POST, []() {
     if (!requireWebAuthentication()) return;
     if (!gatewayConfigWritesAllowed()) {
-      webServer.send(403, "application/json",
-        "{\"ok\":false,\"error\":\"physical_config_mode_required\"}");
+      webServer.send(503, "application/json",
+        "{\"ok\":false,\"error\":\"gateway_busy\"}");
       return;
     }
     if (webServer.arg("confirm") != "FACTORY_RESET") {
@@ -2294,8 +2476,8 @@ void setupWebInterface() {
   webServer.on("/api/v1/reboot", HTTP_POST, []() {
     if (!requireWebAuthentication()) return;
     if (!gatewayConfigWritesAllowed()) {
-      webServer.send(403, "application/json",
-        "{\"ok\":false,\"error\":\"physical_config_mode_required\"}");
+      webServer.send(503, "application/json",
+        "{\"ok\":false,\"error\":\"gateway_busy\"}");
       return;
     }
     webServer.send(200, "application/json", "{\"ok\":true,\"rebooting\":true}");
@@ -2304,6 +2486,11 @@ void setupWebInterface() {
 
   webServer.on("/api/v1/config-mode", HTTP_POST, []() {
     if (!requireWebAuthentication()) return;
+    if (!gatewayConfigWritesAllowed()) {
+      webServer.send(503, "application/json",
+        "{\"ok\":false,\"error\":\"gateway_busy\"}");
+      return;
+    }
     gateway_config_mode = true;
     gateway_config_mode_deadline_ms = millis() + 600000UL;
     startGatewayBleConfiguration();
@@ -2356,7 +2543,9 @@ void setupWebInterface() {
       String out = "{\"ok\":false,\"error\":\"";
       EquineConfigApi::appendJsonEscaped(out, error);
       out += "\"}";
-      webServer.send(strstr(error, "registry is full") ? 409 : 400,
+      const int status_code = strcmp(error, "gateway_busy") == 0
+        ? 503 : (strstr(error, "registry is full") ? 409 : 400);
+      webServer.send(status_code,
                      "application/json", out);
       return;
     }
@@ -2372,19 +2561,22 @@ void setupWebInterface() {
 
   webServer.on("/logs", HTTP_GET, []() {
     if (!requireWebAuthentication()) return;
-    String out = "";
-    if (logHistoryCount == 0) {
-      out = "No logs yet.";
-    } else {
-      const uint8_t oldestIndex =
-        (logHistoryHead + LOG_HISTORY_LINES - logHistoryCount) % LOG_HISTORY_LINES;
-      for (uint8_t i = 0; i < logHistoryCount; i++) {
-        const uint8_t index = (oldestIndex + i) % LOG_HISTORY_LINES;
-        out += logHistory[index];
-        out += "\n";
-      }
-    }
-    webServer.send(200, "text/plain", out);
+    webServer.sendHeader("Cache-Control", "no-store");
+    webServer.send(200, "text/plain", gatewayLogsPlainText());
+  });
+
+  webServer.on("/api/v1/logs", HTTP_OPTIONS, []() {
+    webServer.sendHeader("Access-Control-Allow-Origin", "*");
+    webServer.sendHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+    webServer.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    webServer.send(204, "text/plain", "");
+  });
+
+  webServer.on("/api/v1/logs", HTTP_GET, []() {
+    if (!requireWebAuthentication()) return;
+    webServer.sendHeader("Access-Control-Allow-Origin", "*");
+    webServer.sendHeader("Cache-Control", "no-store");
+    webServer.send(200, "application/json", gatewayLogsJson());
   });
 
   webServer.begin();
@@ -2559,6 +2751,44 @@ void publishAutoDiscovery() {
 void startGatewayFallbackAp();
 void showGatewayOnboardingDisplay();
 
+bool gatewayStationHasUsableIp() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  const IPAddress address = WiFi.localIP();
+  return address[0] != 0 || address[1] != 0 ||
+         address[2] != 0 || address[3] != 0;
+}
+
+void updateGatewayNetworkAddress() {
+  if (gatewayStationHasUsableIp()) {
+    gateway_network_ip = WiFi.localIP().toString();
+  } else if (gateway_ap_active) {
+    gateway_network_ip = WiFi.softAPIP().toString();
+  } else {
+    gateway_network_ip = "off";
+  }
+}
+
+void ensureGatewayMdns() {
+  if (gateway_mdns_started || !gatewayStationHasUsableIp()) return;
+  if (!MDNS.begin(ota_hostname)) {
+    logPrintf("mDNS start failed for %s.\n", ota_hostname);
+    return;
+  }
+  MDNS.addService("http", "tcp", 80);
+  MDNS.addService("arduino", "tcp", 323);
+  gateway_mdns_started = true;
+  logPrintf("mDNS ready at http://%s.local/\n", ota_hostname);
+}
+
+void configureGatewayWifiPowerSave() {
+  // ESP32 classic Bluetooth/BLE and Wi-Fi cannot run with modem sleep
+  // disabled. The Wi-Fi driver aborts the process when both controllers are
+  // enabled and WIFI_PS_NONE is requested. Once BLE has been fully deinitialized
+  // on a configured gateway, disabling modem sleep improves station latency and
+  // avoids stale links on access points with poor power-save interoperability.
+  WiFi.setSleep(gateway_ble_initialized);
+}
+
 void serviceGatewayConfigButton() {
   const bool pressed = digitalRead(USER_BTN_PIN) == LOW;
   const uint32_t now = millis();
@@ -2569,12 +2799,19 @@ void serviceGatewayConfigButton() {
   if (pressed && !gateway_button_hold_handled &&
       (uint32_t)(now - gateway_button_press_start_ms) >= 5000UL) {
     gateway_button_hold_handled = true;
+    if (gateway_ble_permanently_released) {
+      logPrintln("USER held for 5 s: restarting into the ten-minute BLE/configuration window.");
+      gateway_config_restart_magic = GATEWAY_CONFIG_RESTART_MAGIC;
+      delay(100);
+      ESP.restart();
+      return;
+    }
     gateway_config_mode = true;
     gateway_config_mode_deadline_ms = now + 600000UL;
     logPrintln("USER held for 5 s: gateway configuration writes unlocked for 10 minutes.");
     startGatewayBleConfiguration();
     setupOTA();
-    if (WiFi.status() != WL_CONNECTED && !gateway_ap_active) {
+    if (!gatewayStationHasUsableIp() && !gateway_ap_active) {
       startGatewayFallbackAp();
     }
   }
@@ -2608,13 +2845,31 @@ bool postBootButtonRequestsGatewayConfig() {
 }
 
 void startGatewayFallbackAp() {
+  if (gateway_ap_active) {
+    updateGatewayNetworkAddress();
+    return;
+  }
+  const uint32_t now = millis();
+  if (lastGatewayApAttemptMs != 0 &&
+      now - lastGatewayApAttemptMs < WIFI_FALLBACK_AP_RETRY_MS) {
+    return;
+  }
+  lastGatewayApAttemptMs = now;
   char ssid[33]{};
   snprintf(ssid, sizeof(ssid), "LoRaGateway-%04lx",
            static_cast<unsigned long>(
              EquineProtocol::deviceIdHash(GATEWAY_ID) & 0xffffUL));
-  WiFi.mode(WIFI_AP);
+  // Keep the station interface alive while providing the recovery AP. The
+  // previous WIFI_AP-only fallback silently destroyed the configured station
+  // connection and then prevented every subsequent reconnect attempt.
+  const bool station_configured = gateway_config.wifi_ssid[0] != '\0';
+  WiFi.mode(station_configured ? WIFI_AP_STA : WIFI_AP);
+  configureGatewayWifiPowerSave();
+  if (station_configured) {
+    WiFi.begin(gateway_config.wifi_ssid, gateway_config.wifi_password);
+  }
   gateway_ap_active = WiFi.softAP(ssid);
-  gateway_network_ip = gateway_ap_active ? WiFi.softAPIP().toString() : "off";
+  updateGatewayNetworkAddress();
   logPrintf("Gateway configuration AP %s at %s.\n",
             gateway_ap_active ? ssid : "failed",
             gateway_network_ip.c_str());
@@ -2623,9 +2878,11 @@ void startGatewayFallbackAp() {
 
 void setupGatewayNetwork() {
   WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  configureGatewayWifiPowerSave();
+  WiFi.setHostname(ota_hostname);
   if (gateway_config.wifi_ssid[0] != '\0') {
     WiFi.mode(WIFI_STA);
-    WiFi.setSleep(gateway_ble_initialized);
     logPrintf("Connecting gateway to Wi-Fi '%s'...\n",
               gateway_config.wifi_ssid);
     WiFi.begin(gateway_config.wifi_ssid, gateway_config.wifi_password);
@@ -2638,10 +2895,12 @@ void setupGatewayNetwork() {
     Serial.println();
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
+  if (gatewayStationHasUsableIp()) {
     gateway_ap_active = false;
-    gateway_network_ip = WiFi.localIP().toString();
+    updateGatewayNetworkAddress();
     lastWiFiStatus = WiFi.status();
+    gateway_wifi_disconnect_since_ms = 0;
+    ensureGatewayMdns();
     logPrintf("Gateway Wi-Fi connected at %s.\n",
               gateway_network_ip.c_str());
     return;
@@ -2654,25 +2913,65 @@ void setupGatewayNetwork() {
 }
 
 void handleWiFiConnection() {
-  if (gateway_ap_active || gateway_config.wifi_ssid[0] == '\0') return;
+  if (gateway_config.wifi_ssid[0] == '\0') {
+    updateGatewayNetworkAddress();
+    return;
+  }
   const wl_status_t currentStatus = WiFi.status();
+  const bool has_usable_ip = gatewayStationHasUsableIp();
+  const unsigned long now = millis();
+  const bool lost_address = currentStatus == WL_CONNECTED &&
+                            !has_usable_ip &&
+                            gateway_wifi_disconnect_since_ms == 0;
+  const bool regained_address = has_usable_ip &&
+                                gateway_wifi_disconnect_since_ms != 0;
 
-  if (currentStatus != lastWiFiStatus) {
+  if (currentStatus != lastWiFiStatus || lost_address || regained_address) {
     logPrintf("WiFi status changed: %s -> %s\n",
               wifiStatusToString(lastWiFiStatus),
               wifiStatusToString(currentStatus));
     lastWiFiStatus = currentStatus;
 
-    if (currentStatus != WL_CONNECTED && client.connected()) {
+    if (!has_usable_ip) {
+      if (gateway_wifi_disconnect_since_ms == 0) {
+        gateway_wifi_disconnect_since_ms = now;
+      }
+      if (gateway_mdns_started) {
+        MDNS.end();
+        gateway_mdns_started = false;
+      }
+    } else {
+      gateway_wifi_disconnect_since_ms = 0;
+      gateway_network_ip = WiFi.localIP().toString();
+      ensureGatewayMdns();
+    }
+
+    if (!has_usable_ip && client.connected()) {
       client.disconnect();
     }
   }
 
-  if (currentStatus == WL_CONNECTED) {
+  if (has_usable_ip) {
+    if (gateway_ap_active) {
+      if (WiFi.softAPdisconnect(true)) {
+        gateway_ap_active = false;
+        configureGatewayWifiPowerSave();
+        logPrintln("Station Wi-Fi recovered; fallback setup AP stopped.");
+      } else {
+        logPrintln("Warning: station recovered but fallback AP could not be stopped.");
+      }
+    }
+    gateway_network_ip = WiFi.localIP().toString();
+    lastWiFiReconnectAttemptMs = 0;
     return;
   }
 
-  const unsigned long now = millis();
+  updateGatewayNetworkAddress();
+  if (!gateway_ap_active && gateway_wifi_disconnect_since_ms != 0 &&
+      now - gateway_wifi_disconnect_since_ms >= WIFI_FALLBACK_AP_DELAY_MS) {
+    startGatewayFallbackAp();
+  }
+
   if (lastWiFiReconnectAttemptMs != 0 &&
       (now - lastWiFiReconnectAttemptMs) < WIFI_RETRY_INTERVAL_MS) {
     return;
@@ -2696,7 +2995,7 @@ bool ensureTlsClockReady() {
 }
 
 void reconnectMqttIfNeeded() {
-  if (WiFi.status() != WL_CONNECTED || client.connected()) {
+  if (!gatewayStationHasUsableIp() || client.connected()) {
     return;
   }
 
@@ -2730,9 +3029,13 @@ void reconnectMqttIfNeeded() {
         1,
         true,
         "offline")) {
+    if (!subscribeMqttTopics()) {
+      logPrintln("MQTT connected but required subscriptions failed; reconnect scheduled.");
+      client.disconnect();
+      return;
+    }
     logPrintln("CONNECTED!");
     publishGatewayAvailability("online");
-    subscribeMqttTopics();
     publishGatewayStatus(true);
     publishAutoDiscovery();
   } else {
@@ -2740,6 +3043,30 @@ void reconnectMqttIfNeeded() {
     logPrintf("%d", client.state());
     logPrintln(" retry scheduled");
   }
+}
+
+void serviceGatewayNetwork() {
+  if (gateway_ota_active) ArduinoOTA.handle();
+  handleRemoteLogging();
+  webServer.handleClient();
+  handleWiFiConnection();
+
+  if (gatewayStationHasUsableIp()) {
+    reconnectMqttIfNeeded();
+    if (client.connected()) client.loop();
+  }
+}
+
+void serviceGatewayHttpDuringPacketWait() {
+  // A LoRa history frame may wait for the deterministic relay guard. Safe
+  // read-only HTTP requests, especially /api/v1/logs, must still complete
+  // during that wait. Configuration mutations are rejected by
+  // gatewayConfigWritesAllowed() while gateway_packet_processing is true.
+  serviceGatewayBleCommand();
+  if (gateway_ota_active) ArduinoOTA.handle();
+  handleRemoteLogging();
+  webServer.handleClient();
+  yield();
 }
 
 void setup() {
@@ -2787,7 +3114,14 @@ void setup() {
   loadAllDedupStates();
 
   pinMode(USER_BTN_PIN, INPUT_PULLUP);
-  gateway_config_mode = gateway_onboarding_required || postBootButtonRequestsGatewayConfig();
+  const bool restart_requested_config =
+    gateway_config_restart_magic == GATEWAY_CONFIG_RESTART_MAGIC;
+  gateway_config_restart_magic = 0;
+  gateway_config_mode = gateway_onboarding_required ||
+    restart_requested_config || postBootButtonRequestsGatewayConfig();
+  if (restart_requested_config) {
+    logPrintln("Restarted into authenticated gateway configuration mode.");
+  }
   if (gateway_config_mode && !gateway_onboarding_required) {
     gateway_config_mode_deadline_ms = millis() + 600000UL;
   }
@@ -2800,12 +3134,15 @@ void setup() {
 
   if (gateway_config.mqtt_tls_enabled) {
     secureMqttClient.setCACert(runtime_mqtt_ca_certificate.c_str());
+    secureMqttClient.setTimeout(MQTT_TLS_CONNECT_TIMEOUT_SECONDS);
     client.setClient(secureMqttClient);
   } else {
     client.setClient(plainMqttClient);
   }
   client.setServer(gateway_config.mqtt_host, gateway_config.mqtt_port);
   client.setBufferSize(MQTT_BUFFER_SIZE);
+  client.setKeepAlive(MQTT_KEEPALIVE_SECONDS);
+  client.setSocketTimeout(MQTT_SOCKET_TIMEOUT_SECONDS);
   client.setCallback(mqttMessageCallback);
 
   SPI.begin(SCK, MISO, MOSI, SS);
@@ -2855,21 +3192,15 @@ void loop() {
     logPrintln("Gateway configuration write window closed.");
   }
 
+  serviceGatewayBleLifetime();
   serviceGatewayConfigButton();
-  ArduinoOTA.handle();
-  handleRemoteLogging();
-  webServer.handleClient();
+  serviceGatewayNetwork();
   logReceiverHeartbeat();
-
-  handleWiFiConnection();
-  if (WiFi.status() == WL_CONNECTED) {
-    reconnectMqttIfNeeded();
-    if (client.connected()) client.loop();
-  }
 
   const int packetSize = LoRa.parsePacket();
   if (!packetSize) return;
 
+  gateway_packet_processing = true;
   do {
     // Authenticated envelope + encrypted history, root and batch metadata.
     if (packetSize < (int)(sizeof(EquineRelay::LinkHeaderV2) +
@@ -3034,7 +3365,6 @@ void loop() {
     bool packet_valid = true;
     bool publish_success = true;
     bool processed_any_point = false;
-    resetPendingArchiveConfirmations();
     uint32_t current_seq = header.first_seq;
     uint32_t highest_ackable_seq = header.first_seq;
 
@@ -3130,11 +3460,6 @@ void loop() {
           return;
         }
 
-        if (!addPendingArchiveConfirmation(point_id)) {
-          logPrintln("Archive confirmation set overflow; packet retained for retry.");
-          publish_success = false;
-          return;
-        }
       } else {
         logPrintf("  -> Duplicate already published [%s] boot=%lu seq=%lu\n",
                   tracker->config->device_id,
@@ -3223,22 +3548,11 @@ void loop() {
       packet_valid = false;
     }
 
-    if (packet_valid && publish_success && pending_archive_count > 0) {
-      const uint32_t deadline_ms = millis() + ARCHIVE_ACK_TIMEOUT_MS;
-      while (client.connected() && !allArchiveConfirmationsReceived() &&
-             static_cast<int32_t>(millis() - deadline_ms) < 0) {
-        client.loop();
-        delay(1);
-      }
-      if (!allArchiveConfirmationsReceived()) {
-        logPrintf(
-          "Archive confirmation timed out (%u points); ACK withheld and "
-          "tracker data retained.\n",
-          static_cast<unsigned>(pending_archive_count));
-        publish_success = false;
-      } else {
-        updateDedupState(*tracker, header.boot_id, highest_ackable_seq);
-      }
+    if (packet_valid && publish_success && processed_any_point) {
+      // MQTT client acceptance is the receiver's delivery boundary. Archive
+      // receipts are intentionally not part of radio ACK progression: the
+      // archiver is optional and a missing one must not strand tracker data.
+      updateDedupState(*tracker, header.boot_id, highest_ackable_seq);
     }
 
     if (!packet_valid || !publish_success || !processed_any_point) {
@@ -3250,10 +3564,9 @@ void loop() {
       break;
     }
 
-    // A nearby repeater can start forwarding the just-received HISTORY while
-    // the archive receipt is in flight. Wait until that deterministic relay
-    // window and packet airtime have cleared before sending the ACK; otherwise
-    // a fast archive can make the ACK collide with the repeater transmission.
+    // A nearby repeater can start forwarding the just-received HISTORY. Wait
+    // until that deterministic relay window and packet airtime have cleared
+    // before sending the ACK, so it cannot collide with the forwarding frame.
     const LoraTrackerCore::RadioConfig guard_radio{
       gateway_config.lora.frequency_hz,
       gateway_config.lora.bandwidth_hz,
@@ -3264,9 +3577,10 @@ void loop() {
     const uint32_t ack_relay_guard_ms = LoraTrackerCore::ackRelayGuardMs(
       packetSize, guard_radio, link_header.hop_count, link_header.hop_limit);
     const uint32_t receive_finished_ms = lastLoRaPacketMs;
-    while (client.connected() &&
-           millis() - receive_finished_ms < ack_relay_guard_ms) {
-      client.loop();
+    while (static_cast<uint32_t>(millis() - receive_finished_ms) <
+           ack_relay_guard_ms) {
+      if (client.connected()) client.loop();
+      serviceGatewayHttpDuringPacketWait();
       delay(1);
     }
     if (ack_relay_guard_ms > 0) {
@@ -3323,6 +3637,10 @@ void loop() {
     LoRa.write(ack_packet, sizeof(ack_packet));
 
     const uint32_t tx_started_ms = millis();
+    // Keep DIO0 unregistered and receive frames through parsePacket(). The
+    // LoRa library's TX-done callback also consumes RX_DONE interrupts, which
+    // makes a mixed callback/polling design silently drop incoming packets.
+    // ACK airtime is bounded and short enough to transmit synchronously.
     const int txResult = LoRa.endPacket();
     const uint32_t measured_airtime_ms = millis() - tx_started_ms;
     if (measured_airtime_ms > estimated_airtime_ms) {
@@ -3331,16 +3649,18 @@ void loop() {
         static_cast<double>(measured_airtime_ms - estimated_airtime_ms));
     }
     if (txResult) {
-      logPrintf("Sent ACK [%s] boot=%lu seq=%lu\n",
+      logPrintf("Sent ACK [%s] boot=%lu seq=%lu airtime=%lu ms\n",
                 tracker->config->device_id,
                 (unsigned long)header.boot_id,
-                (unsigned long)highest_ackable_seq);
+                (unsigned long)highest_ackable_seq,
+                (unsigned long)measured_airtime_ms);
     } else {
       logPrintf("Failed to transmit ACK for tracker %s.\n",
                 tracker->config->device_id);
     }
   } while (false);
 
+  gateway_packet_processing = false;
   LoRa.receive();
 }
 void showGatewayOnboardingDisplay() {

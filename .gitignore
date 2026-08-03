@@ -8,6 +8,7 @@
 .platformio/
 components/.pio-build/
 .venv/
+.venv-platformio/
 **/__pycache__/
 *.egg-info/
 .pytest_cache/

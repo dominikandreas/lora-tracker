@@ -95,6 +95,7 @@ reduce it only after verifying worst-case end-to-end timing. See
 ## Safe change procedure
 
 Change one policy group at a time, record the old revision and export non-secret
-configuration, then verify at least one complete fix/transmit/ACK/archive cycle.
+configuration, then verify at least one complete fix/transmit/ACK cycle and,
+when deployed, a separate archive cycle.
 Radio changes require coordinated tracker and gateway maintenance. Identity
 changes also require broker ACL, archiver allowlist and application updates.

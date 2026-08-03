@@ -55,11 +55,12 @@ model.
 The gateway accepts only the current versioned LoRa history packet. Frames are
 routed by a public 64-bit device hash. It maintains independent
 per-tracker deduplication state and publishes point events plus retained latest
-state. It advances deduplication and sends a radio ACK only after the archiver
-returns a durable SQLite receipt for every new point in the batch. If the
-received link header still permits a relay hop, it also waits for the shared
-relay-clear guard before transmitting the ACK so a fast archive cannot collide
-with a repeater forwarding the HISTORY frame.
+state. It advances deduplication and sends a radio ACK after the authenticated
+frame has been handed to MQTT; the SQLite archiver is an optional consumer and
+does not participate in radio delivery. If the received link header still
+permits a relay hop, it waits for the shared relay-clear guard before
+transmitting the ACK so it cannot collide with a repeater forwarding the
+HISTORY frame.
 
 The gateway can register up to 12 trackers. Unknown identities and unsupported
 schemas are rejected.
@@ -82,9 +83,9 @@ latest state and availability are retained. The stable point identifier is:
 ```
 
 The archiver deduplicates on that ID, records receptions from multiple gateways,
-and stores GNSS fix time separately from broker receive time. After commit it
-publishes a gateway-specific archive receipt at QoS 1. History responses are
-paginated and chunked over MQTT.
+and stores GNSS fix time separately from broker receive time. It may publish a
+gateway-specific QoS 1 archive receipt after commit; this optional receipt does
+not affect radio ACKs. History responses are paginated and chunked over MQTT.
 
 ## Portable firmware core and Network Lab
 

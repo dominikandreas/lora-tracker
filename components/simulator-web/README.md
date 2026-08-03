@@ -3,7 +3,7 @@
 The Network Lab is a static, self-contained browser simulator. Its Web Worker
 loads the portable C++ firmware policy core as WebAssembly and runs a seeded
 discrete-event model for trackers, keyless repeaters, receivers, a single MQTT
-service and its durable archive receipt.
+service. The archive is optional and does not gate gateway ACK delivery.
 
 ## Build and run
 

@@ -31,8 +31,8 @@ delivery guarantees and hardware qualification and cannot be papered over.
 - Added CI, tagged release packaging, checksums, provenance and browser-flash images.
 - Added keyless bounded repeater forwarding for encrypted history and ACKs with
   deterministic suppression, queue bounds, post-success duplicate caching and retries.
-- Added archiver-confirmed gateway delivery: dedup state and tracker ACKs advance
-  only after every new point has a durable SQLite receipt.
+- Added optional SQLite archiving with idempotent point storage and history
+  service; tracker ACKs remain independent of archive availability.
 - Enforced the Germany band-48 channel, 14 dBm conducted-power cap and 1% rolling-hour airtime ceiling on every transmitter.
 - Preserved unacknowledged points across daily rollover and stopped queue-full overwrite; new samples now fail closed when RTC storage is full.
 - Added consistent live archive backups, integrity and foreign-key checks,

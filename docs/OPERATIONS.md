@@ -96,6 +96,54 @@ changes are deferred outside the button handler, and enabling BLE uses a clean
 restart path. After disabling BLE on a configured tracker, verify that wake
 count and fix age continue to change after the next normal tracking cycle.
 
+## Gateway logs without USB
+
+After authenticating a gateway with its owner key, the app's **Read recent
+logs** action retrieves the bounded in-memory log buffer over BLE or HTTP. BLE
+returns the newest eight lines to avoid blocking LoRa polling with hundreds of
+acknowledged GATT indications; HTTP returns all 25 buffered lines. The HTTP API
+is:
+
+```bash
+curl -H "Authorization: Bearer <64-hex-owner-key>" \
+  http://<gateway-ip>/api/v1/logs
+```
+
+The response contains a `lines` array. Logs are intentionally not persisted;
+rebooting clears the buffer. Use the endpoint immediately before and after a
+radio test. `Received packet`, `MQTT publish failed`, `ACK deferred by Germany
+1% airtime limiter`, and `Sent ACK` identify
+the main receive-to-ACK stages.
+
+## Gateway network recovery
+
+The gateway keeps its configured station Wi-Fi active while it starts a
+fallback setup AP after a prolonged disconnect. It continues retrying the
+station connection instead of becoming AP-only. Once station Wi-Fi returns,
+the reported `network_ip` and the mDNS name are updated automatically. Prefer
+the stable name `http://lora-gateway-<gateway-id>.local/` when the local network
+supports mDNS; DHCP addresses can change after a router restart.
+
+The gateway keeps Wi-Fi modem sleep enabled while BLE is active. The classic
+ESP32 Wi-Fi driver aborts when Wi-Fi and BLE are both active with modem sleep
+disabled, so `WIFI_PS_NONE` must not be used during that coexistence window.
+On an already configured gateway, BLE closes after the 60-second startup
+management window and releases its controller memory; the gateway then
+reassociates with station Wi-Fi with modem sleep disabled. This avoids stale
+Wi-Fi links seen on classic ESP32 boards during indefinite BLE advertising.
+MQTT socket reads are bounded so an unavailable broker cannot starve device
+management. During a LoRa relay/ACK guard, read-only HTTP requests such as log
+retrieval continue to be served; configuration writes are briefly rejected
+with `gateway_busy` and should be retried.
+
+If both station and HTTP access disappear, verify the gateway still has power,
+then hold USER for five seconds while it is running or hold it for 1.5 seconds
+inside the post-boot configuration window. If BLE controller memory has already
+been released, the five-second hold performs a controlled restart into a
+ten-minute authenticated BLE/configuration window. The recovery AP remains
+available while station reconnect is attempted, allowing the app to restore
+Wi-Fi or enable OTA without a USB cable.
+
 ## No GNSS fixes
 
 The tracker gives a cold or periodic recovery attempt at least 90 seconds of
@@ -127,12 +175,13 @@ profile. Check gateway RSSI/logs and repeater forwarded, suppressed, queue-drop
 and airtime-deferral counters. Failed ACKs retain the queue and use
 1/2/5/10-minute retry backoff by default.
 
-A gateway sends a radio ACK only after the archiver confirms every new point on
-its `archive/ack` topic. If the archiver, broker, ACL or confirmation route is
-unavailable, the gateway deliberately withholds the ACK and the tracker retries.
-Broker ACLs must allow only the archiver to publish gateway archive-confirmation
-topics. This converts QoS-0 point publication into application-confirmed durable
-SQLite delivery; duplicate events and confirmations are expected and idempotent.
+A gateway sends a radio ACK after it authenticates the complete frame and hands
+every new point to its configured MQTT client. The SQLite archiver is optional:
+an unavailable archive must not delay or prevent tracker ACKs. If MQTT is
+unavailable or a point event cannot be handed off, the gateway withholds the
+ACK and the tracker retries. MQTT point events use QoS 0, so a production
+deployment that needs durable history should operate the optional archiver and
+monitor its retained availability/status independently.
 
 The link uses deterministic repeater priority slots and peer suppression, but
 hidden repeaters and multiple receivers can still produce duplicate ACKs or

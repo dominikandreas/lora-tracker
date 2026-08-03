@@ -94,7 +94,7 @@ test("fixed seed produces an identical event trace", () => {
   assert.ok(first.events.some((event) => event.type === "radio-tx"));
 });
 
-test("relay path can archive data and return an ACK", () => {
+test("relay path returns an ACK while optional archive data commits", () => {
   const core = new ReferenceCore();
   const scenario = createDefaultScenario();
   // Block the direct path while keeping tracker -> relay -> gateway viable.
@@ -119,7 +119,7 @@ test("relay path can archive data and return an ACK", () => {
   assert.ok(engine.archive.size > 0);
 });
 
-test("MQTT outage withholds archive-backed ACK and retains tracker queue", () => {
+test("MQTT outage withholds gateway ACK and retains tracker queue", () => {
   const core = new ReferenceCore();
   const scenario = createDefaultScenario();
   scenario.mqtt.online = false;
@@ -133,6 +133,19 @@ test("MQTT outage withholds archive-backed ACK and retains tracker queue", () =>
   );
   assert.ok(tracker.runtime.queue.length > 0);
   assert.equal(engine.archive.size, 0);
+});
+
+test("gateway ACK does not wait for optional archive completion", () => {
+  const core = new ReferenceCore();
+  const scenario = createDefaultScenario();
+  scenario.mqtt.archiveLatencyMs = 60_000;
+  const engine = new SimulationEngine(scenario, core);
+  engine.advance(900);
+  const ack = engine.events.find((event) => event.type === "ack");
+  const archive = engine.events.find((event) => event.type === "archive");
+  assert.ok(ack, "expected a gateway ACK");
+  assert.ok(archive, "expected the optional archive to eventually commit");
+  assert.ok(ack.timeS < archive.timeS, "ACK must not wait for the archive");
 });
 
 test("collision model reports simultaneous equal-power frames", () => {

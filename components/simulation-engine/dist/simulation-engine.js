@@ -541,7 +541,7 @@ export class SimulationEngine {
       if (task.type === 'radio-receive') this.receiveTransmission(task.payload);
       else if (task.type === 'relay-forward') this.forwardRelay(task.payload);
       else if (task.type === 'archive') this.archiveFrame(task.payload);
-      else if (task.type === 'send-ack') this.sendArchiveAck(
+      else if (task.type === 'send-ack') this.sendGatewayAck(
         this.devices.get(task.payload.gatewayId), task.payload.frame);
       else if (task.type === 'ack-timeout') this.ackTimeout(task.payload);
     }
@@ -692,10 +692,21 @@ export class SimulationEngine {
       deviceId: gateway.id, frameKey: frame.key, qos: 0, severity: 'info',
     });
     this.schedule((this.scenario.mqtt.latencyMs + this.scenario.mqtt.archiveLatencyMs) / 1000,
-      'archive', { gatewayId: gateway.id, frame: deepCopy(frame), receivedAtS: this.timeS });
+      'archive', { gatewayId: gateway.id, frame: deepCopy(frame) });
+    const guardMs = this.core.ackRelayGuardMs(
+      frame.bytes, gateway.radio, frame.hop, frame.hopLimit);
+    const guardS = guardMs / 1000;
+    if (guardS > 0.001) {
+      this.log('ack-guard', `${gateway.name} waits ${Math.ceil(guardMs)} ms for relay airtime to clear`, {
+        deviceId: gateway.id, frameKey: frame.key, severity: 'info',
+      });
+      this.schedule(guardS, 'send-ack', { gatewayId: gateway.id, frame });
+    } else {
+      this.sendGatewayAck(gateway, frame);
+    }
   }
 
-  archiveFrame({ gatewayId, frame, receivedAtS }) {
+  archiveFrame({ gatewayId, frame }) {
     const gateway = this.devices.get(gatewayId);
     let inserted = 0;
     for (const point of frame.points) {
@@ -706,20 +717,9 @@ export class SimulationEngine {
     this.log('archive', `MQTT archive committed ${inserted} new point${inserted === 1 ? '' : 's'}`, {
       deviceId: gateway.id, frameKey: frame.key, inserted, severity: 'success',
     });
-    const guardMs = this.core.ackRelayGuardMs(
-      frame.bytes, gateway.radio, frame.hop, frame.hopLimit);
-    const remainingGuardS = Math.max(0, receivedAtS + guardMs / 1000 - this.timeS);
-    if (remainingGuardS > 0.001) {
-      this.log('ack-guard', `${gateway.name} waits ${Math.ceil(remainingGuardS * 1000)} ms for relay airtime to clear`, {
-        deviceId: gateway.id, frameKey: frame.key, severity: 'info',
-      });
-      this.schedule(remainingGuardS, 'send-ack', { gatewayId, frame });
-    } else {
-      this.sendArchiveAck(gateway, frame);
-    }
   }
 
-  sendArchiveAck(gateway, frame) {
+  sendGatewayAck(gateway, frame) {
     const tracker = this.devices.get(frame.deviceId);
     if (!tracker || frame.points.length === 0) return;
     const ackSeq = frame.points.at(-1).seq;
@@ -780,7 +780,7 @@ export class SimulationEngine {
     tracker.runtime.rxWindowUntilS = null;
     tracker.runtime.status = 'sleeping';
     tracker.runtime.failures = Math.min(255, tracker.runtime.failures + 1);
-    this.log('ack-timeout', `${tracker.name} did not receive an archive-backed ACK`, {
+    this.log('ack-timeout', `${tracker.name} did not receive a gateway ACK`, {
       deviceId: tracker.id, failures: tracker.runtime.failures,
       retryS: this.core.retrySeconds(tracker.config, tracker.runtime.failures), severity: 'warning',
     });

@@ -52,19 +52,18 @@ gateway emits:
 
 Consumers must prefer `fix_time_unix_ms` only when `timestamp_valid` is true.
 
-## Archive confirmation
+## Optional archive receipt
 
 ```text
 lora-tracker/v1/gateways/<gateway_hash>/archive/ack
 ```
 
-After a point transaction commits, the archiver publishes the exact `point_id`
-as the non-retained payload at QoS 1 to the receiving gateway topic. It sends a
-receipt for both a first insert and an idempotent duplicate. The gateway does
-not advance its dedup cursor or transmit a LoRa ACK until every new point in the
-radio batch has a matching receipt. A missing receipt therefore causes safe
-tracker retry rather than silent loss after a QoS-0 point event. Broker ACLs
-must restrict publication on this route to the archiver role.
+After a point transaction commits, an archiver may publish the exact `point_id`
+as a non-retained QoS 1 receipt to the receiving gateway topic. It sends a
+receipt for both a first insert and an idempotent duplicate. Receipts are
+useful for archive monitoring, but the gateway does not subscribe to or depend
+on them for deduplication or LoRa ACK progression. Broker ACLs may restrict
+publication on this route to the archiver role.
 
 ## History request
 
@@ -152,4 +151,4 @@ registration envelope non-replayable after its original configuration commit.
 Broker ACLs must still restrict gateway command topics; encryption does not
 replace least-privilege MQTT accounts.
 
-The archive confirmation route above is required for tracker ACK progression.
+The optional archive-receipt route above does not affect tracker ACK progression.

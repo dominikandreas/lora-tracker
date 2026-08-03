@@ -92,8 +92,8 @@ reverse limits. The repeater hop value is only a local maximum.
 ## Timing and topology
 
 Co-hearing relays use packet-airtime-sized slots and suppress their pending copy
-when they hear the winner. The gateway retains the relay-clear guard before an
-archive-backed ACK; the ACK then follows only the recorded reverse path. Hidden
+when they hear the winner. The gateway retains the relay-clear guard before a
+gateway ACK; the ACK then follows only the recorded reverse path. Hidden
 nodes that cannot hear the winner remain a physical shared-channel limitation,
 so installed topology tests are still required.
 
@@ -128,7 +128,7 @@ Before field use:
 
 The browser Network Lab covers deterministic multi-hop timing, obstacle-aware
 link budgets, collisions/capture, suppression, legal airtime, MQTT outage,
-archive receipt and reverse ACK propagation while running the shared firmware
+optional archive activity and reverse ACK propagation while running the shared firmware
 policy as WASM. Its RF/environment parameters are engineering estimates, not
 site calibration; installed propagation, interference, ERP and real radio
 timing remain hardware tests.
