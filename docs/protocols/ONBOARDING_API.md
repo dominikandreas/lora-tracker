@@ -85,6 +85,7 @@ CLAIM <64-hex-owner-key>
 AUTH <64-hex-owner-key>
 HELLO
 GET CONFIG
+GET LOGS
 PATCH expected_revision=4&device_name=Wera&moving_sleep_s=45
 ENTER_CONFIG_MODE
 PAIR_GATEWAY <gateway-id>             # tracker
@@ -99,10 +100,30 @@ REBOOT
 attended setup window. Every other command except `AUTH` requires the current
 BLE session to be authenticated. Disconnect clears session authentication.
 
+`GET LOGS` returns the eight most recent gateway log lines over BLE, with
+`count`, `total`, and `truncated` metadata. Limiting the response avoids a long
+burst of acknowledged GATT indications blocking the gateway's polling LoRa
+receiver. It is intended for diagnostics and does not persist logs or keep the
+BLE connection busy with a continuous stream. Authenticated HTTP returns the
+full bounded 25-line snapshot.
+
+Provisioned gateways expose the same snapshot over authenticated HTTP:
+
+```text
+GET /api/v1/logs
+Authorization: Bearer <64-hex-owner-key>
+```
+
+The legacy authenticated `GET /logs` endpoint remains available as plain text.
+
 An incomplete tracker advertises this service without a deadline. Completing
 both tracker configuration and gateway pairing returns it to the bounded BLE
-window and normal low-power policy. Gateway owner-key BLE management remains
-discoverable; its setup AP and OTA service are independently time-bounded.
+window and normal low-power policy. An already configured gateway advertises
+BLE for 60 seconds after a normal boot, or for the ten-minute authenticated
+configuration window after an explicit request. It then releases Bluetooth to
+prioritize station Wi-Fi reliability. Holding USER for five seconds after that
+release performs a controlled restart into a fresh ten-minute BLE/configuration
+window. The setup AP and OTA service remain independently time-bounded.
 
 The key is a bearer secret on local HTTP and the custom BLE protocol. Operate
 configuration networks in physical proximity/on a trusted LAN. QR exports and

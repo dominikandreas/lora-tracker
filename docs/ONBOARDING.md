@@ -111,16 +111,19 @@ power or reset to an ESP32-S3, because that can select the ROM downloader.
 
 ## Gateway and repeater
 
-The gateway's custom BLE management service remains discoverable so a saved
-owner key can authenticate without an OS bond. Station Wi-Fi is preferred for
-normal management. Holding USER for five seconds opens configuration mode and
-the setup AP for ten minutes.
+The gateway's custom BLE management service is available for 60 seconds after
+a normal configured boot and throughout an explicit ten-minute configuration
+window. It then releases Bluetooth to protect station Wi-Fi reliability on the
+classic ESP32. If Bluetooth has already been released, holding USER for five
+seconds performs a controlled restart into a fresh authenticated BLE/configuration
+window. Reconnection uses the saved owner key and never requires an OS bond.
+Station Wi-Fi is preferred for normal management.
 
 An incomplete tracker keeps its custom BLE configuration service available
 without a timeout, including the interval after Wi-Fi has been saved but before
 gateway registration is confirmed. Once onboarding is complete, its normal
-bounded BLE/low-power policy resumes. Gateway BLE management remains available
-after onboarding and always requires the stored owner key.
+bounded BLE/low-power policy resumes. Gateway BLE management can be reopened
+with the USER-button procedure above and always requires the stored owner key.
 
 Repeaters do not need tracker LoRa keys and do not expose BLE. Claim and manage
 them through their open, attended setup AP. They do not run a station Wi-Fi or

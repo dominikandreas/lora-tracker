@@ -66,6 +66,24 @@ test("Wi-Fi tracker registration uses the narrow idempotent endpoint", async () 
   assert.match(request.options.body, /lora_aead_key=/);
 });
 
+test("authenticated Wi-Fi log retrieval uses the gateway logs API", async () => {
+  const originalFetch = globalThis.fetch;
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return { status: 200, text: async () => '{"ok":true,"count":1,"lines":["Received packet"]}' };
+  };
+  try {
+    const device = new WifiDeviceTransport("gateway.local", "paired-token");
+    const result = await device.getLogs();
+    assert.deepEqual(result.lines, ["Received packet"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(request.url, "http://gateway.local/api/v1/logs");
+  assert.equal(request.options.headers.Authorization, "Bearer paired-token");
+});
+
 test("pairing keeps one tracker session and commits gateway before tracker", async () => {
   const steps = [];
   const progress = [];

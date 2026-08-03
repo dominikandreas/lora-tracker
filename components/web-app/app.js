@@ -487,6 +487,7 @@ async function resetDeviceSession() {
   els.deviceSession.hidden = false;
   els.deviceAddressRow.hidden = false;
   els.deviceConfigPanel.hidden = true;
+  els.getDeviceLogs.hidden = true;
   els.bleOutput.textContent = "";
   setBleStatus("Disconnected");
 }
@@ -508,6 +509,7 @@ async function showDeviceConfig(config) {
   els.deviceConfigPanel.hidden = false;
   els.trackerPairingPanel.hidden = config.role !== "tracker";
   els.rollbackDevice.hidden = config.role === "repeater";
+  els.getDeviceLogs.hidden = config.role !== "gateway";
   if (config.role === "tracker") {
     els.pairingGateway.replaceChildren();
     for (const gateway of devices.filter((device) => device.role === "gateway")) {
@@ -1118,6 +1120,21 @@ els.refreshDeviceConfig.addEventListener("click", async () => {
     await showDeviceConfig(config);
   } catch (error) {
     appendBleOutput(`Refresh failed: ${error.message}`);
+  }
+});
+
+els.getDeviceLogs.addEventListener("click", async () => {
+  try {
+    const result = deviceSession.mode === "wifi"
+      ? await deviceSession.wifi.getLogs()
+      : await deviceSession.manager.getLogs();
+    if (Array.isArray(result?.lines)) {
+      appendBleOutput(result.lines.join("\n"));
+    } else {
+      appendBleOutput(result);
+    }
+  } catch (error) {
+    appendBleOutput(`Log retrieval failed: ${error.message}`);
   }
 });
 

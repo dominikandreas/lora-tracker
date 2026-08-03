@@ -102,6 +102,10 @@ export class WifiDeviceTransport {
     return this.request("/api/v1/config");
   }
 
+  getLogs() {
+    return this.request("/api/v1/logs");
+  }
+
   async patchConfig(expectedRevision, fields) {
     if (this.role === "repeater") {
       return this.request("/save", {

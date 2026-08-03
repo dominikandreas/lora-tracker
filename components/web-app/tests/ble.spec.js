@@ -264,6 +264,22 @@ test.describe("BLE Mock Transport Integration", () => {
     expect(role).toBe("gateway");
   });
 
+  test("OnboardingManager requests authenticated recent logs over BLE", async ({ page }) => {
+    const command = await page.evaluate(async () => {
+      const { OnboardingManager } = window.__loraTrackerTest;
+      let sent;
+      const manager = new OnboardingManager({
+        sendCommand: async (value) => {
+          sent = value;
+          return { ok: true, count: 1, lines: ["Received packet"] };
+        },
+      });
+      const result = await manager.getLogs();
+      return { command: sent, lines: result.lines };
+    });
+    expect(command).toEqual({ command: "GET LOGS", lines: ["Received packet"] });
+  });
+
   test("OnboardingManager waits for the native disconnect to finish", async ({ page }) => {
     const result = await page.evaluate(async () => {
       const { OnboardingManager } = window.__loraTrackerTest;

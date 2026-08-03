@@ -461,6 +461,10 @@ export class OnboardingManager {
     return this.lastConfig;
   }
 
+  getLogs() {
+    return this.transport.sendCommand("GET LOGS", 15000);
+  }
+
   async patchConfig(expectedRevision, fields) {
     const params = new URLSearchParams({
       expected_revision: expectedRevision,
