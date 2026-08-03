@@ -148,6 +148,14 @@ test("gateway ACK does not wait for optional archive completion", () => {
   assert.ok(ack.timeS < archive.timeS, "ACK must not wait for the archive");
 });
 
+test("fresh devices have one bounded legal airtime burst", () => {
+  const engine = new SimulationEngine(createDefaultScenario(), new ReferenceCore());
+  for (const device of engine.devices.values()) {
+    assert.equal(device.runtime.airtimeTokensMs, device.runtime.airtimeCapacityMs);
+    assert.ok(device.runtime.airtimeTokensMs > 0);
+  }
+});
+
 test("collision model reports simultaneous equal-power frames", () => {
   const core = new ReferenceCore();
   const scenario = createDefaultScenario();
@@ -283,6 +291,9 @@ test("co-hearing relays serialize HISTORY and only the selected route accepts AC
   const tracker = engine.devices.get("tracker-1");
   const relay1 = engine.devices.get("relay-1");
   const second = engine.devices.get("relay-2");
+  // This is a relay-selection test. Prevent the independently tested gateway
+  // ACK path from creating a competing transmission during peer suppression.
+  engine.devices.get("gateway-1").runtime.airtimeTokensMs = 0;
   relay1.runtime.airtimeTokensMs = relay1.runtime.airtimeCapacityMs;
   second.runtime.airtimeTokensMs = second.runtime.airtimeCapacityMs;
   const frame = {

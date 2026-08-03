@@ -288,4 +288,11 @@ inline bool consumeAirtimeTokens(double& tokens_ms, uint32_t airtime_ms) {
   return LoraTrackerCore::consumeAirtimeTokens(tokens_ms, airtime_ms);
 }
 
+inline double settleAirtimeTokens(
+    double tokens_ms, uint32_t reserved_airtime_ms,
+    uint32_t measured_airtime_ms, uint32_t capacity_ms) {
+  return LoraTrackerCore::settleAirtimeTokens(
+    tokens_ms, reserved_airtime_ms, measured_airtime_ms, capacity_ms);
+}
+
 }  // namespace EquineRelay

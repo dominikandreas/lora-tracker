@@ -30,11 +30,13 @@ The tracker, gateway and repeater reject a configuration unless:
 - every transmitting role uses at most 36,000 ms in a rolling hour.
 
 The shipped center frequency is 868.1 MHz with 125 kHz bandwidth. Airtime is
-calculated with the Semtech LoRa time-on-air equation. The limiter starts empty
-after a cold boot, survives tracker deep sleep in CRC-protected RTC state, and
-uses a burst bucket whose refill is reduced by that capacity. Trackers and
-gateways reserve one maximum frame; repeaters reserve one maximum HISTORY plus
-the matching ACK so a selected route never strands its response.
+calculated with the Semtech LoRa time-on-air equation. The limiter permits one
+bounded startup packet, then settles the conservative reservation to the
+measured TX-done duration so shorter real transmissions are not overcharged.
+It uses a burst bucket whose refill is reduced by that capacity; tracker state
+survives deep sleep in CRC-protected RTC memory. Trackers and gateways reserve
+one maximum frame; repeaters reserve one maximum HISTORY plus the matching ACK
+so a selected route never strands its response.
 This bounds an idle-time burst plus all refill during any hour to the legal
 36-second ceiling. Gateway ACKs are deferred when no budget is available;
 trackers retain their data and retry. Repeaters drop a due HISTORY when the complete HISTORY+ACK transaction cannot

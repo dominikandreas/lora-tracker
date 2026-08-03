@@ -33,7 +33,8 @@ Forwarding is bounded and opportunistic:
   boot and transaction and expires after 35 seconds. If the whole transaction
   cannot be funded, the frame is dropped and the tracker retry selects a fresh
   path; an already-forwarded half-transaction is never left waiting indefinitely;
-- the rolling-hour limiter starts empty after reboot and sizes its burst capacity
+- the rolling-hour limiter permits one bounded HISTORY+ACK transaction after
+  reboot, sizes its burst capacity
   for one maximum HISTORY plus ACK transaction, while still bounding refill to
   36,000 ms in every continuous hour under the supported Germany profile. See the
   [Germany radio profile](RADIO_COMPLIANCE_DE.md) for ERP/EIRP and antenna rules.

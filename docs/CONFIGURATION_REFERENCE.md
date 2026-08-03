@@ -84,7 +84,7 @@ trusted NTP-synchronized clock fails closed.
   the one-time, passwordless setup-AP claim.
 - Two-hop local forwarding cap; 40 ms base delay and eight deterministic 45 ms priority slots.
 - Eight queued frames and a 120-second history duplicate cache; ACKs use five seconds.
-- Rolling-hour 36,000 ms airtime ceiling with fail-safe cold start and 14 dBm maximum requested conducted TX power.
+- Rolling-hour 36,000 ms airtime ceiling with one bounded startup packet/transaction, measured TX-duration settlement after each transmission, and 14 dBm maximum requested conducted TX power.
 - Repeating disabled until the first valid configuration is saved.
 
 The 15-second tracker ACK window is an energy/coverage tradeoff, not a universal

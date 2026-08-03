@@ -205,7 +205,9 @@ function initialRuntime(device, core) {
     nextSeq: 0,
     counter: 0,
     bootId: 1,
-    airtimeTokensMs: 0,
+    // A token bucket allows one bounded packet after a clean startup. Starting
+    // empty delayed the first report/ACK despite no prior airtime use.
+    airtimeTokensMs: radioCapacity,
     airtimeCapacityMs: radioCapacity,
     seen: {},
     pending: {},

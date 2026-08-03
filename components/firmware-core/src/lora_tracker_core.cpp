@@ -222,6 +222,21 @@ bool consumeAirtimeTokens(double& tokens_ms, uint32_t airtime_ms) {
   return true;
 }
 
+double settleAirtimeTokens(
+    double tokens_ms,
+    uint32_t reserved_airtime_ms,
+    uint32_t measured_airtime_ms,
+    uint32_t capacity_ms) {
+  // A transmission is pre-authorized with the PHY equation, then settled
+  // against the blocking TX-done duration. This refunds an over-estimate while
+  // retaining the conservative reservation before the radio is keyed.
+  if (reserved_airtime_ms == 0 || capacity_ms == 0) return tokens_ms;
+  const double settled = tokens_ms + static_cast<double>(reserved_airtime_ms) -
+    static_cast<double>(measured_airtime_ms);
+  if (settled <= 0.0) return 0.0;
+  return settled > capacity_ms ? capacity_ms : settled;
+}
+
 }  // namespace LoraTrackerCore
 
 extern "C" {

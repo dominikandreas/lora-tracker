@@ -143,6 +143,10 @@ void testRelayLink() {
     0.0, 3600000ULL, 36000, capacity);
   assert(rolling == capacity);
   assert(capacity + (36000 - capacity) == 36000);
+  // Reserve a conservative estimate before TX, but settle to the measured
+  // TX-done duration afterwards so shorter real packets are not overcharged.
+  assert(LoraTrackerCore::settleAirtimeTokens(0.0, 1000, 750, 2000) == 250.0);
+  assert(LoraTrackerCore::settleAirtimeTokens(0.0, 1000, 1200, 2000) == 0.0);
 }
 
 void testPortableCore() {

@@ -93,6 +93,11 @@ double refillAirtimeTokens(
     uint32_t legal_budget_ms_per_hour,
     uint32_t capacity_ms);
 bool consumeAirtimeTokens(double& tokens_ms, uint32_t airtime_ms);
+double settleAirtimeTokens(
+    double tokens_ms,
+    uint32_t reserved_airtime_ms,
+    uint32_t measured_airtime_ms,
+    uint32_t capacity_ms);
 
 }  // namespace LoraTrackerCore
 

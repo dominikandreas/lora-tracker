@@ -233,17 +233,21 @@ wl_status_t lastWiFiStatus = WL_IDLE_STATUS;
 constexpr uint32_t GATEWAY_STATUS_INTERVAL_MS = 60000;
 constexpr size_t MQTT_COMMAND_PAYLOAD_SIZE = 640;
 
+uint32_t gatewayAirtimeCapacityMs() {
+  return EquineRelay::maxFrameAirtimeMs(
+    gateway_config.lora.spreading_factor,
+    gateway_config.lora.bandwidth_hz,
+    gateway_config.lora.coding_rate_denominator,
+    gateway_config.lora.preamble_length);
+}
+
 void refillGatewayAirtime() {
   const uint32_t now = millis();
   if (gateway_airtime_refill_ms == 0) {
     gateway_airtime_refill_ms = now;
     return;
   }
-  const uint32_t capacity_ms = EquineRelay::maxFrameAirtimeMs(
-    gateway_config.lora.spreading_factor,
-    gateway_config.lora.bandwidth_hz,
-    gateway_config.lora.coding_rate_denominator,
-    gateway_config.lora.preamble_length);
+  const uint32_t capacity_ms = gatewayAirtimeCapacityMs();
   gateway_airtime_tokens_ms = EquineRelay::refillRollingHourAirtimeTokens(
     gateway_airtime_tokens_ms,
     now - gateway_airtime_refill_ms,
@@ -3090,9 +3094,6 @@ void setup() {
   }
   esp_fill_random(&gateway_tx_nonce_prefix, sizeof(gateway_tx_nonce_prefix));
   if (gateway_tx_nonce_prefix == 0) gateway_tx_nonce_prefix = 1;
-  // Cold-start empty: rebooting must not restore a full regulatory burst.
-  gateway_airtime_tokens_ms = 0.0;
-  gateway_airtime_refill_ms = millis();
   initializeOwnerKey();
   initializeMqttCaCertificate();
 
@@ -3101,6 +3102,12 @@ void setup() {
     gateway_onboarding_required = true;
     logPrintln("Warning: running with unsaved factory gateway configuration.");
   }
+  // A token bucket permits one physically bounded frame immediately. Starting
+  // empty made a gateway defer its first short ACK for tens of seconds even
+  // when it had never transmitted. Sustained traffic still refills only up to
+  // the 1% rolling-hour budget.
+  gateway_airtime_tokens_ms = gatewayAirtimeCapacityMs();
+  gateway_airtime_refill_ms = millis();
 
   if (!initializeTrackerRegistry()) {
     logPrintln("Fatal tracker configuration error; gateway halted.");
@@ -3655,17 +3662,16 @@ void loop() {
     // ACK airtime is bounded and short enough to transmit synchronously.
     const int txResult = LoRa.endPacket();
     const uint32_t measured_airtime_ms = millis() - tx_started_ms;
-    if (measured_airtime_ms > estimated_airtime_ms) {
-      gateway_airtime_tokens_ms -= min(
-        gateway_airtime_tokens_ms,
-        static_cast<double>(measured_airtime_ms - estimated_airtime_ms));
-    }
+    gateway_airtime_tokens_ms = EquineRelay::settleAirtimeTokens(
+      gateway_airtime_tokens_ms, estimated_airtime_ms, measured_airtime_ms,
+      gatewayAirtimeCapacityMs());
     if (txResult) {
-      logPrintf("Sent ACK [%s] boot=%lu seq=%lu airtime=%lu ms\n",
+      logPrintf("Sent ACK [%s] boot=%lu seq=%lu airtime=%lu ms (reserved=%lu ms)\n",
                 tracker->config->device_id,
                 (unsigned long)header.boot_id,
                 (unsigned long)highest_ackable_seq,
-                (unsigned long)measured_airtime_ms);
+                (unsigned long)measured_airtime_ms,
+                (unsigned long)estimated_airtime_ms);
     } else {
       logPrintf("Failed to transmit ACK for tracker %s.\n",
                 tracker->config->device_id);

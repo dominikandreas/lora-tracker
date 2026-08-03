@@ -358,19 +358,23 @@ uint64_t trackerWallClockUs() {
          static_cast<uint64_t>(tv.tv_usec);
 }
 
-void refillTrackerAirtime() {
-  const uint64_t now_us = trackerWallClockUs();
-  if (tracker_airtime_refill_time_us == 0 ||
-      now_us < tracker_airtime_refill_time_us) {
-    tracker_airtime_tokens_ms = 0.0;
-    tracker_airtime_refill_time_us = now_us;
-    return;
-  }
-  const uint32_t capacity_ms = EquineRelay::maxFrameAirtimeMs(
+uint32_t trackerAirtimeCapacityMs() {
+  return EquineRelay::maxFrameAirtimeMs(
     tracker_config.lora.spreading_factor,
     tracker_config.lora.bandwidth_hz,
     tracker_config.lora.coding_rate_denominator,
     tracker_config.lora.preamble_length);
+}
+
+void refillTrackerAirtime() {
+  const uint64_t now_us = trackerWallClockUs();
+  if (tracker_airtime_refill_time_us == 0 ||
+      now_us < tracker_airtime_refill_time_us) {
+    tracker_airtime_tokens_ms = trackerAirtimeCapacityMs();
+    tracker_airtime_refill_time_us = now_us;
+    return;
+  }
+  const uint32_t capacity_ms = trackerAirtimeCapacityMs();
   tracker_airtime_tokens_ms = EquineRelay::refillRollingHourAirtimeTokens(
     tracker_airtime_tokens_ms,
     (now_us - tracker_airtime_refill_time_us) / 1000ULL,
@@ -3975,8 +3979,9 @@ void setup() {
     gettimeofday(&tv, NULL);
     session_start_time_us =
       (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;
-    // Cold-start empty so rebooting cannot reset the regulatory limiter.
-    tracker_airtime_tokens_ms = 0.0;
+    // Permit one bounded frame on a fresh tracker. Starting empty delayed the
+    // first valid report despite no previous transmission.
+    tracker_airtime_tokens_ms = trackerAirtimeCapacityMs();
     tracker_airtime_refill_time_us = session_start_time_us;
   } else {
     wakeup_counter++;
@@ -4009,7 +4014,7 @@ void setup() {
       next_point_seq = 0;
       memset(history_points, 0, sizeof(history_points));
       memset(&rtc_history_metadata, 0, sizeof(rtc_history_metadata));
-      tracker_airtime_tokens_ms = 0.0;
+      tracker_airtime_tokens_ms = trackerAirtimeCapacityMs();
       tracker_airtime_refill_time_us = trackerWallClockUs();
     }
   }
@@ -4413,11 +4418,9 @@ void performTrackingCycle() {
       const uint32_t tx_started_ms = millis();
       const bool tx_result = transmitLoRaPacket(payload_buffer, payload_len);
       const uint32_t measured_airtime_ms = millis() - tx_started_ms;
-      if (measured_airtime_ms > estimated_airtime_ms) {
-        tracker_airtime_tokens_ms -= min(
-          tracker_airtime_tokens_ms,
-          static_cast<double>(measured_airtime_ms - estimated_airtime_ms));
-      }
+      tracker_airtime_tokens_ms = EquineRelay::settleAirtimeTokens(
+        tracker_airtime_tokens_ms, estimated_airtime_ms, measured_airtime_ms,
+        trackerAirtimeCapacityMs());
       last_tx_status = tx_result ? 1 : 0;
       serviceDisplayAndButton(true);
 

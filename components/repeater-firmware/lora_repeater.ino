@@ -929,11 +929,9 @@ void serviceForwardQueue() {
   const bool sent = transmitPacket(due->packet, due->packet_size);
   const uint32_t measured_airtime = millis() - started;
   if (ack && reservation) reservation->used = false;
-  if (measured_airtime > estimated_airtime) {
-    airtime_tokens_ms -= min(
-      airtime_tokens_ms,
-      static_cast<double>(measured_airtime - estimated_airtime));
-  }
+  airtime_tokens_ms = EquineRelay::settleAirtimeTokens(
+    airtime_tokens_ms, estimated_airtime, measured_airtime,
+    transactionCapacityMs());
   if (sent) {
     rememberFrame(due->identity, millis());
     forwarded_frames++;
@@ -996,8 +994,10 @@ void setup() {
   repeater_hash = EquineProtocol::deviceIdHash(config.repeater_id);
   EquineProtocol::formatDeviceHash(
     repeater_hash, repeater_hash_text, sizeof(repeater_hash_text));
-  // Start empty so rebooting cannot reset the regulatory limiter to a full burst.
-  airtime_tokens_ms = 0.0;
+  // Permit one bounded HISTORY+ACK transaction immediately. Empty startup
+  // tokens made a repeater drop its first eligible frame despite no airtime
+  // having been used since boot.
+  airtime_tokens_ms = transactionCapacityMs();
   airtime_refill_ms = millis();
 
   Serial.printf("LoRa Tracker repeater %s (%s), config schema=%u revision=%lu\n",
